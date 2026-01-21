@@ -1,0 +1,274 @@
+/* Base Styles */
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: #f5f5f5;
+  margin: 0;
+  padding: 0;
+  color: #222;
+}
+
+.app header {
+  background: #111;
+  color: #fff;
+  padding: 1rem;
+}
+
+.app main {
+  padding: 2rem;
+}
+
+input, select {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  margin: 8px 0;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  font-size: 1rem;
+}
+
+button {
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+/* ===============================
+   LOGIN PAGE
+================================ */
+.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  background: linear-gradient(135deg, #004aad, #00b4db);
+  color: #fff;
+}
+
+.login-card {
+  background: #fff;
+  color: #333;
+  padding: 40px;
+  border-radius: 16px;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
+  width: 350px;
+  text-align: center;
+  animation: fadeIn 0.6s ease-in;
+}
+
+.login-card .brand {
+  color: #007bff;
+  font-weight: 700;
+  font-size: 1.3rem;
+}
+
+.login-card .subtitle {
+  color: #666;
+  font-size: 0.9rem;
+  margin-bottom: 20px;
+}
+
+.login-card input,
+.login-card select {
+  width: 100%;
+  padding: 10px;
+  margin-bottom: 15px;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  font-size: 1rem;
+}
+
+.btn-primary {
+  background: #007bff;
+  border: none;
+  color: #fff;
+  width: 100%;
+  padding: 12px;
+  border-radius: 8px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: 0.3s ease;
+}
+
+.btn-primary:hover {
+  background: #0056b3;
+}
+
+.error {
+  color: red;
+  font-size: 0.85rem;
+  margin-bottom: 10px;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ===============================
+   DASHBOARD PAGE
+================================ */
+.dashboard-page {
+  padding: 40px 20px;
+  max-width: 1100px;
+  margin: 0 auto;
+  font-family: 'Poppins', sans-serif;
+}
+
+.dashboard-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 30px;
+}
+
+.dashboard-header h2 {
+  font-size: 1.8rem;
+  color: #111;
+}
+
+.btn-secondary {
+  background: #dc3545;
+  color: #fff;
+  padding: 10px 16px;
+  border: none;
+  border-radius: 8px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: 0.3s;
+}
+
+.btn-secondary:hover {
+  background: #b02a37;
+}
+
+/* STAT CARDS */
+.stats-section {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.stat-card {
+  flex: 1;
+  min-width: 200px;
+  background: #fff;
+  border-radius: 12px;
+  text-align: center;
+  padding: 1.2rem;
+  box-shadow: 0 3px 8px rgba(0,0,0,0.08);
+  transition: 0.3s ease;
+}
+
+.stat-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 6px 12px rgba(0,0,0,0.1);
+}
+
+.stat-card h3 {
+  font-size: 2rem;
+  color: #007bff;
+  margin: 0;
+}
+
+.stat-card p {
+  color: #555;
+  margin-top: 6px;
+}
+
+/* DASHBOARD CARDS GRID */
+.dashboard-content {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 25px;
+}
+
+.card {
+  background: #fff;
+  padding: 20px;
+  border-radius: 15px;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.08);
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: .8rem;
+}
+
+.card h3 {
+  margin: 0 0 10px;
+  font-size: 1.2rem;
+  color: #222;
+}
+
+.card ul {
+  list-style: none;
+  padding-left: 0;
+}
+
+.card li {
+  padding: 8px 0;
+  border-bottom: 1px solid #eee;
+}
+
+.card li:last-child {
+  border-bottom: none;
+}
+
+/* BUTTON STYLES */
+.btn-primary {
+  background: #007bff;
+  color: white;
+  padding: 10px 15px;
+  border-radius: 8px;
+  text-decoration: none;
+  font-weight: 500;
+  transition: 0.2s;
+}
+
+.btn-primary:hover {
+  background: #0056b3;
+}
+
+/* RESPONSIVE */
+@media (max-width: 768px) {
+  .dashboard-header {
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .stats-section {
+    flex-direction: column;
+  }
+
+  .dashboard-content {
+    grid-template-columns: 1fr;
+  }
+}
+.loading {
+  text-align: center;
+  font-size: 1.1rem;
+  color: #333;
+  margin-top: 40px;
+}
+
+.card ul {
+  list-style: none;
+  padding-left: 0;
+  margin-top: 10px;
+}
+
+.card ul li {
+  background: #f8f9fa;
+  margin-bottom: 8px;
+  padding: 10px;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  transition: 0.2s;
+}
+
+.card ul li:hover {
+  background: #e9f2ff;
+}
