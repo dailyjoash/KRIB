@@ -19,16 +19,10 @@ export default function TenantDashboard() {
     }
 
     try {
-      const config = {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      };
-
       const [leaseRes, payRes, maintRes] = await Promise.all([
-        api.get("/api/leases/my-lease/", config),
-        api.get("/api/payments/", config),
-        api.get("/api/my-maintenance/", config),
+        api.get("/api/leases/my-lease/"),
+        api.get("/api/payments/"),
+        api.get("/api/maintenance/"),
       ]);
 
       setLease(leaseRes.data || null);

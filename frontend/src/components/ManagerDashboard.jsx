@@ -18,12 +18,10 @@ export default function ManagerDashboard() {
         return;
       }
 
-      const config = { headers: { Authorization: `Bearer ${token}` } };
-
       const [pRes, lRes, mRes] = await Promise.all([
-        api.get("/api/properties/", config),
-        api.get("/api/leases/", config),
-        api.get("/api/my-maintenance/", config),
+        api.get("/api/properties/"),
+        api.get("/api/leases/"),
+        api.get("/api/maintenance/"),
       ]);
 
       setProperties(pRes.data || []);
