@@ -12,7 +12,7 @@ export default function PropertiesNew(){
   const submit = async (e) => {
     e.preventDefault()
     try {
-      await api.post('/properties/', {title, address, description})
+      await api.post('/api/properties/', {title, address, description})
       nav('/dashboard')
     } catch (err) {
       alert('Failed to create property')
