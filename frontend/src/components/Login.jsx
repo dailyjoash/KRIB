@@ -1,16 +1,14 @@
 import React, { useState, useContext } from "react";
 import { useNavigate } from "react-router-dom";
-import api from "../services/api";
 import { AuthContext } from "../context/AuthContext";
 
 const Login = () => {
   const navigate = useNavigate();
-  const { setUser } = useContext(AuthContext); // works now
+  const { login } = useContext(AuthContext);
 
   const [formData, setFormData] = useState({
     username: "",
     password: "",
-    role: "tenant",
   });
 
   const [error, setError] = useState("");
@@ -28,36 +26,15 @@ const Login = () => {
     try {
       console.log("Sending login request for:", formData.username);
 
-      const res = await api.post("/api/token/", {
+      const userData = await login({
         username: formData.username,
         password: formData.password,
       });
 
-      console.log("Login response:", res.data);
-
-      const { access, refresh } = res.data;
-
-      if (!access || !refresh) {
-        throw new Error("No tokens returned from server");
-      }
-
-      // Save tokens + role
-      localStorage.setItem("access", access);
-      localStorage.setItem("refresh", refresh);
-      localStorage.setItem("role", formData.role);
-
-      // Update context state
-      setUser({
-        username: formData.username,
-        role: formData.role,
-        token: access,
-      });
-
-      // Redirect based on role
       navigate(
-        formData.role === "landlord"
+        userData.role === "landlord"
           ? "/dashboard"
-          : formData.role === "tenant"
+          : userData.role === "tenant"
             ? "/tenant-dashboard"
             : "/manager-dashboard"
       );
@@ -95,12 +72,6 @@ const Login = () => {
             onChange={handleChange}
             required
           />
-
-          <select name="role" value={formData.role} onChange={handleChange}>
-            <option value="landlord">Landlord</option>
-            <option value="tenant">Tenant</option>
-            <option value="manager">Manager</option>
-          </select>
 
           {error && <p className="error">{error}</p>}
 

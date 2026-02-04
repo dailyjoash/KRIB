@@ -1,5 +1,14 @@
 from rest_framework import serializers
-from .models import Property, Lease, Payment, Maintenance, Manager, Tenant
+from .models import Property, Lease, Payment, Maintenance, Manager, Tenant, Profile, Document, Notification
+
+
+# 👤 Profile Serializer
+class ProfileSerializer(serializers.ModelSerializer):
+    user = serializers.StringRelatedField()
+
+    class Meta:
+        model = Profile
+        fields = ['id', 'user', 'role']
 
 
 # 👨‍💼 Manager Serializer
@@ -34,7 +43,19 @@ class PropertySerializer(serializers.ModelSerializer):
 # 📜 Lease Serializer
 class LeaseSerializer(serializers.ModelSerializer):
     property = PropertySerializer(read_only=True)
+    property_id = serializers.PrimaryKeyRelatedField(
+        queryset=Property.objects.all(),
+        source="property",
+        write_only=True,
+        required=False,
+    )
     tenant = TenantSerializer(read_only=True)
+    tenant_id = serializers.PrimaryKeyRelatedField(
+        queryset=Tenant.objects.all(),
+        source="tenant",
+        write_only=True,
+        required=False,
+    )
 
     class Meta:
         model = Lease
@@ -44,6 +65,12 @@ class LeaseSerializer(serializers.ModelSerializer):
 # 💸 Payment Serializer
 class PaymentSerializer(serializers.ModelSerializer):
     lease = LeaseSerializer(read_only=True)
+    lease_id = serializers.PrimaryKeyRelatedField(
+        queryset=Lease.objects.all(),
+        source="lease",
+        write_only=True,
+        required=False,
+    )
 
     class Meta:
         model = Payment
@@ -53,8 +80,34 @@ class PaymentSerializer(serializers.ModelSerializer):
 # 🧰 Maintenance Serializer
 class MaintenanceSerializer(serializers.ModelSerializer):
     tenant = TenantSerializer(read_only=True)
+    tenant_id = serializers.PrimaryKeyRelatedField(
+        queryset=Tenant.objects.all(),
+        source="tenant",
+        write_only=True,
+        required=False,
+    )
     property = PropertySerializer(read_only=True)
+    property_id = serializers.PrimaryKeyRelatedField(
+        queryset=Property.objects.all(),
+        source="property",
+        write_only=True,
+        required=False,
+    )
 
     class Meta:
         model = Maintenance
+        fields = '__all__'
+
+
+class DocumentSerializer(serializers.ModelSerializer):
+    uploaded_by = serializers.StringRelatedField(read_only=True)
+
+    class Meta:
+        model = Document
+        fields = '__all__'
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
         fields = '__all__'

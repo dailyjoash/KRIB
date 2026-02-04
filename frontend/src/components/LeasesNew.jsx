@@ -15,7 +15,7 @@ export default function LeasesNew(){
 
   useEffect(()=>{
     async function load(){
-      const res = await api.get('/properties/')
+      const res = await api.get('/api/properties/')
       setProperties(res.data)
     }
     load()
@@ -31,7 +31,7 @@ export default function LeasesNew(){
       form.append('end_date', endDate)
       form.append('rent_amount', rentAmount)
       if(agreement) form.append('agreement', agreement)
-      await api.post('/leases/', form, { headers: {'Content-Type': 'multipart/form-data'} })
+      await api.post('/api/leases/', form, { headers: {'Content-Type': 'multipart/form-data'} })
       nav('/dashboard')
     } catch (err) {
       console.error(err)
