@@ -10,8 +10,11 @@ import TenantDashboard from "./components/TenantDashboard";
 import AddProperty from "./components/AddProperty";
 import LeasesNew from "./components/LeasesNew";
 import MaintenanceNew from "./components/MaintenanceNew";
+<<<<<<< HEAD
 import InviteTenant from "./components/InviteTenant";
 import AcceptInvite from "./components/AcceptInvite";
+=======
+>>>>>>> origin/master
 import ProtectedRoute from "./components/ProtectedRoute";
 
 import "./styles.css";
@@ -79,6 +82,7 @@ const App = () => (
         </ProtectedRoute>
       }
     />
+<<<<<<< HEAD
 
     <Route
       path="/invites/new"
@@ -88,6 +92,8 @@ const App = () => (
         </ProtectedRoute>
       }
     />
+=======
+>>>>>>> origin/master
   </Routes>
 );
 

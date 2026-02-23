@@ -1,4 +1,5 @@
 from rest_framework import serializers
+<<<<<<< HEAD
 from .models import (
     Property,
     Lease,
@@ -11,6 +12,9 @@ from .models import (
     Notification,
     TenantInvite,
 )
+=======
+from .models import Property, Lease, Payment, Maintenance, Manager, Tenant, Profile, Document, Notification
+>>>>>>> origin/master
 
 
 # 👤 Profile Serializer
@@ -122,6 +126,7 @@ class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification
         fields = '__all__'
+<<<<<<< HEAD
 
 
 class TenantInviteSerializer(serializers.ModelSerializer):
@@ -146,3 +151,5 @@ class TenantInviteSerializer(serializers.ModelSerializer):
         if not email and not phone:
             raise serializers.ValidationError("Email or phone is required.")
         return attrs
+=======
+>>>>>>> origin/master

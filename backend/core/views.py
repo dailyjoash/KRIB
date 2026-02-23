@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import logging
 import secrets
 from datetime import timedelta
@@ -8,6 +9,12 @@ from rest_framework import viewsets
 from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
+=======
+from rest_framework import viewsets
+from rest_framework.decorators import api_view, permission_classes, action
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.permissions import IsAuthenticated
+>>>>>>> origin/master
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
 from .models import (
@@ -17,10 +24,25 @@ from .models import (
     Maintenance,
     Manager,
     Tenant,
+<<<<<<< HEAD
     Profile,
     Document,
     Notification,
     TenantInvite,
+=======
+    Document,
+    Notification,
+)
+from .serializers import (
+    PropertySerializer,
+    LeaseSerializer,
+    PaymentSerializer,
+    MaintenanceSerializer,
+    ManagerSerializer,
+    TenantSerializer,
+    DocumentSerializer,
+    NotificationSerializer,
+>>>>>>> origin/master
 )
 from .serializers import (
     PropertySerializer,
@@ -308,6 +330,7 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return Notification.objects.filter(user=self.request.user).order_by("-created_at")
+<<<<<<< HEAD
 
 
 class TenantInviteViewSet(viewsets.ModelViewSet):
@@ -471,3 +494,5 @@ class TenantInviteViewSet(viewsets.ModelViewSet):
             message=f"{invite.full_name} accepted the invite.",
         )
         return Response({"detail": "Invite accepted. Please log in."})
+=======
+>>>>>>> origin/master
