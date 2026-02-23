@@ -86,3 +86,10 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 # CORS (dev)
 CORS_ALLOW_ALL_ORIGINS = True
+
+# Invites + notifications
+INVITE_EXPIRY_HOURS = int(os.getenv("INVITE_EXPIRY_HOURS", "72"))
+INVITE_OTP_MINUTES = int(os.getenv("INVITE_OTP_MINUTES", "10"))
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
+SEND_EMAIL = os.getenv("SEND_EMAIL", "0") == "1"
+SEND_SMS = os.getenv("SEND_SMS", "0") == "1"

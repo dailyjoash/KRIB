@@ -11,6 +11,10 @@ router.register(r"payments", views.PaymentViewSet, basename="payments")
 router.register(r"maintenance", views.MaintenanceViewSet, basename="maintenance")
 router.register(r"documents", views.DocumentViewSet, basename="documents")
 router.register(r"notifications", views.NotificationViewSet, basename="notifications")
+<<<<<<< HEAD
+router.register(r"invites", views.TenantInviteViewSet, basename="invites")
+=======
+>>>>>>> origin/master
 
 urlpatterns = [
     path('auth/me/', views.get_me, name='get_me'),

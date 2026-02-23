@@ -53,3 +53,12 @@ If you want, I can expand any part (full M-Pesa integration, admin UI, deploymen
 ## Dev notes
 - After migrations, create users and set `profile.role` to `landlord` or `tenant` in Django admin or via shell.
 - Media files served in DEBUG mode at `/media/`.
+
+## Manual test checklist (tenant invites)
+1. Landlord/manager logs in and opens **Invite Tenant** page.
+2. Create an invite with email or phone (optional property).
+3. Copy the invite link displayed after submission.
+4. Open the invite link in a new browser session, verify status is **PENDING**.
+5. If OTP is enabled, verify OTP then set password and accept invite.
+6. Log in with the invited tenant account and confirm Tenant Dashboard loads.
+7. Landlord creates a lease for the tenant and confirm lease details appear for the tenant.
