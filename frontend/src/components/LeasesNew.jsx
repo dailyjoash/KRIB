@@ -1,59 +1,36 @@
+import React, { useEffect, useState } from "react";
+import api from "../services/api";
 
-import React, { useState, useEffect } from 'react'
-import api from '../services/api'
-import { useNavigate } from 'react-router-dom'
+export default function LeasesNew() {
+  const [units, setUnits] = useState([]);
+  const [unitId, setUnitId] = useState("");
+  const [tenantId, setTenantId] = useState("");
+  const [startDate, setStartDate] = useState("");
 
-export default function LeasesNew(){
-  const [properties, setProperties] = useState([])
-  const [tenantId, setTenantId] = useState('')
-  const [propertyId, setPropertyId] = useState('')
-  const [startDate, setStartDate] = useState('')
-  const [endDate, setEndDate] = useState('')
-  const [rentAmount, setRentAmount] = useState('')
-  const [agreement, setAgreement] = useState(null)
-  const nav = useNavigate()
-
-  useEffect(()=>{
-    async function load(){
-      const res = await api.get('/api/properties/')
-      setProperties(res.data)
-    }
-    load()
-  },[])
+  useEffect(() => {
+    api.get("/api/units/").then((res) => setUnits(res.data));
+  }, []);
 
   const submit = async (e) => {
-    e.preventDefault()
-    try {
-      const form = new FormData()
-      form.append('property', propertyId)
-      form.append('tenant', tenantId)
-      form.append('start_date', startDate)
-      form.append('end_date', endDate)
-      form.append('rent_amount', rentAmount)
-      if(agreement) form.append('agreement', agreement)
-      await api.post('/api/leases/', form, { headers: {'Content-Type': 'multipart/form-data'} })
-      nav('/dashboard')
-    } catch (err) {
-      console.error(err)
-      alert('Failed to create lease')
-    }
-  }
+    e.preventDefault();
+    await api.post("/api/leases/", { unit_id: unitId, tenant_id: tenantId, start_date: startDate });
+    alert("Lease created");
+  };
 
   return (
-    <div className='card'>
+    <div className="card">
       <h3>Create Lease</h3>
       <form onSubmit={submit}>
-        <select onChange={e=>setPropertyId(e.target.value)} value={propertyId}>
-          <option value=''>Select property</option>
-          {properties.map(p=> <option key={p.id} value={p.id}>{p.title}</option>)}
+        <select value={unitId} onChange={(e) => setUnitId(e.target.value)} required>
+          <option value="">Select Unit</option>
+          {units.map((u) => (
+            <option key={u.id} value={u.id}>{u.property.name} / {u.unit_number} ({u.status})</option>
+          ))}
         </select>
-        <input placeholder='Tenant (ID)' value={tenantId} onChange={e=>setTenantId(e.target.value)} />
-        <input type='date' value={startDate} onChange={e=>setStartDate(e.target.value)} />
-        <input type='date' value={endDate} onChange={e=>setEndDate(e.target.value)} />
-        <input placeholder='Rent amount' value={rentAmount} onChange={e=>setRentAmount(e.target.value)} />
-        <input type='file' onChange={e=>setAgreement(e.target.files[0])} />
-        <button type='submit'>Create Lease</button>
+        <input value={tenantId} onChange={(e) => setTenantId(e.target.value)} placeholder="Tenant user ID" required />
+        <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} required />
+        <button type="submit">Create Lease</button>
       </form>
     </div>
-  )
+  );
 }

@@ -1,65 +1,72 @@
-from rest_framework import viewsets
-from rest_framework.decorators import api_view, permission_classes, action
-from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.parsers import MultiPartParser, FormParser
+import base64
+import logging
+import os
+import random
+from datetime import datetime, timedelta
+
+import json
+from urllib import request as urllib_request
+from urllib.error import HTTPError
+from django.contrib.auth.models import User
+from django.db.models import Q
+from django.utils import timezone
+from rest_framework import status, viewsets
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.exceptions import PermissionDenied, ValidationError
+
 from .models import (
-    Property,
     Lease,
-    Payment,
-    Maintenance,
-    Manager,
-    Tenant,
-    Document,
+    MaintenanceRequest,
     Notification,
+    PaymentTransaction,
+    Profile,
+    Property,
+    Tenant,
+    TenantInvite,
+    Unit,
+    compute_lease_rent_status,
 )
 from .serializers import (
-    PropertySerializer,
+    InviteAcceptSerializer,
     LeaseSerializer,
-    PaymentSerializer,
-    MaintenanceSerializer,
-    ManagerSerializer,
-    TenantSerializer,
-    DocumentSerializer,
+    MaintenanceRequestSerializer,
     NotificationSerializer,
+    PaymentTransactionSerializer,
+    ProfileSerializer,
+    PropertySerializer,
+    STKInitiateSerializer,
+    TenantInviteSerializer,
+    UnitSerializer,
 )
 
-# 👤 Authenticated user info (/auth/me/)
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def get_me(request):
-    user = request.user
+logger = logging.getLogger(__name__)
 
-    # Determine role dynamically
-    if hasattr(user, "profile"):
-        role = user.profile.role
-    elif user.is_staff:
-        role = "landlord"
-    elif hasattr(user, "manager_profile"):
-        role = "manager"
-    elif hasattr(user, "tenant_profile"):
-        role = "tenant"
-    else:
-        role = "user"
-
-    return Response({
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "role": role
-    })
 
 def _get_role(user):
     if hasattr(user, "profile"):
         return user.profile.role
-    if user.is_staff:
-        return "landlord"
-    if hasattr(user, "manager_profile"):
-        return "manager"
-    if hasattr(user, "tenant_profile"):
-        return "tenant"
-    return "user"
+    return Profile.ROLE_TENANT
+
+
+def _scoped_properties(user):
+    role = _get_role(user)
+    if role == Profile.ROLE_LANDLORD:
+        return Property.objects.filter(landlord=user)
+    if role == Profile.ROLE_MANAGER:
+        return Property.objects.filter(manager=user)
+    if role == Profile.ROLE_TENANT:
+        return Property.objects.filter(units__leases__tenant=user, units__leases__status=Lease.STATUS_ACTIVE).distinct()
+    return Property.objects.none()
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_me(request):
+    profile, _ = Profile.objects.get_or_create(user=request.user)
+    return Response({"id": request.user.id, "username": request.user.username, "email": request.user.email, "role": profile.role})
 
 
 class PropertyViewSet(viewsets.ModelViewSet):
@@ -67,228 +74,257 @@ class PropertyViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        role = _get_role(user)
-        if role == "landlord":
-            return Property.objects.filter(landlord=user)
-        if role == "manager" and hasattr(user, "manager_profile"):
-            return Property.objects.filter(manager=user.manager_profile)
-        if role == "tenant" and hasattr(user, "tenant_profile"):
-            return Property.objects.filter(leases__tenant=user.tenant_profile)
-        return Property.objects.none()
+        return _scoped_properties(self.request.user)
 
     def perform_create(self, serializer):
-        user = self.request.user
-        role = _get_role(user)
-        if role == "landlord":
-            serializer.save(landlord=user)
-            return
-        if role == "manager" and hasattr(user, "manager_profile"):
-            serializer.save(landlord=user.manager_profile.landlord, manager=user.manager_profile)
-            return
-        raise PermissionDenied("Only landlords or managers can create properties.")
+        role = _get_role(self.request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
+            raise PermissionDenied("Forbidden")
+        landlord = self.request.user if role == Profile.ROLE_LANDLORD else self.request.user
+        serializer.save(landlord=landlord)
+
+
+class UnitViewSet(viewsets.ModelViewSet):
+    serializer_class = UnitSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return Unit.objects.filter(property__in=_scoped_properties(self.request.user)).select_related("property")
+
+    def perform_create(self, serializer):
+        prop = serializer.validated_data["property"]
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_MANAGER and prop.manager != self.request.user:
+            raise PermissionDenied("You are not assigned to this property.")
+        if role == Profile.ROLE_LANDLORD and prop.landlord != self.request.user:
+            raise PermissionDenied("You do not own this property.")
+        serializer.save()
 
 
 class LeaseViewSet(viewsets.ModelViewSet):
     serializer_class = LeaseSerializer
     permission_classes = [IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
 
     def get_queryset(self):
-        user = self.request.user
-        role = _get_role(user)
-        if role == "landlord":
-            return Lease.objects.filter(property__landlord=user)
-        if role == "manager" and hasattr(user, "manager_profile"):
-            return Lease.objects.filter(property__manager=user.manager_profile)
-        if role == "tenant" and hasattr(user, "tenant_profile"):
-            return Lease.objects.filter(tenant=user.tenant_profile)
-        return Lease.objects.none()
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_TENANT:
+            return Lease.objects.filter(tenant=self.request.user).select_related("unit", "unit__property", "tenant")
+        return Lease.objects.filter(unit__property__in=_scoped_properties(self.request.user)).select_related("unit", "unit__property", "tenant")
+
+    def get_serializer_context(self):
+        ctx = super().get_serializer_context()
+        ctx["period"] = self.request.query_params.get("period")
+        return ctx
 
     def perform_create(self, serializer):
         user = self.request.user
         role = _get_role(user)
-        if role not in {"landlord", "manager"}:
-            raise PermissionDenied("Only landlords or managers can create leases.")
-        property_id = self.request.data.get("property")
-        tenant_id = self.request.data.get("tenant")
-        if not property_id or not tenant_id:
-            raise ValidationError("Property and tenant are required.")
-        try:
-            prop = Property.objects.get(id=property_id)
-        except Property.DoesNotExist as exc:
-            raise ValidationError("Property not found.") from exc
-        if role == "landlord" and prop.landlord != user:
-            raise PermissionDenied("You do not own this property.")
-        if role == "manager" and prop.manager != user.manager_profile:
-            raise PermissionDenied("You are not assigned to this property.")
-        try:
-            tenant = Tenant.objects.get(id=tenant_id)
-        except Tenant.DoesNotExist as exc:
-            raise ValidationError("Tenant not found.") from exc
-        if Lease.objects.filter(property=prop, is_active=True).exists():
-            raise ValidationError("An active lease already exists for this property.")
-        serializer.save(property=prop, tenant=tenant)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
+            raise PermissionDenied("Forbidden")
+        unit = serializer.validated_data["unit"]
+        if role == Profile.ROLE_MANAGER and unit.property.manager != user:
+            raise PermissionDenied("Forbidden")
+        if role == Profile.ROLE_LANDLORD and unit.property.landlord != user:
+            raise PermissionDenied("Forbidden")
+        serializer.save(rent_amount=unit.rent_amount)
 
     @action(detail=True, methods=["post"])
-    def end_lease(self, request, pk=None):
+    def deactivate(self, request, pk=None):
         lease = self.get_object()
-        lease.is_active = False
-        lease.save()
-        return Response({"detail": "Lease ended."})
+        lease.status = Lease.STATUS_INACTIVE
+        lease.save(update_fields=["status"])
+        lease.unit.status = Unit.STATUS_VACANT
+        lease.unit.save(update_fields=["status"])
+        return Response({"detail": "Lease deactivated."})
 
-# 🧾 Get a tenant's own lease (for tenant dashboard)
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def my_lease(request):
-    user = request.user
 
-    if hasattr(user, 'tenant_profile'):
-        lease = Lease.objects.filter(tenant=user.tenant_profile).first()
-        if not lease:
-            return Response({"detail": "No active lease found."}, status=404)
-        serializer = LeaseSerializer(lease)
-        return Response(serializer.data)
+class InviteViewSet(viewsets.GenericViewSet):
+    queryset = TenantInvite.objects.all()
+    serializer_class = TenantInviteSerializer
 
-    return Response({"detail": "Only tenants can access this endpoint."}, status=403)
+    def get_permissions(self):
+        if self.action in ["retrieve", "verify_otp", "accept"]:
+            return [AllowAny()]
+        return [IsAuthenticated()]
 
-class PaymentViewSet(viewsets.ModelViewSet):
-    serializer_class = PaymentSerializer
+    def create(self, request):
+        role = _get_role(request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
+            return Response({"detail": "Only landlord/manager can invite."}, status=403)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        invite = serializer.save(invited_by=request.user)
+        if role == Profile.ROLE_MANAGER and invite.property and invite.property.manager != request.user:
+            invite.delete()
+            return Response({"detail": "Managers can only invite for assigned properties."}, status=403)
+        Notification.objects.create(user=request.user, title="Invite created", message=f"Invite for {invite.full_name} created")
+        logger.info("Invite link: /api/invites/%s/", invite.token)
+        if invite.otp_code:
+            logger.info("Invite OTP: %s", invite.otp_code)
+        data = TenantInviteSerializer(invite).data
+        data["invite_link"] = f"/api/invites/{invite.token}/"
+        return Response(data, status=201)
+
+    def retrieve(self, request, pk=None):
+        invite = TenantInvite.objects.filter(token=pk).first()
+        if not invite:
+            return Response({"detail": "Not found"}, status=404)
+        if invite.is_expired() and invite.status == TenantInvite.STATUS_PENDING:
+            invite.status = TenantInvite.STATUS_EXPIRED
+            invite.save(update_fields=["status"])
+        return Response(TenantInviteSerializer(invite).data)
+
+    @action(detail=True, methods=["post"], url_path="verify-otp")
+    def verify_otp(self, request, pk=None):
+        invite = TenantInvite.objects.filter(token=pk).first()
+        if not invite:
+            return Response({"detail": "Not found"}, status=404)
+        otp = request.data.get("otp_code")
+        if not invite.otp_code:
+            return Response({"detail": "OTP not enabled for this invite."}, status=400)
+        if invite.otp_expires_at and timezone.now() > invite.otp_expires_at:
+            return Response({"detail": "OTP expired."}, status=400)
+        if otp != invite.otp_code:
+            return Response({"detail": "Invalid OTP."}, status=400)
+        return Response({"detail": "OTP verified."})
+
+    @action(detail=True, methods=["post"])
+    def accept(self, request, pk=None):
+        invite = TenantInvite.objects.filter(token=pk).first()
+        if not invite:
+            return Response({"detail": "Not found"}, status=404)
+        if invite.is_expired() or invite.status != TenantInvite.STATUS_PENDING:
+            return Response({"detail": "Invite is no longer valid."}, status=400)
+        serializer = InviteAcceptSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        username = serializer.validated_data.get("username") or (invite.email or invite.phone or f"tenant_{invite.token.hex[:8]}")
+        user, created = User.objects.get_or_create(username=username, defaults={"email": invite.email or ""})
+        user.set_password(serializer.validated_data["password"])
+        user.email = invite.email or user.email
+        user.save()
+        profile, _ = Profile.objects.get_or_create(user=user)
+        profile.role = Profile.ROLE_TENANT
+        profile.save(update_fields=["role"])
+        tenant_profile, _ = Tenant.objects.get_or_create(user=user)
+        if invite.phone:
+            tenant_profile.phone = invite.phone
+            tenant_profile.save(update_fields=["phone"])
+        invite.status = TenantInvite.STATUS_ACCEPTED
+        invite.save(update_fields=["status"])
+        Notification.objects.create(user=user, title="Welcome to KRIB", message="Your tenant account has been activated.")
+        return Response({"detail": "Invite accepted.", "username": user.username, "created": created})
+
+
+class STKInitiateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if _get_role(request.user) != Profile.ROLE_TENANT:
+            return Response({"detail": "Only tenants can initiate payment."}, status=403)
+        serializer = STKInitiateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        lease = serializer.validated_data["lease"]
+        if lease.tenant != request.user or lease.status != Lease.STATUS_ACTIVE:
+            return Response({"detail": "You can only pay your active lease."}, status=403)
+        period = timezone.localdate().strftime("%Y-%m")
+        payment = PaymentTransaction.objects.create(
+            lease=lease,
+            tenant=request.user,
+            period=period,
+            phone_number=serializer.validated_data["phone_number"],
+            amount=serializer.validated_data["amount"],
+            status=PaymentTransaction.STATUS_PENDING,
+        )
+        result = initiate_stk_push(payment)
+        payment.merchant_request_id = result.get("MerchantRequestID")
+        payment.checkout_request_id = result.get("CheckoutRequestID")
+        if result.get("errorMessage"):
+            payment.status = PaymentTransaction.STATUS_FAILED
+            payment.result_desc = result.get("errorMessage")
+        payment.raw_callback = result
+        payment.save()
+        return Response(PaymentTransactionSerializer(payment).data, status=201)
+
+
+class STKCallbackView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        payload = request.data
+        callback = payload.get("Body", {}).get("stkCallback", {})
+        checkout_id = callback.get("CheckoutRequestID")
+        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).first()
+        if not payment:
+            return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
+        result_code = callback.get("ResultCode")
+        payment.result_code = result_code
+        payment.result_desc = callback.get("ResultDesc")
+        payment.raw_callback = payload
+        if result_code == 0:
+            payment.status = PaymentTransaction.STATUS_SUCCESS
+            metadata = callback.get("CallbackMetadata", {}).get("Item", [])
+            parsed = {item.get("Name"): item.get("Value") for item in metadata}
+            payment.mpesa_receipt = parsed.get("MpesaReceiptNumber")
+            tr_date = parsed.get("TransactionDate")
+            if tr_date:
+                payment.transaction_date = datetime.strptime(str(tr_date), "%Y%m%d%H%M%S")
+        else:
+            payment.status = PaymentTransaction.STATUS_FAILED
+        payment.save()
+        return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
+
+
+class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = PaymentTransactionSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        role = _get_role(user)
-        if role == "landlord":
-            return Payment.objects.filter(lease__property__landlord=user)
-        if role == "manager" and hasattr(user, "manager_profile"):
-            return Payment.objects.filter(lease__property__manager=user.manager_profile)
-        if role == "tenant" and hasattr(user, "tenant_profile"):
-            return Payment.objects.filter(lease__tenant=user.tenant_profile)
-        return Payment.objects.none()
-
-    def perform_create(self, serializer):
-        user = self.request.user
-        role = _get_role(user)
-        lease_id = self.request.data.get("lease")
-        if not lease_id:
-            raise ValidationError("Lease is required.")
-        try:
-            lease = Lease.objects.get(id=lease_id)
-        except Lease.DoesNotExist as exc:
-            raise ValidationError("Lease not found.") from exc
-        if not lease.is_active:
-            raise ValidationError("Lease is not active.")
-        amount = serializer.validated_data.get("amount")
-        if amount != lease.rent_amount:
-            raise ValidationError("Payment amount must match rent amount.")
-        if role == "tenant":
-            if not hasattr(user, "tenant_profile") or lease.tenant != user.tenant_profile:
-                raise PermissionDenied("You can only pay for your own lease.")
-        serializer.save(lease=lease, status="Paid")
-        Notification.objects.create(
-            user=lease.property.landlord,
-            title="Rent payment received",
-            message=f"{lease.tenant.user.username} paid {amount} KES for {lease.property.title}.",
-        )
-        Notification.objects.create(
-            user=lease.tenant.user,
-            title="Payment successful",
-            message=f"Your payment of {amount} KES for {lease.property.title} was received.",
-        )
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_TENANT:
+            return PaymentTransaction.objects.filter(tenant=self.request.user).select_related("lease", "lease__unit")
+        if role == Profile.ROLE_LANDLORD:
+            return PaymentTransaction.objects.all().select_related("lease", "lease__unit", "lease__unit__property")
+        if role == Profile.ROLE_MANAGER:
+            return PaymentTransaction.objects.filter(lease__unit__property__manager=self.request.user).select_related("lease", "lease__unit")
+        return PaymentTransaction.objects.none()
 
 
 class MaintenanceViewSet(viewsets.ModelViewSet):
-    serializer_class = MaintenanceSerializer
+    serializer_class = MaintenanceRequestSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        role = _get_role(user)
-        if role == "tenant" and hasattr(user, "tenant_profile"):
-            return Maintenance.objects.filter(tenant=user.tenant_profile)
-        if role == "landlord":
-            return Maintenance.objects.filter(property__landlord=user)
-        if role == "manager" and hasattr(user, "manager_profile"):
-            return Maintenance.objects.filter(property__manager=user.manager_profile)
-        return Maintenance.objects.none()
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_TENANT:
+            return MaintenanceRequest.objects.filter(tenant=self.request.user).select_related("lease", "lease__unit")
+        if role == Profile.ROLE_LANDLORD:
+            return MaintenanceRequest.objects.filter(lease__unit__property__landlord=self.request.user).select_related("lease", "tenant")
+        if role == Profile.ROLE_MANAGER:
+            return MaintenanceRequest.objects.filter(lease__unit__property__manager=self.request.user).select_related("lease", "tenant")
+        return MaintenanceRequest.objects.none()
 
     def perform_create(self, serializer):
-        user = self.request.user
-        role = _get_role(user)
-        if role != "tenant":
-            raise PermissionDenied("Only tenants can submit maintenance requests.")
-        property_id = self.request.data.get("property")
-        if not property_id:
-            raise ValidationError("Property is required.")
-        try:
-            prop = Property.objects.get(id=property_id)
-        except Property.DoesNotExist as exc:
-            raise ValidationError("Property not found.") from exc
-        has_active_lease = Lease.objects.filter(
-            tenant=user.tenant_profile,
-            property=prop,
-            is_active=True,
-        ).exists()
-        if not has_active_lease:
-            raise ValidationError("You need an active lease for this property.")
-        serializer.save(tenant=user.tenant_profile, property=prop, status="Pending")
-        Notification.objects.create(
-            user=prop.landlord,
-            title="New maintenance request",
-            message=f"{user.username} reported an issue at {prop.title}.",
-        )
+        if _get_role(self.request.user) != Profile.ROLE_TENANT:
+            raise PermissionDenied("Only tenants can create requests")
+        lease = serializer.validated_data["lease"]
+        if lease.tenant != self.request.user or lease.status != Lease.STATUS_ACTIVE:
+            raise ValidationError("Active lease required")
+        maintenance = serializer.save(tenant=self.request.user)
+        recipients = [lease.unit.property.landlord]
+        if lease.unit.property.manager:
+            recipients.append(lease.unit.property.manager)
+        for user in recipients:
+            Notification.objects.create(user=user, title="Maintenance request", message=f"New issue from {self.request.user.username}: {maintenance.issue}")
 
     def perform_update(self, serializer):
-        user = self.request.user
-        role = _get_role(user)
-        if role == "tenant":
-            raise PermissionDenied("Tenants cannot update maintenance status.")
-        serializer.save()
-
-
-class DocumentViewSet(viewsets.ModelViewSet):
-    serializer_class = DocumentSerializer
-    permission_classes = [IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
-
-    def get_queryset(self):
-        user = self.request.user
-        role = _get_role(user)
-        if role == "landlord":
-            return Document.objects.filter(property__landlord=user)
-        if role == "manager" and hasattr(user, "manager_profile"):
-            return Document.objects.filter(property__manager=user.manager_profile)
-        if role == "tenant" and hasattr(user, "tenant_profile"):
-            return Document.objects.filter(lease__tenant=user.tenant_profile)
-        return Document.objects.none()
-
-    def perform_create(self, serializer):
-        user = self.request.user
-        role = _get_role(user)
-        property_id = self.request.data.get("property")
-        if not property_id:
-            raise ValidationError("Property is required.")
-        try:
-            prop = Property.objects.get(id=property_id)
-        except Property.DoesNotExist as exc:
-            raise ValidationError("Property not found.") from exc
-        if role == "landlord" and prop.landlord != user:
-            raise PermissionDenied("You do not own this property.")
-        if role == "manager" and prop.manager != user.manager_profile:
-            raise PermissionDenied("You are not assigned to this property.")
-        if role == "tenant":
-            lease_id = self.request.data.get("lease")
-            if not lease_id:
-                raise ValidationError("Lease is required for tenant uploads.")
-            lease = Lease.objects.get(id=lease_id)
-            if lease.tenant != user.tenant_profile:
-                raise PermissionDenied("You cannot upload documents for this lease.")
-            if lease.property != prop:
-                raise ValidationError("Lease does not match the selected property.")
-            serializer.save(uploaded_by=user, property=prop, lease=lease)
-            return
-        serializer.save(uploaded_by=user, property=prop)
+        prev = self.get_object()
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_TENANT:
+            raise PermissionDenied("Tenants cannot update status")
+        updated = serializer.save()
+        if prev.status != updated.status:
+            Notification.objects.create(user=updated.tenant, title="Maintenance updated", message=f"Your request status is now {updated.status}.")
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -297,3 +333,99 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return Notification.objects.filter(user=self.request.user).order_by("-created_at")
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def dashboard_summary(request):
+    period = timezone.localdate().strftime("%Y-%m")
+    role = _get_role(request.user)
+    if role == Profile.ROLE_TENANT:
+        active_lease = Lease.objects.filter(tenant=request.user, status=Lease.STATUS_ACTIVE).select_related("unit", "unit__property").first()
+        if not active_lease:
+            return Response({"active_lease": None, "payments": []})
+        status_data = compute_lease_rent_status(active_lease, period=period)
+        show_overdue_banner = status_data["status"] == "OVERDUE"
+        payments = PaymentTransaction.objects.filter(lease=active_lease).order_by("-created_at")
+        return Response({
+            "active_lease": LeaseSerializer(active_lease).data,
+            "rent": status_data,
+            "show_overdue_banner": show_overdue_banner,
+            "payments": PaymentTransactionSerializer(payments, many=True).data,
+        })
+
+    leases = Lease.objects.filter(status=Lease.STATUS_ACTIVE)
+    if role == Profile.ROLE_MANAGER:
+        leases = leases.filter(unit__property__manager=request.user)
+    elif role == Profile.ROLE_LANDLORD:
+        leases = leases.filter(unit__property__landlord=request.user)
+    else:
+        leases = Lease.objects.none()
+
+    grouped = {"PAID": [], "PARTIAL": [], "UNPAID": [], "OVERDUE": []}
+    totals = {"expected": 0, "collected": 0, "outstanding": 0}
+    for lease in leases.select_related("tenant", "unit"):
+        data = compute_lease_rent_status(lease, period=period)
+        row = {
+            "lease_id": lease.id,
+            "tenant": lease.tenant.username,
+            "unit": f"{lease.unit.property.name} / {lease.unit.unit_number}",
+            "rent_due": data["rent_due"],
+            "paid_sum": data["paid_sum"],
+            "balance": data["balance"],
+            "status": data["status"],
+        }
+        grouped[data["status"]].append(row)
+        totals["expected"] += float(data["rent_due"])
+        totals["collected"] += float(data["paid_sum"])
+        totals["outstanding"] += float(max(data["balance"], 0))
+    return Response({"period": period, "lists": grouped, "totals": totals})
+
+
+def _daraja_access_token():
+    key = os.getenv("DARAJA_CONSUMER_KEY")
+    secret = os.getenv("DARAJA_CONSUMER_SECRET")
+    env = os.getenv("DARAJA_ENV", "sandbox")
+    base = "https://api.safaricom.co.ke" if env == "production" else "https://sandbox.safaricom.co.ke"
+    credentials = base64.b64encode(f"{key}:{secret}".encode()).decode()
+    req = urllib_request.Request(f"{base}/oauth/v1/generate?grant_type=client_credentials")
+    req.add_header("Authorization", f"Basic {credentials}")
+    with urllib_request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    return payload.get("access_token"), base
+
+
+def initiate_stk_push(payment):
+    shortcode = os.getenv("DARAJA_SHORTCODE", "")
+    passkey = os.getenv("DARAJA_PASSKEY", "")
+    callback_url = os.getenv("DARAJA_CALLBACK_URL", "")
+    if not all([shortcode, passkey, callback_url]):
+        return {"errorMessage": "Daraja credentials not fully configured."}
+    token, base = _daraja_access_token()
+    timestamp = timezone.now().strftime("%Y%m%d%H%M%S")
+    password = base64.b64encode(f"{shortcode}{passkey}{timestamp}".encode()).decode()
+    payload = {
+        "BusinessShortCode": shortcode,
+        "Password": password,
+        "Timestamp": timestamp,
+        "TransactionType": "CustomerPayBillOnline",
+        "Amount": int(payment.amount),
+        "PartyA": payment.phone_number,
+        "PartyB": shortcode,
+        "PhoneNumber": payment.phone_number,
+        "CallBackURL": callback_url,
+        "AccountReference": f"KRIB-{payment.lease.id}",
+        "TransactionDesc": f"Rent payment {payment.period}",
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+    req = urllib_request.Request(
+        f"{base}/mpesa/stkpush/v1/processrequest",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode())
+    except HTTPError as exc:
+        return {"errorMessage": exc.read().decode()}
