@@ -1,10 +1,14 @@
+ codex/implement-full-krib-rental-workflow-prps6l
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import React, { useState } from "react";
+ master
 import api from "../services/api";
 
 export default function MaintenanceNew() {
   const [leaseId, setLeaseId] = useState("");
   const [issue, setIssue] = useState("");
+ codex/implement-full-krib-rental-workflow-prps6l
   const [error, setError] = useState("");
   const navigate = useNavigate();
 
@@ -23,6 +27,12 @@ export default function MaintenanceNew() {
     } catch (err) {
       setError(JSON.stringify(err.response?.data || "Failed to submit maintenance"));
     }
+
+  const submit = async (e) => {
+    e.preventDefault();
+    await api.post("/api/maintenance/", { lease_id: leaseId, issue });
+    setIssue("");
+master
   };
 
   return (

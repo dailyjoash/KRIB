@@ -1,11 +1,14 @@
 import React, { useEffect, useState } from "react";
+codex/implement-full-krib-rental-workflow-prps6l
 import { Link } from "react-router-dom";
+ master
 import api from "../services/api";
 
 export default function TenantDashboard() {
   const [summary, setSummary] = useState(null);
   const [phone, setPhone] = useState("");
   const [amount, setAmount] = useState("");
+ codex/implement-full-krib-rental-workflow-prps6l
   const [maintenance, setMaintenance] = useState([]);
   const [error, setError] = useState("");
 
@@ -48,6 +51,47 @@ export default function TenantDashboard() {
     <div className="dashboard-container">
       <h2>Tenant Dashboard</h2>
       {error && <p className="error">{error}</p>}
+  const [issue, setIssue] = useState("");
+  const [maintenance, setMaintenance] = useState([]);
+
+  const load = async () => {
+    const [sumRes, maintRes] = await Promise.all([
+      api.get("/api/dashboard/summary/"),
+      api.get("/api/maintenance/"),
+    ]);
+    setSummary(sumRes.data);
+    setMaintenance(maintRes.data);
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  if (!summary) return <p>Loading...</p>;
+  if (!summary.active_lease) return <p>No active lease yet.</p>;
+
+  const pay = async () => {
+    await api.post("/api/payments/stk/initiate/", {
+      lease_id: summary.active_lease.id,
+      phone_number: phone,
+      amount,
+    });
+    await load();
+  };
+
+  const createIssue = async () => {
+    await api.post("/api/maintenance/", {
+      lease_id: summary.active_lease.id,
+      issue,
+    });
+    setIssue("");
+    await load();
+  };
+
+  return (
+    <div className="dashboard-container">
+      <h2>Tenant Dashboard</h2>
+ master
       {summary.show_overdue_banner && <p className="error">Your rent is overdue.</p>}
       <div className="card">
         <h3>{summary.active_lease.unit.property.name} - Unit {summary.active_lease.unit.unit_number}</h3>
@@ -61,6 +105,7 @@ export default function TenantDashboard() {
         <button onClick={pay}>Initiate STK Push</button>
       </div>
       <div className="card">
+ codex/implement-full-krib-rental-workflow-prps6l
         <h3>Maintenance</h3>
         <Link to="/maintenance/new"><button>Report Maintenance Issue</button></Link>
         <ul>{maintenance.map((m) => <li key={m.id}>{m.issue} - {m.status}</li>)}</ul>
@@ -68,6 +113,15 @@ export default function TenantDashboard() {
       <div className="card">
         <h3>Payment History</h3>
         <ul>{summary.payments.map((p) => <li key={p.id}>{p.amount} - {p.status}</li>)}</ul>
+        <h3>Payment History</h3>
+        <ul>{summary.payments.map((p) => <li key={p.id}>{p.amount} - {p.status}</li>)}</ul>
+      </div>
+      <div className="card">
+        <h3>Maintenance</h3>
+        <textarea value={issue} onChange={(e) => setIssue(e.target.value)} />
+        <button onClick={createIssue}>Submit Request</button>
+        <ul>{maintenance.map((m) => <li key={m.id}>{m.issue} - {m.status}</li>)}</ul>
+ master
       </div>
     </div>
   );

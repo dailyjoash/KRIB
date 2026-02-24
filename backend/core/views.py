@@ -10,7 +10,10 @@ from urllib.error import HTTPError
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils import timezone
+codex/implement-full-krib-rental-workflow-prps6l
 from rest_framework import mixins, status, viewsets
+from rest_framework import status, viewsets
+ master
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -39,7 +42,9 @@ from .serializers import (
     PropertySerializer,
     STKInitiateSerializer,
     TenantInviteSerializer,
+ codex/implement-full-krib-rental-workflow-prps6l
     TenantSerializer,
+ master
     UnitSerializer,
 )
 
@@ -139,6 +144,7 @@ class LeaseViewSet(viewsets.ModelViewSet):
         return Response({"detail": "Lease deactivated."})
 
 
+codex/implement-full-krib-rental-workflow-prps6l
 class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     queryset = TenantInvite.objects.all()
     serializer_class = TenantInviteSerializer
@@ -183,6 +189,44 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
             invite.save(update_fields=["status"])
         return Response(TenantInviteSerializer(invite).data)
 
+
+class InviteViewSet(viewsets.GenericViewSet):
+    queryset = TenantInvite.objects.all()
+    serializer_class = TenantInviteSerializer
+
+    def get_permissions(self):
+        if self.action in ["retrieve", "verify_otp", "accept"]:
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    def create(self, request):
+        role = _get_role(request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
+            return Response({"detail": "Only landlord/manager can invite."}, status=403)
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        invite = serializer.save(invited_by=request.user)
+        if role == Profile.ROLE_MANAGER and invite.property and invite.property.manager != request.user:
+            invite.delete()
+            return Response({"detail": "Managers can only invite for assigned properties."}, status=403)
+        Notification.objects.create(user=request.user, title="Invite created", message=f"Invite for {invite.full_name} created")
+        logger.info("Invite link: /api/invites/%s/", invite.token)
+        if invite.otp_code:
+            logger.info("Invite OTP: %s", invite.otp_code)
+        data = TenantInviteSerializer(invite).data
+        data["invite_link"] = f"/api/invites/{invite.token}/"
+        return Response(data, status=201)
+
+    def retrieve(self, request, pk=None):
+        invite = TenantInvite.objects.filter(token=pk).first()
+        if not invite:
+            return Response({"detail": "Not found"}, status=404)
+        if invite.is_expired() and invite.status == TenantInvite.STATUS_PENDING:
+            invite.status = TenantInvite.STATUS_EXPIRED
+            invite.save(update_fields=["status"])
+        return Response(TenantInviteSerializer(invite).data)
+
+ master
     @action(detail=True, methods=["post"], url_path="verify-otp")
     def verify_otp(self, request, pk=None):
         invite = TenantInvite.objects.filter(token=pk).first()
@@ -222,6 +266,7 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         invite.save(update_fields=["status"])
         Notification.objects.create(user=user, title="Welcome to KRIB", message="Your tenant account has been activated.")
         return Response({"detail": "Invite accepted.", "username": user.username, "created": created})
+ codex/implement-full-krib-rental-workflow-prps6l
 
 
 class STKInitiateView(APIView):
@@ -340,15 +385,127 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
 
 class TenantViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = TenantSerializer
+
+
+
+class STKInitiateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if _get_role(request.user) != Profile.ROLE_TENANT:
+            return Response({"detail": "Only tenants can initiate payment."}, status=403)
+        serializer = STKInitiateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        lease = serializer.validated_data["lease"]
+        if lease.tenant != request.user or lease.status != Lease.STATUS_ACTIVE:
+            return Response({"detail": "You can only pay your active lease."}, status=403)
+        period = timezone.localdate().strftime("%Y-%m")
+        payment = PaymentTransaction.objects.create(
+            lease=lease,
+            tenant=request.user,
+            period=period,
+            phone_number=serializer.validated_data["phone_number"],
+            amount=serializer.validated_data["amount"],
+            status=PaymentTransaction.STATUS_PENDING,
+        )
+        result = initiate_stk_push(payment)
+        payment.merchant_request_id = result.get("MerchantRequestID")
+        payment.checkout_request_id = result.get("CheckoutRequestID")
+        if result.get("errorMessage"):
+            payment.status = PaymentTransaction.STATUS_FAILED
+            payment.result_desc = result.get("errorMessage")
+        payment.raw_callback = result
+        payment.save()
+        return Response(PaymentTransactionSerializer(payment).data, status=201)
+
+
+class STKCallbackView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        payload = request.data
+        callback = payload.get("Body", {}).get("stkCallback", {})
+        checkout_id = callback.get("CheckoutRequestID")
+        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).first()
+        if not payment:
+            return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
+        result_code = callback.get("ResultCode")
+        payment.result_code = result_code
+        payment.result_desc = callback.get("ResultDesc")
+        payment.raw_callback = payload
+        if result_code == 0:
+            payment.status = PaymentTransaction.STATUS_SUCCESS
+            metadata = callback.get("CallbackMetadata", {}).get("Item", [])
+            parsed = {item.get("Name"): item.get("Value") for item in metadata}
+            payment.mpesa_receipt = parsed.get("MpesaReceiptNumber")
+            tr_date = parsed.get("TransactionDate")
+            if tr_date:
+                payment.transaction_date = datetime.strptime(str(tr_date), "%Y%m%d%H%M%S")
+        else:
+            payment.status = PaymentTransaction.STATUS_FAILED
+        payment.save()
+        return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
+
+
+class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = PaymentTransactionSerializer
+ master
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         role = _get_role(self.request.user)
+ codex/implement-full-krib-rental-workflow-prps6l
         if role in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
             return Tenant.objects.select_related("user").all()
         if role == Profile.ROLE_TENANT:
             return Tenant.objects.filter(user=self.request.user).select_related("user")
         return Tenant.objects.none()
+        if role == Profile.ROLE_TENANT:
+            return PaymentTransaction.objects.filter(tenant=self.request.user).select_related("lease", "lease__unit")
+        if role == Profile.ROLE_LANDLORD:
+            return PaymentTransaction.objects.all().select_related("lease", "lease__unit", "lease__unit__property")
+        if role == Profile.ROLE_MANAGER:
+            return PaymentTransaction.objects.filter(lease__unit__property__manager=self.request.user).select_related("lease", "lease__unit")
+        return PaymentTransaction.objects.none()
+
+
+class MaintenanceViewSet(viewsets.ModelViewSet):
+    serializer_class = MaintenanceRequestSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_TENANT:
+            return MaintenanceRequest.objects.filter(tenant=self.request.user).select_related("lease", "lease__unit")
+        if role == Profile.ROLE_LANDLORD:
+            return MaintenanceRequest.objects.filter(lease__unit__property__landlord=self.request.user).select_related("lease", "tenant")
+        if role == Profile.ROLE_MANAGER:
+            return MaintenanceRequest.objects.filter(lease__unit__property__manager=self.request.user).select_related("lease", "tenant")
+        return MaintenanceRequest.objects.none()
+
+    def perform_create(self, serializer):
+        if _get_role(self.request.user) != Profile.ROLE_TENANT:
+            raise PermissionDenied("Only tenants can create requests")
+        lease = serializer.validated_data["lease"]
+        if lease.tenant != self.request.user or lease.status != Lease.STATUS_ACTIVE:
+            raise ValidationError("Active lease required")
+        maintenance = serializer.save(tenant=self.request.user)
+        recipients = [lease.unit.property.landlord]
+        if lease.unit.property.manager:
+            recipients.append(lease.unit.property.manager)
+        for user in recipients:
+            Notification.objects.create(user=user, title="Maintenance request", message=f"New issue from {self.request.user.username}: {maintenance.issue}")
+
+    def perform_update(self, serializer):
+        prev = self.get_object()
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_TENANT:
+            raise PermissionDenied("Tenants cannot update status")
+        updated = serializer.save()
+        if prev.status != updated.status:
+            Notification.objects.create(user=updated.tenant, title="Maintenance updated", message=f"Your request status is now {updated.status}.")
+ master
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
