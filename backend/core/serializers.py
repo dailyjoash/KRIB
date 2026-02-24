@@ -1,113 +1,165 @@
+from django.contrib.auth.models import User
+from django.utils import timezone
 from rest_framework import serializers
-from .models import Property, Lease, Payment, Maintenance, Manager, Tenant, Profile, Document, Notification
+
+from .models import (
+    Lease,
+    MaintenanceRequest,
+    Notification,
+    PaymentTransaction,
+    Profile,
+    Property,
+    Tenant,
+    TenantInvite,
+    Unit,
+    compute_lease_rent_status,
+)
 
 
-# 👤 Profile Serializer
+class UserLiteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["id", "username", "email"]
+
+
 class ProfileSerializer(serializers.ModelSerializer):
-    user = serializers.StringRelatedField()
+    user = UserLiteSerializer(read_only=True)
 
     class Meta:
         model = Profile
-        fields = ['id', 'user', 'role']
+        fields = ["id", "user", "role"]
 
 
-# 👨‍💼 Manager Serializer
-class ManagerSerializer(serializers.ModelSerializer):
-    user = serializers.StringRelatedField()
-    landlord = serializers.StringRelatedField()
-
-    class Meta:
-        model = Manager
-        fields = ['id', 'user', 'landlord']
-
-
-# 🧍 Tenant Serializer
-class TenantSerializer(serializers.ModelSerializer):
-    user = serializers.StringRelatedField()
-
-    class Meta:
-        model = Tenant
-        fields = ['id', 'user', 'phone', 'national_id']
-
-
-# 🏠 Property Serializer
 class PropertySerializer(serializers.ModelSerializer):
-    landlord = serializers.StringRelatedField()
-    manager = ManagerSerializer(read_only=True)
+    landlord = UserLiteSerializer(read_only=True)
+    manager = UserLiteSerializer(read_only=True)
+    manager_id = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(), source="manager", write_only=True, required=False, allow_null=True
+    )
 
     class Meta:
         model = Property
-        fields = '__all__'
+        fields = ["id", "landlord", "manager", "manager_id", "name", "location", "description"]
 
 
-# 📜 Lease Serializer
-class LeaseSerializer(serializers.ModelSerializer):
+class UnitSerializer(serializers.ModelSerializer):
     property = PropertySerializer(read_only=True)
-    property_id = serializers.PrimaryKeyRelatedField(
-        queryset=Property.objects.all(),
-        source="property",
-        write_only=True,
-        required=False,
-    )
-    tenant = TenantSerializer(read_only=True)
-    tenant_id = serializers.PrimaryKeyRelatedField(
-        queryset=Tenant.objects.all(),
-        source="tenant",
-        write_only=True,
-        required=False,
-    )
+    property_id = serializers.PrimaryKeyRelatedField(queryset=Property.objects.all(), source="property", write_only=True)
+
+    class Meta:
+        model = Unit
+        fields = ["id", "property", "property_id", "unit_number", "unit_type", "rent_amount", "deposit", "status"]
+
+
+class TenantSerializer(serializers.ModelSerializer):
+    user = UserLiteSerializer(read_only=True)
+
+    class Meta:
+        model = Tenant
+        fields = ["id", "user", "phone"]
+
+
+class LeaseSerializer(serializers.ModelSerializer):
+    unit = UnitSerializer(read_only=True)
+    unit_id = serializers.PrimaryKeyRelatedField(queryset=Unit.objects.all(), source="unit", write_only=True)
+    tenant = UserLiteSerializer(read_only=True)
+    tenant_id = serializers.PrimaryKeyRelatedField(queryset=User.objects.all(), source="tenant", write_only=True)
+    rent_status = serializers.SerializerMethodField()
 
     class Meta:
         model = Lease
-        fields = '__all__'
+        fields = [
+            "id",
+            "unit",
+            "unit_id",
+            "tenant",
+            "tenant_id",
+            "rent_amount",
+            "start_date",
+            "due_day",
+            "status",
+            "rent_status",
+        ]
+
+    def get_rent_status(self, obj):
+        period = self.context.get("period") if self.context else None
+        return compute_lease_rent_status(obj, period=period)
 
 
-# 💸 Payment Serializer
-class PaymentSerializer(serializers.ModelSerializer):
+class TenantInviteSerializer(serializers.ModelSerializer):
+    invited_by = UserLiteSerializer(read_only=True)
+
+    class Meta:
+        model = TenantInvite
+        fields = [
+            "id",
+            "token",
+            "full_name",
+            "email",
+            "phone",
+            "invited_by",
+            "property",
+            "unit",
+            "status",
+            "expires_at",
+            "otp_code",
+            "otp_expires_at",
+        ]
+        read_only_fields = ["token", "status"]
+
+
+class InviteAcceptSerializer(serializers.Serializer):
+    password = serializers.CharField(write_only=True, min_length=6)
+    username = serializers.CharField(required=False)
+
+
+class PaymentTransactionSerializer(serializers.ModelSerializer):
     lease = LeaseSerializer(read_only=True)
-    lease_id = serializers.PrimaryKeyRelatedField(
-        queryset=Lease.objects.all(),
-        source="lease",
-        write_only=True,
-        required=False,
-    )
+    lease_id = serializers.PrimaryKeyRelatedField(queryset=Lease.objects.all(), source="lease", write_only=True)
+    tenant = UserLiteSerializer(read_only=True)
 
     class Meta:
-        model = Payment
-        fields = '__all__'
+        model = PaymentTransaction
+        fields = "__all__"
+        read_only_fields = [
+            "merchant_request_id",
+            "checkout_request_id",
+            "status",
+            "mpesa_receipt",
+            "result_code",
+            "result_desc",
+            "transaction_date",
+            "raw_callback",
+        ]
 
 
-# 🧰 Maintenance Serializer
-class MaintenanceSerializer(serializers.ModelSerializer):
-    tenant = TenantSerializer(read_only=True)
-    tenant_id = serializers.PrimaryKeyRelatedField(
-        queryset=Tenant.objects.all(),
-        source="tenant",
-        write_only=True,
-        required=False,
-    )
-    property = PropertySerializer(read_only=True)
-    property_id = serializers.PrimaryKeyRelatedField(
-        queryset=Property.objects.all(),
-        source="property",
-        write_only=True,
-        required=False,
-    )
-
-    class Meta:
-        model = Maintenance
-        fields = '__all__'
+class STKInitiateSerializer(serializers.Serializer):
+    lease_id = serializers.PrimaryKeyRelatedField(queryset=Lease.objects.filter(status=Lease.STATUS_ACTIVE), source="lease")
+    phone_number = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
 
 
-class DocumentSerializer(serializers.ModelSerializer):
-    uploaded_by = serializers.StringRelatedField(read_only=True)
+class MaintenanceRequestSerializer(serializers.ModelSerializer):
+    tenant = UserLiteSerializer(read_only=True)
+    lease = LeaseSerializer(read_only=True)
+    lease_id = serializers.PrimaryKeyRelatedField(queryset=Lease.objects.filter(status=Lease.STATUS_ACTIVE), source="lease", write_only=True)
 
     class Meta:
-        model = Document
-        fields = '__all__'
+        model = MaintenanceRequest
+        fields = ["id", "tenant", "lease", "lease_id", "issue", "status", "created_at", "updated_at"]
 
 
 class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification
-        fields = '__all__'
+        fields = "__all__"
+
+
+class DashboardRowSerializer(serializers.Serializer):
+    lease_id = serializers.IntegerField()
+    tenant = serializers.CharField()
+    unit = serializers.CharField()
+    rent_due = serializers.DecimalField(max_digits=12, decimal_places=2)
+    paid_sum = serializers.DecimalField(max_digits=12, decimal_places=2)
+    balance = serializers.DecimalField(max_digits=12, decimal_places=2)
+    status = serializers.CharField()

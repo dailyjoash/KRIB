@@ -1,117 +1,78 @@
 import React, { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import api from "../services/api";
-import { useNavigate, Link } from "react-router-dom";
 
 export default function ManagerDashboard() {
-  const [properties, setProperties] = useState([]);
-  const [leases, setLeases] = useState([]);
+  const [summary, setSummary] = useState(null);
   const [maintenance, setMaintenance] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [payments, setPayments] = useState([]);
   const [error, setError] = useState("");
-  const navigate = useNavigate();
 
-  const fetchData = async () => {
+  const load = async () => {
     try {
-      const token = localStorage.getItem("access");
-      if (!token) {
-        navigate("/");
-        return;
-      }
-
-      const [pRes, lRes, mRes] = await Promise.all([
-        api.get("/api/properties/"),
-        api.get("/api/leases/"),
-        api.get("/api/maintenance/"),
+      const [sRes, mRes, pRes] = await Promise.all([
+        api.get('/api/dashboard/summary/'),
+        api.get('/api/maintenance/'),
+        api.get('/api/payments/'),
       ]);
-
-      setProperties(pRes.data || []);
-      setLeases(lRes.data || []);
+      setSummary(sRes.data);
       setMaintenance(mRes.data || []);
+      setPayments(pRes.data || []);
     } catch (err) {
-      console.error("Error fetching dashboard data:", err);
-      if (err.response?.status === 401) {
-        setError("Session expired. Please log in again.");
-        handleLogout();
-      } else {
-        setError("Failed to load dashboard data.");
-      }
-    } finally {
-      setLoading(false);
+      setError("Failed to load manager data");
+      setSummary({ period: "-", totals: { expected: 0, collected: 0, outstanding: 0 } });
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("access");
-    localStorage.removeItem("refresh");
-    localStorage.removeItem("role");
-    navigate("/");
+  useEffect(() => { load(); }, []);
+
+  const updateStatus = async (id, status) => {
+    await api.patch(`/api/maintenance/${id}/`, { status });
+    await load();
   };
 
-  useEffect(() => {
-    fetchData();
-  }, []);
-
-  if (loading) return <p style={{ textAlign: "center" }}>⏳ Loading dashboard...</p>;
+  if (!summary) return <p>Loading...</p>;
 
   return (
     <div className="dashboard-container">
-      <div className="dashboard-header">
-        <h2>👨‍💼 Manager Dashboard</h2>
-        <button className="btn-secondary" onClick={handleLogout}>
-          Logout
-        </button>
+      <h2>Manager Dashboard ({summary.period})</h2>
+      {error && <p className="error">{error}</p>}
+      <p>
+        Expected: {summary.totals.expected.toFixed(2)} | Collected: {summary.totals.collected.toFixed(2)} |
+        Outstanding: {summary.totals.outstanding.toFixed(2)}
+      </p>
+
+      <div className="card">
+        <h3>Quick Actions</h3>
+        <Link to="/invites/new">Invite Tenant</Link> | <Link to="/leases/new">Create Lease</Link>
       </div>
 
-      {error && <p style={{ color: "red", textAlign: "center" }}>{error}</p>}
+      <div className="card">
+        <h3>Maintenance Queue</h3>
+        <table><thead><tr><th>Tenant</th><th>Issue</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody>
+            {maintenance.map((m) => (
+              <tr key={m.id}>
+                <td>{m.tenant?.username}</td><td>{m.issue}</td><td>{m.status}</td>
+                <td>
+                  <select onChange={(e) => updateStatus(m.id, e.target.value)} defaultValue="">
+                    <option value="" disabled>Update</option>
+                    <option value="open">Open</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="resolved">Resolved</option>
+                  </select>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
-      <div className="dashboard-grid">
-        {/* 🏘️ Properties */}
-        <div className="card">
-          <h3>Managed Properties</h3>
-          {properties.length ? (
-            <ul>
-              {properties.map((p) => (
-                <li key={p.id}>
-                  <strong>{p.title}</strong> — {p.address}
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No properties assigned yet.</p>
-          )}
-        </div>
-
-        {/* 📜 Leases */}
-        <div className="card">
-          <h3>Leases Overview</h3>
-          {leases.length ? (
-            <ul>
-              {leases.map((l) => (
-                <li key={l.id}>
-                  {l.property?.title || "Unnamed Property"} — {l.tenant?.user || "Unknown Tenant"}
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No active leases yet.</p>
-          )}
-        </div>
-
-        {/* 🧰 Maintenance */}
-        <div className="card">
-          <h3>Maintenance Requests</h3>
-          {maintenance.length ? (
-            <ul>
-              {maintenance.map((m) => (
-                <li key={m.id}>
-                  {m.issue} — <strong>{m.status}</strong>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No maintenance requests found.</p>
-          )}
-        </div>
+      <div className="card">
+        <h3>Payments (assigned properties)</h3>
+        <table><thead><tr><th>Tenant</th><th>Period</th><th>Amount</th><th>Status</th></tr></thead>
+          <tbody>{payments.map((p) => <tr key={p.id}><td>{p.tenant?.username}</td><td>{p.period}</td><td>{p.amount}</td><td>{p.status}</td></tr>)}</tbody>
+        </table>
       </div>
     </div>
   );

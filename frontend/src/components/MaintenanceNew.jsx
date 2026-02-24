@@ -1,31 +1,39 @@
+import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import api from "../services/api";
 
-import React, { useState } from 'react'
-import api from '../services/api'
-import { useNavigate } from 'react-router-dom'
+export default function MaintenanceNew() {
+  const [leaseId, setLeaseId] = useState("");
+  const [issue, setIssue] = useState("");
+  const [error, setError] = useState("");
+  const navigate = useNavigate();
 
-export default function MaintenanceNew(){
-  const [propertyId, setPropertyId] = useState('')
-  const [issue, setIssue] = useState('')
-  const nav = useNavigate()
+  useEffect(() => {
+    api.get('/api/dashboard/summary/').then((res) => {
+      if (res.data?.active_lease?.id) setLeaseId(String(res.data.active_lease.id));
+    });
+  }, []);
 
   const submit = async (e) => {
-    e.preventDefault()
+    e.preventDefault();
+    setError("");
     try {
-      await api.post('/api/maintenance/', {property: propertyId, issue})
-      nav('/dashboard')
+      await api.post("/api/maintenance/", { lease_id: leaseId, issue });
+      navigate('/tenant-dashboard');
     } catch (err) {
-      alert('Failed to create maintenance request')
+      setError(JSON.stringify(err.response?.data || "Failed to submit maintenance"));
     }
-  }
+  };
 
   return (
-    <div className='card'>
+    <div className="card">
       <h3>Report Maintenance</h3>
+      {error && <p className="error">{error}</p>}
       <form onSubmit={submit}>
-        <input placeholder='Property ID' value={propertyId} onChange={e=>setPropertyId(e.target.value)} />
-        <textarea placeholder='Issue description' value={issue} onChange={e=>setIssue(e.target.value)} />
-        <button type='submit'>Report</button>
+        <input value={leaseId} onChange={(e) => setLeaseId(e.target.value)} placeholder="Active lease ID" required />
+        <textarea value={issue} onChange={(e) => setIssue(e.target.value)} placeholder="Issue" required />
+        <button type="submit">Submit</button>
       </form>
     </div>
-  )
+  );
 }

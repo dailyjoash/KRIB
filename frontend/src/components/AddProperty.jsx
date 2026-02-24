@@ -1,72 +1,75 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import api from "../services/api";
-import { useNavigate } from "react-router-dom";
 
 export default function AddProperty() {
-  const [title, setTitle] = useState("");
-  const [address, setAddress] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState("");
-  const navigate = useNavigate();
+  const [name, setName] = useState("");
+  const [location, setLocation] = useState("");
+  const [description, setDescription] = useState("");
+  const [managerId, setManagerId] = useState("");
+  const [properties, setProperties] = useState([]);
+  const [error, setError] = useState("");
 
-  const handleSubmit = async (e) => {
+  const load = async () => {
+    const res = await api.get("/api/properties/");
+    setProperties(res.data || []);
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const createProperty = async (e) => {
     e.preventDefault();
-    setLoading(true);
-    setMessage("");
-
+    setError("");
     try {
-      const token = localStorage.getItem("access");
-      const config = { headers: { Authorization: `Bearer ${token}` } };
+      await api.post("/api/properties/", { name, location, description });
+      setName(""); setLocation(""); setDescription("");
+      await load();
+    } catch (err) {
+      setError(err.response?.data?.detail || "Failed to create property");
+    }
+  };
 
-      await api.post("/api/properties/", { title, address }, config);
-
-      setMessage("✅ Property added successfully!");
-      setTimeout(() => navigate("/dashboard"), 1500);
-    } catch (error) {
-      console.error("Error adding property:", error);
-      setMessage("❌ Failed to add property. Try again.");
-    } finally {
-      setLoading(false);
+  const assignManager = async (propertyId) => {
+    setError("");
+    try {
+      await api.patch(`/api/properties/${propertyId}/`, { manager_id: managerId || null });
+      setManagerId("");
+      await load();
+    } catch (err) {
+      setError(err.response?.data?.detail || JSON.stringify(err.response?.data || "Failed to assign manager"));
     }
   };
 
   return (
     <div className="dashboard-container">
-      <div className="card" style={{ maxWidth: "500px", margin: "auto" }}>
-        <h2>Add New Property 🏠</h2>
-        <form onSubmit={handleSubmit}>
-          <label>Property Title</label>
-          <input
-            type="text"
-            placeholder="e.g., Sunset Apartments"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            required
-          />
-
-          <label>Address</label>
-          <input
-            type="text"
-            placeholder="e.g., 123 Nairobi Lane, Kenya"
-            value={address}
-            onChange={(e) => setAddress(e.target.value)}
-            required
-          />
-
-          <button type="submit" className="btn-primary" disabled={loading}>
-            {loading ? "Adding..." : "Add Property"}
-          </button>
+      <div className="card">
+        <h3>Add Property</h3>
+        {error && <p className="error">{error}</p>}
+        <form onSubmit={createProperty}>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Property name" required />
+          <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Location" required />
+          <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" />
+          <button type="submit">Create Property</button>
         </form>
+      </div>
 
-        {message && <p style={{ marginTop: "10px" }}>{message}</p>}
-
-        <button
-          className="btn-secondary"
-          style={{ marginTop: "10px" }}
-          onClick={() => navigate("/dashboard")}
-        >
-          ← Back to Dashboard
-        </button>
+      <div className="card">
+        <h3>Properties</h3>
+        <table>
+          <thead><tr><th>Name</th><th>Location</th><th>Manager</th><th>Assign manager user ID</th></tr></thead>
+          <tbody>
+            {properties.map((p) => (
+              <tr key={p.id}>
+                <td>{p.name}</td>
+                <td>{p.location}</td>
+                <td>{p.manager?.username || "Landlord default"}</td>
+                <td>
+                  <input value={managerId} onChange={(e) => setManagerId(e.target.value)} placeholder="manager user id" />
+                  <button onClick={() => assignManager(p.id)}>Save</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   );

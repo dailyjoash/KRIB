@@ -1,126 +1,54 @@
 import React, { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import api from "../services/api";
-import { useNavigate, Link } from "react-router-dom";
+
+const sections = ["PAID", "PARTIAL", "UNPAID", "OVERDUE"];
 
 export default function Dashboard() {
-  const [properties, setProperties] = useState([]);
-  const [leases, setLeases] = useState([]);
-  const [maintenance, setMaintenance] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState(null);
   const [error, setError] = useState("");
-  const navigate = useNavigate();
 
-  const fetchData = async () => {
+  const load = async () => {
     try {
-      const token = localStorage.getItem("access");
-      if (!token) {
-        navigate("/");
-        return;
-      }
-
-      const [pRes, lRes, mRes] = await Promise.all([
-        api.get("/api/properties/"),
-        api.get("/api/leases/"),
-        api.get("/api/maintenance/"),
-      ]);
-
-      setProperties(pRes.data || []);
-      setLeases(lRes.data || []);
-      setMaintenance(mRes.data || []);
-    } catch (err) {
-      console.error("Error fetching dashboard data:", err);
-      if (err.response?.status === 401) {
-        setError("Session expired. Please log in again.");
-        handleLogout();
-      } else {
-        setError("Failed to load dashboard data.");
-      }
-    } finally {
-      setLoading(false);
+      const res = await api.get("/api/dashboard/summary/");
+      setData(res.data);
+    } catch {
+      setError("Failed to load dashboard");
+      setData({ period: "-", totals: { expected: 0, collected: 0, outstanding: 0 }, lists: { PAID: [], PARTIAL: [], UNPAID: [], OVERDUE: [] } });
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem("access");
-    localStorage.removeItem("refresh");
-    localStorage.removeItem("role");
-    navigate("/");
-  };
+  useEffect(() => { load(); }, []);
 
-  useEffect(() => {
-    fetchData();
-  }, []);
-
-  if (loading) return <p className="loading">⏳ Loading dashboard...</p>;
+  if (!data) return <p>Loading...</p>;
 
   return (
     <div className="dashboard-container">
-      <header className="dashboard-header">
-        <h2>🏠 Landlord Dashboard</h2>
-        <button className="btn-secondary" onClick={handleLogout}>
-          Logout
-        </button>
-      </header>
-
+      <h2>Landlord Dashboard ({data.period})</h2>
       {error && <p className="error">{error}</p>}
-
-      <div className="dashboard-grid">
-        {/* 🏡 Properties */}
-        <div className="card">
-          <h3>My Properties</h3>
-          <Link to="/properties/new" className="btn-primary">
-            + Add Property
-          </Link>
-          {properties.length ? (
-            <ul>
-              {properties.map((p) => (
-                <li key={p.id}>
-                  <strong>{p.title}</strong> <br />
-                  <small>{p.address}</small>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No properties yet.</p>
-          )}
-        </div>
-
-        {/* 📄 Leases */}
-        <div className="card">
-          <h3>Active Leases</h3>
-          {leases.length ? (
-            <ul>
-              {leases.map((l) => (
-                <li key={l.id}>
-                  {l.property?.title || "Unnamed Property"} –{" "}
-                  <strong>{l.rent_amount} KES</strong>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No active leases.</p>
-          )}
-        </div>
-
-        {/* 🛠️ Maintenance */}
-        <div className="card">
-          <h3>Maintenance Requests</h3>
-          <Link to="/maintenance/new" className="btn-primary">
-            + Report Issue
-          </Link>
-          {maintenance.length ? (
-            <ul>
-              {maintenance.map((m) => (
-                <li key={m.id}>
-                  {m.issue} – <strong>{m.status}</strong>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No issues reported yet.</p>
-          )}
-        </div>
+      <div className="card">
+        <h3>Quick Actions</h3>
+        <Link to="/properties/new">Add Property</Link> | <Link to="/units/new">Add Unit</Link> | <Link to="/invites/new">Invite Tenant</Link> | <Link to="/leases/new">Create Lease</Link>
       </div>
+      <p>
+        Expected: {data.totals.expected.toFixed(2)} | Collected: {data.totals.collected.toFixed(2)} |
+        Outstanding: {data.totals.outstanding.toFixed(2)}
+      </p>
+      {sections.map((section) => (
+        <div className="card" key={section}>
+          <h3>{section}</h3>
+          <table>
+            <thead><tr><th>Tenant</th><th>Unit</th><th>Due</th><th>Paid</th><th>Balance</th></tr></thead>
+            <tbody>
+              {(data.lists[section] || []).map((row) => (
+                <tr key={row.lease_id}>
+                  <td>{row.tenant}</td><td>{row.unit}</td><td>{row.rent_due}</td><td>{row.paid_sum}</td><td>{row.balance}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ))}
     </div>
   );
 }
