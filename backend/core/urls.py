@@ -8,6 +8,9 @@ router.register(r"properties", views.PropertyViewSet, basename="properties")
 router.register(r"units", views.UnitViewSet, basename="units")
 router.register(r"leases", views.LeaseViewSet, basename="leases")
 router.register(r"invites", views.InviteViewSet, basename="invites")
+codex/implement-full-krib-rental-workflow-prps6l
+router.register(r"tenants", views.TenantViewSet, basename="tenants")
+master
 router.register(r"payments", views.PaymentViewSet, basename="payments")
 router.register(r"maintenance", views.MaintenanceViewSet, basename="maintenance")
 router.register(r"notifications", views.NotificationViewSet, basename="notifications")
