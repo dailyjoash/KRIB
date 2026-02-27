@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api from "../services/api";
+import BackButton from "./BackButton";
 
 export default function LeasesNew() {
   const [units, setUnits] = useState([]);
@@ -83,6 +84,7 @@ export default function LeasesNew() {
 
   return (
     <div className="dashboard-container">
+      <BackButton />
       <h2>Lease Management</h2>
 
       {error && <p className="error">{error}</p>}

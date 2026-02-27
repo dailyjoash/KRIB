@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api from "../services/api";
+import BackButton from "./BackButton";
 
 export default function InvitesNew() {
   const [properties, setProperties] = useState([]);
@@ -37,6 +38,7 @@ export default function InvitesNew() {
 
   return (
     <div className="dashboard-container">
+      <BackButton />
       <div className="card">
         <h3>Invite Tenant</h3>
         {error && <p className="error">{error}</p>}

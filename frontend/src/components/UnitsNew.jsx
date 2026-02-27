@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api from "../services/api";
+import BackButton from "./BackButton";
 
 export default function UnitsNew() {
   const [properties, setProperties] = useState([]);
@@ -29,6 +30,7 @@ export default function UnitsNew() {
 
   return (
     <div className="dashboard-container">
+      <BackButton />
       <div className="card">
         <h3>Add Unit</h3>
         {error && <p className="error">{error}</p>}

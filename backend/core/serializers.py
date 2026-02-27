@@ -1,4 +1,6 @@
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.validators import RegexValidator
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -12,6 +14,7 @@ from .models import (
     Tenant,
     TenantInvite,
     Unit,
+    ManagerInvite,
     compute_lease_rent_status,
 )
 
@@ -27,7 +30,45 @@ class ProfileSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Profile
-        fields = ["id", "user", "role"]
+        fields = ["id", "user", "role", "phone_number"]
+
+
+class MeSerializer(serializers.Serializer):
+    id = serializers.IntegerField(read_only=True)
+    username = serializers.CharField(read_only=True)
+    role = serializers.CharField(read_only=True)
+    email = serializers.EmailField(required=False, allow_blank=True)
+    phone_number = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        validators=[RegexValidator(regex=r"^[0-9+\-()\s]{7,20}$", message="Invalid phone number format.")],
+    )
+
+
+class ChangePasswordSerializer(serializers.Serializer):
+    old_password = serializers.CharField(write_only=True)
+    new_password = serializers.CharField(write_only=True)
+
+    def validate_new_password(self, value):
+        validate_password(value)
+        return value
+
+
+class ManagerInviteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ManagerInvite
+        fields = ["token", "email", "phone", "expires_at", "accepted_at", "is_active"]
+        read_only_fields = ["token", "accepted_at", "is_active"]
+
+
+class ManagerInviteAcceptSerializer(serializers.Serializer):
+    token = serializers.UUIDField()
+    username = serializers.CharField()
+    password = serializers.CharField(write_only=True)
+
+    def validate_password(self, value):
+        validate_password(value)
+        return value
 
 
 class PropertySerializer(serializers.ModelSerializer):

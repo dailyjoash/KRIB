@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
+import BackButton from "./BackButton";
 
 export default function ManagerDashboard() {
   const [summary, setSummary] = useState(null);
@@ -35,6 +36,7 @@ export default function ManagerDashboard() {
 
   return (
     <div className="dashboard-container">
+      <BackButton />
       <h2>Manager Dashboard ({summary.period})</h2>
       {error && <p className="error">{error}</p>}
       <p>
@@ -44,7 +46,7 @@ export default function ManagerDashboard() {
 
       <div className="card">
         <h3>Quick Actions</h3>
-        <Link to="/invites/new">Invite Tenant</Link> | <Link to="/leases/new">Create Lease</Link>
+        <Link to="/invites/new">Invite Tenant</Link> | <Link to="/leases/new">Create Lease</Link> | <Link to="/profile">Profile</Link>
       </div>
 
       <div className="card">

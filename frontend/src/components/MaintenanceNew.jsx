@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import api from "../services/api";
+import BackButton from "./BackButton";
 
 export default function MaintenanceNew() {
   const [leaseId, setLeaseId] = useState("");
@@ -40,6 +41,7 @@ export default function MaintenanceNew() {
 
   return (
     <div className="card">
+      <BackButton />
       <h3>Report Maintenance</h3>
 
       {error && <p className="error">{error}</p>}

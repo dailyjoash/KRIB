@@ -276,3 +276,26 @@ button {
 .card ul li:hover {
   background: #e9f2ff;
 }
+.success {
+  color: green;
+}
+
+.theme-dark body {
+  background: #121212;
+  color: #eaeaea;
+}
+
+.theme-dark .card,
+.theme-dark .login-card {
+  background: #1e1e1e;
+  color: #eaeaea;
+  border: 1px solid #333;
+}
+
+.theme-dark input,
+.theme-dark select,
+.theme-dark textarea {
+  background: #2a2a2a;
+  color: #f0f0f0;
+  border: 1px solid #444;
+}

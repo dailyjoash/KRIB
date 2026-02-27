@@ -88,3 +88,15 @@ Set in environment (or `.env` if loaded externally):
 - [ ] Check tenant dashboard overdue banner after 15th when balance > 0.
 - [ ] Clear balance and verify status returns to PAID.
 - [ ] Create/update maintenance and verify notifications.
+
+
+## Manual test steps for new features
+- [ ] Landlord login redirects to `/dashboard`; manager to `/manager`; tenant to `/tenant`.
+- [ ] Landlord creates manager invite from `/managers/invite` and copies generated `http://localhost:5173/invite/<token>` link.
+- [ ] Open invite link, complete username/password form, and verify manager account is created.
+- [ ] Login with new manager account and confirm manager dashboard access.
+- [ ] Landlord opens property management and assigns a manager using dropdown (no manual ID entry).
+- [ ] Open `/profile` and update email + phone number, then verify success message and persisted data on refresh.
+- [ ] Change password from profile and confirm old password no longer works.
+- [ ] Toggle theme in profile and verify dark/light mode persists after reload.
+- [ ] Verify back button works on dashboard/create/invite/profile pages.

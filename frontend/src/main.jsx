@@ -12,26 +12,39 @@ import UnitsNew from "./components/UnitsNew";
 import InvitesNew from "./components/InvitesNew";
 import LeasesNew from "./components/LeasesNew";
 import MaintenanceNew from "./components/MaintenanceNew";
+import InviteManager from "./components/InviteManager";
+import AcceptInvite from "./components/AcceptInvite";
+import Profile from "./components/Profile";
 import ProtectedRoute from "./components/ProtectedRoute";
 import NavBar from "./components/NavBar";
 
 import "./styles.css";
+
+const savedTheme = localStorage.getItem("theme") || "light";
+if (savedTheme === "dark") {
+  document.documentElement.classList.add("theme-dark");
+}
 
 const App = () => (
   <>
     <NavBar />
     <Routes>
       <Route path="/" element={<Login />} />
+      <Route path="/invite/:token" element={<AcceptInvite />} />
 
       <Route path="/dashboard" element={<ProtectedRoute allowedRoles={["landlord"]}><Dashboard /></ProtectedRoute>} />
+      <Route path="/manager" element={<ProtectedRoute allowedRoles={["manager"]}><ManagerDashboard /></ProtectedRoute>} />
+      <Route path="/tenant" element={<ProtectedRoute allowedRoles={["tenant"]}><TenantDashboard /></ProtectedRoute>} />
       <Route path="/manager-dashboard" element={<ProtectedRoute allowedRoles={["manager"]}><ManagerDashboard /></ProtectedRoute>} />
       <Route path="/tenant-dashboard" element={<ProtectedRoute allowedRoles={["tenant"]}><TenantDashboard /></ProtectedRoute>} />
 
       <Route path="/properties/new" element={<ProtectedRoute allowedRoles={["landlord"]}><AddProperty /></ProtectedRoute>} />
       <Route path="/units/new" element={<ProtectedRoute allowedRoles={["landlord"]}><UnitsNew /></ProtectedRoute>} />
       <Route path="/invites/new" element={<ProtectedRoute allowedRoles={["landlord", "manager"]}><InvitesNew /></ProtectedRoute>} />
+      <Route path="/managers/invite" element={<ProtectedRoute allowedRoles={["landlord"]}><InviteManager /></ProtectedRoute>} />
       <Route path="/leases/new" element={<ProtectedRoute allowedRoles={["landlord", "manager"]}><LeasesNew /></ProtectedRoute>} />
       <Route path="/maintenance/new" element={<ProtectedRoute allowedRoles={["tenant"]}><MaintenanceNew /></ProtectedRoute>} />
+      <Route path="/profile" element={<ProtectedRoute allowedRoles={["landlord", "manager", "tenant"]}><Profile /></ProtectedRoute>} />
     </Routes>
   </>
 );

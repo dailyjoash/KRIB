@@ -8,6 +8,9 @@ import json
 from urllib import request as urllib_request
 from urllib.error import HTTPError
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
+from django.core.mail import send_mail
+from django.conf import settings
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
@@ -20,6 +23,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from .models import (
     Lease,
+    ManagerInvite,
     MaintenanceRequest,
     Notification,
     PaymentTransaction,
@@ -31,10 +35,14 @@ from .models import (
     compute_lease_rent_status,
 )
 from .serializers import (
+    ChangePasswordSerializer,
     InviteAcceptSerializer,
+    ManagerInviteAcceptSerializer,
+    MeSerializer,
     LeaseSerializer,
     MaintenanceRequestSerializer,
     NotificationSerializer,
+    ManagerInviteSerializer,
     PaymentTransactionSerializer,
     ProfileSerializer,
     PropertySerializer,
@@ -64,12 +72,135 @@ def _scoped_properties(user):
     return Property.objects.none()
 
 
-@api_view(["GET"])
+@api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def get_me(request):
     profile, _ = Profile.objects.get_or_create(user=request.user)
-    return Response({"id": request.user.id, "username": request.user.username, "email": request.user.email, "role": profile.role})
+    if request.method == "GET":
+        return Response({
+            "id": request.user.id,
+            "username": request.user.username,
+            "role": profile.role,
+            "email": request.user.email,
+            "phone_number": profile.phone_number,
+        })
 
+    serializer = MeSerializer(data=request.data, partial=True)
+    serializer.is_valid(raise_exception=True)
+    email = serializer.validated_data.get("email")
+    phone_number = serializer.validated_data.get("phone_number")
+    if email is not None:
+        request.user.email = email
+        request.user.save(update_fields=["email"])
+    if phone_number is not None:
+        profile.phone_number = phone_number
+        profile.save(update_fields=["phone_number"])
+    return Response({
+        "id": request.user.id,
+        "username": request.user.username,
+        "role": profile.role,
+        "email": request.user.email,
+        "phone_number": profile.phone_number,
+    })
+
+
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def change_password(request):
+    serializer = ChangePasswordSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    if not request.user.check_password(serializer.validated_data["old_password"]):
+        return Response({"old_password": ["Old password is incorrect."]}, status=400)
+    request.user.set_password(serializer.validated_data["new_password"])
+    request.user.save(update_fields=["password"])
+    return Response({"detail": "Password changed successfully."})
+
+
+def send_invite(invite):
+    invite_link = f"http://localhost:5173/invite/{invite.token}"
+    logger.info("Manager invite link: %s", invite_link)
+    if getattr(settings, "EMAIL_HOST", ""):
+        recipient = invite.email
+        if recipient:
+            send_mail(
+                subject="KRIB Manager Invite",
+                message=f"Use this link to join as manager: {invite_link}",
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                recipient_list=[recipient],
+                fail_silently=True,
+            )
+    return invite_link
+
+
+class ManagerInviteCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        role = _get_role(request.user)
+        if role not in [Profile.ROLE_LANDLORD] and not request.user.is_staff:
+            return Response({"detail": "Only landlord/admin can create manager invites."}, status=403)
+        email = request.data.get("email")
+        phone = request.data.get("phone")
+        if not email and not phone:
+            return Response({"detail": "Provide email or phone."}, status=400)
+        invite = ManagerInvite.objects.create(
+            created_by=request.user,
+            email=email or None,
+            phone=phone or None,
+            expires_at=timezone.now() + timedelta(days=7),
+            is_active=True,
+        )
+        invite_link = send_invite(invite)
+        return Response({
+            "token": str(invite.token),
+            "expires_at": invite.expires_at,
+            "invite_link": invite_link,
+        }, status=201)
+
+
+class ManagerInviteAcceptView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = ManagerInviteAcceptSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        invite = ManagerInvite.objects.filter(token=serializer.validated_data["token"]).first()
+        if not invite or not invite.is_active:
+            return Response({"detail": "Invalid invite token."}, status=400)
+        if invite.is_expired() or invite.accepted_at:
+            return Response({"detail": "Invite is no longer valid."}, status=400)
+        if User.objects.filter(username=serializer.validated_data["username"]).exists():
+            return Response({"username": ["Username already exists."]}, status=400)
+
+        user = User.objects.create(username=serializer.validated_data["username"], email=invite.email or "")
+        user.set_password(serializer.validated_data["password"])
+        user.save()
+        profile, _ = Profile.objects.get_or_create(user=user)
+        profile.role = Profile.ROLE_MANAGER
+        profile.phone_number = invite.phone
+        profile.save(update_fields=["role", "phone_number"])
+        invite.accepted_at = timezone.now()
+        invite.is_active = False
+        invite.save(update_fields=["accepted_at", "is_active"])
+        return Response({"detail": "Invite accepted. Account created."})
+
+
+class UserViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsAuthenticated]
+
+    def list(self, request):
+        role = _get_role(request.user)
+        if role != Profile.ROLE_LANDLORD and not request.user.is_staff:
+            return Response({"detail": "Forbidden"}, status=403)
+        q = User.objects.all().select_related("profile")
+        wanted_role = request.query_params.get("role")
+        if wanted_role:
+            q = q.filter(profile__role=wanted_role.lower())
+        data = [{"id": u.id, "username": u.username} for u in q]
+        return Response(data)
 
 class PropertyViewSet(viewsets.ModelViewSet):
     serializer_class = PropertySerializer
@@ -385,6 +516,15 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
 
 class TenantViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = TenantSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        role = _get_role(self.request.user)
+        if role in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
+            return Tenant.objects.select_related("user").all()
+        if role == Profile.ROLE_TENANT:
+            return Tenant.objects.filter(user=self.request.user).select_related("user")
+        return Tenant.objects.none()
 
 
 class STKInitiateView(APIView):

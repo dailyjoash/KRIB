@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
+import BackButton from "./BackButton";
 
 const SECTIONS = ["PAID", "PARTIAL", "UNPAID", "OVERDUE"];
 
@@ -75,6 +76,7 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-container">
+      <BackButton />
       <h2>Landlord Dashboard ({data.period})</h2>
 
       {error && <p className="error">{error}</p>}
@@ -85,7 +87,9 @@ export default function Dashboard() {
           <Link to="/properties/new">Add Property</Link>
           <Link to="/units/new">Add Unit</Link>
           <Link to="/invites/new">Invite Tenant</Link>
+          <Link to="/managers/invite">Invite Manager</Link>
           <Link to="/leases/new">Create Lease</Link>
+          <Link to="/profile">Profile</Link>
         </div>
       </div>
 

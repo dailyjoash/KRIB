@@ -23,6 +23,7 @@ class Profile(models.Model):
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default=ROLE_TENANT)
+    phone_number = models.CharField(max_length=20, blank=True, null=True)
 
     def __str__(self):
         return f"{self.user.username} ({self.role})"
@@ -140,6 +141,20 @@ class TenantInvite(models.Model):
     expires_at = models.DateTimeField()
     otp_code = models.CharField(max_length=6, blank=True, null=True)
     otp_expires_at = models.DateTimeField(blank=True, null=True)
+
+    def is_expired(self):
+        return timezone.now() > self.expires_at
+
+
+class ManagerInvite(models.Model):
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    email = models.EmailField(blank=True, null=True)
+    phone = models.CharField(max_length=20, blank=True, null=True)
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name="manager_invites")
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    accepted_at = models.DateTimeField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
 
     def is_expired(self):
         return timezone.now() > self.expires_at
