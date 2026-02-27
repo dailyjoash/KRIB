@@ -1,14 +1,12 @@
 import React, { useEffect, useState } from "react";
-codex/implement-full-krib-rental-workflow-prps6l
 import { Link } from "react-router-dom";
- master
 import api from "../services/api";
 
 export default function TenantDashboard() {
   const [summary, setSummary] = useState(null);
   const [phone, setPhone] = useState("");
   const [amount, setAmount] = useState("");
- codex/implement-full-krib-rental-workflow-prps6l
+  const [issue, setIssue] = useState("");
   const [maintenance, setMaintenance] = useState([]);
   const [error, setError] = useState("");
 
@@ -19,14 +17,21 @@ export default function TenantDashboard() {
         api.get("/api/maintenance/"),
       ]);
       setSummary(sumRes.data);
-      setMaintenance(maintRes.data);
+      setMaintenance(maintRes.data || []);
     } catch (err) {
       setError("Failed to load tenant dashboard");
-      setSummary({ active_lease: null, payments: [], rent: {} });
+      setSummary({
+        active_lease: null,
+        payments: [],
+        rent: {},
+        show_overdue_banner: false
+      });
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
   if (!summary) return <p>Loading...</p>;
   if (!summary.active_lease) return <p>No active lease yet.</p>;
@@ -47,81 +52,108 @@ export default function TenantDashboard() {
     }
   };
 
-  return (
-    <div className="dashboard-container">
-      <h2>Tenant Dashboard</h2>
-      {error && <p className="error">{error}</p>}
-  const [issue, setIssue] = useState("");
-  const [maintenance, setMaintenance] = useState([]);
-
-  const load = async () => {
-    const [sumRes, maintRes] = await Promise.all([
-      api.get("/api/dashboard/summary/"),
-      api.get("/api/maintenance/"),
-    ]);
-    setSummary(sumRes.data);
-    setMaintenance(maintRes.data);
-  };
-
-  useEffect(() => {
-    load();
-  }, []);
-
-  if (!summary) return <p>Loading...</p>;
-  if (!summary.active_lease) return <p>No active lease yet.</p>;
-
-  const pay = async () => {
-    await api.post("/api/payments/stk/initiate/", {
-      lease_id: summary.active_lease.id,
-      phone_number: phone,
-      amount,
-    });
-    await load();
-  };
-
   const createIssue = async () => {
-    await api.post("/api/maintenance/", {
-      lease_id: summary.active_lease.id,
-      issue,
-    });
-    setIssue("");
-    await load();
+    setError("");
+    try {
+      await api.post("/api/maintenance/", {
+        lease_id: summary.active_lease.id,
+        issue,
+      });
+      setIssue("");
+      await load();
+    } catch (err) {
+      setError(JSON.stringify(err.response?.data || "Failed to create maintenance issue"));
+    }
   };
 
   return (
     <div className="dashboard-container">
       <h2>Tenant Dashboard</h2>
- master
+
+      {error && <p className="error">{error}</p>}
       {summary.show_overdue_banner && <p className="error">Your rent is overdue.</p>}
+
+      {/* Active Lease Info */}
       <div className="card">
-        <h3>{summary.active_lease.unit.property.name} - Unit {summary.active_lease.unit.unit_number}</h3>
+        <h3>
+          {summary.active_lease.unit.property.name} - Unit {summary.active_lease.unit.unit_number}
+        </h3>
         <p>Status: {summary.rent.status}</p>
-        <p>Due: {summary.rent.rent_due} Paid: {summary.rent.paid_sum} Balance: {summary.rent.balance}</p>
+        <p>
+          Due: ${Number(summary.rent.rent_due || 0).toFixed(2)} |
+          Paid: ${Number(summary.rent.paid_sum || 0).toFixed(2)} |
+          Balance: ${Number(summary.rent.balance || 0).toFixed(2)}
+        </p>
       </div>
+
+      {/* Pay Rent Section */}
       <div className="card">
         <h3>Pay Rent</h3>
-        <input placeholder="2547..." value={phone} onChange={(e) => setPhone(e.target.value)} />
-        <input placeholder="Amount" value={amount} onChange={(e) => setAmount(e.target.value)} />
-        <button onClick={pay}>Initiate STK Push</button>
+        <div style={{ display: "flex", gap: "10px", flexDirection: "column", maxWidth: "300px" }}>
+          <input
+            placeholder="Phone (e.g., 2547...)"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+          />
+          <input
+            placeholder="Amount"
+            type="number"
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+          />
+          <button onClick={pay}>Initiate STK Push</button>
+        </div>
       </div>
+
+      {/* Report Maintenance Issue */}
       <div className="card">
- codex/implement-full-krib-rental-workflow-prps6l
-        <h3>Maintenance</h3>
-        <Link to="/maintenance/new"><button>Report Maintenance Issue</button></Link>
-        <ul>{maintenance.map((m) => <li key={m.id}>{m.issue} - {m.status}</li>)}</ul>
+        <h3>Report Maintenance Issue</h3>
+        <div style={{ display: "flex", gap: "10px", flexDirection: "column", maxWidth: "300px" }}>
+          <textarea
+            value={issue}
+            onChange={(e) => setIssue(e.target.value)}
+            placeholder="Describe the issue..."
+            rows="3"
+          />
+          <button onClick={createIssue}>Submit Request</button>
+        </div>
       </div>
+
+      {/* Maintenance Queue */}
+      <div className="card">
+        <h3>Your Maintenance Requests</h3>
+        {maintenance.length === 0 ? (
+          <p>No maintenance requests found.</p>
+        ) : (
+          <ul>
+            {maintenance.map((m) => (
+              <li key={m.id}>
+                <strong>{m.issue}</strong> - Status: {m.status}
+                {m.created_at && <span> (Submitted: {new Date(m.created_at).toLocaleDateString()})</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+        <Link to="/maintenance/new">
+          <button style={{ marginTop: "10px" }}>Report via Form</button>
+        </Link>
+      </div>
+
+      {/* Payment History */}
       <div className="card">
         <h3>Payment History</h3>
-        <ul>{summary.payments.map((p) => <li key={p.id}>{p.amount} - {p.status}</li>)}</ul>
-        <h3>Payment History</h3>
-        <ul>{summary.payments.map((p) => <li key={p.id}>{p.amount} - {p.status}</li>)}</ul>
-      </div>
-      <div className="card">
-        <h3>Maintenance</h3>
-        <textarea value={issue} onChange={(e) => setIssue(e.target.value)} />
-        <button onClick={createIssue}>Submit Request</button>
-        <ul>{maintenance.map((m) => <li key={m.id}>{m.issue} - {m.status}</li>)}</ul>
- master
+        {summary.payments?.length === 0 ? (
+          <p>No payment history found.</p>
+        ) : (
+          <ul>
+            {summary.payments?.map((p) => (
+              <li key={p.id}>
+                ${Number(p.amount).toFixed(2)} - {p.status}
+                {p.created_at && <span> ({new Date(p.created_at).toLocaleDateString()})</span>}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );

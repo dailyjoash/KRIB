@@ -1,4 +1,3 @@
- codex/implement-full-krib-rental-workflow-prps6l
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
@@ -77,11 +76,4 @@ export default function ManagerDashboard() {
       </div>
     </div>
   );
-
-import React from "react";
-import Dashboard from "./Dashboard";
-
-export default function ManagerDashboard() {
-  return <Dashboard />;
-master
 }

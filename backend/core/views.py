@@ -10,10 +10,8 @@ from urllib.error import HTTPError
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils import timezone
-codex/implement-full-krib-rental-workflow-prps6l
 from rest_framework import mixins, status, viewsets
 from rest_framework import status, viewsets
- master
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -42,9 +40,7 @@ from .serializers import (
     PropertySerializer,
     STKInitiateSerializer,
     TenantInviteSerializer,
- codex/implement-full-krib-rental-workflow-prps6l
     TenantSerializer,
- master
     UnitSerializer,
 )
 
@@ -144,7 +140,6 @@ class LeaseViewSet(viewsets.ModelViewSet):
         return Response({"detail": "Lease deactivated."})
 
 
-codex/implement-full-krib-rental-workflow-prps6l
 class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     queryset = TenantInvite.objects.all()
     serializer_class = TenantInviteSerializer
@@ -172,7 +167,8 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         if role == Profile.ROLE_MANAGER and invite.property and invite.property.manager != request.user:
             invite.delete()
             return Response({"detail": "Managers can only invite for assigned properties."}, status=403)
-        Notification.objects.create(user=request.user, title="Invite created", message=f"Invite for {invite.full_name} created")
+        Notification.objects.create(
+            user=request.user, title="Invite created", message=f"Invite for {invite.full_name} created")
         logger.info("Invite link: /api/invites/%s/", invite.token)
         if invite.otp_code:
             logger.info("Invite OTP: %s", invite.otp_code)
@@ -209,7 +205,8 @@ class InviteViewSet(viewsets.GenericViewSet):
         if role == Profile.ROLE_MANAGER and invite.property and invite.property.manager != request.user:
             invite.delete()
             return Response({"detail": "Managers can only invite for assigned properties."}, status=403)
-        Notification.objects.create(user=request.user, title="Invite created", message=f"Invite for {invite.full_name} created")
+        Notification.objects.create(
+            user=request.user, title="Invite created", message=f"Invite for {invite.full_name} created")
         logger.info("Invite link: /api/invites/%s/", invite.token)
         if invite.otp_code:
             logger.info("Invite OTP: %s", invite.otp_code)
@@ -226,7 +223,6 @@ class InviteViewSet(viewsets.GenericViewSet):
             invite.save(update_fields=["status"])
         return Response(TenantInviteSerializer(invite).data)
 
- master
     @action(detail=True, methods=["post"], url_path="verify-otp")
     def verify_otp(self, request, pk=None):
         invite = TenantInvite.objects.filter(token=pk).first()
@@ -250,8 +246,10 @@ class InviteViewSet(viewsets.GenericViewSet):
             return Response({"detail": "Invite is no longer valid."}, status=400)
         serializer = InviteAcceptSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        username = serializer.validated_data.get("username") or (invite.email or invite.phone or f"tenant_{invite.token.hex[:8]}")
-        user, created = User.objects.get_or_create(username=username, defaults={"email": invite.email or ""})
+        username = serializer.validated_data.get("username") or (
+            invite.email or invite.phone or f"tenant_{invite.token.hex[:8]}")
+        user, created = User.objects.get_or_create(
+            username=username, defaults={"email": invite.email or ""})
         user.set_password(serializer.validated_data["password"])
         user.email = invite.email or user.email
         user.save()
@@ -264,9 +262,9 @@ class InviteViewSet(viewsets.GenericViewSet):
             tenant_profile.save(update_fields=["phone"])
         invite.status = TenantInvite.STATUS_ACCEPTED
         invite.save(update_fields=["status"])
-        Notification.objects.create(user=user, title="Welcome to KRIB", message="Your tenant account has been activated.")
+        Notification.objects.create(
+            user=user, title="Welcome to KRIB", message="Your tenant account has been activated.")
         return Response({"detail": "Invite accepted.", "username": user.username, "created": created})
- codex/implement-full-krib-rental-workflow-prps6l
 
 
 class STKInitiateView(APIView):
@@ -308,7 +306,8 @@ class STKCallbackView(APIView):
         payload = request.data
         callback = payload.get("Body", {}).get("stkCallback", {})
         checkout_id = callback.get("CheckoutRequestID")
-        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).first()
+        payment = PaymentTransaction.objects.filter(
+            checkout_request_id=checkout_id).first()
         if not payment:
             return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
         result_code = callback.get("ResultCode")
@@ -322,7 +321,8 @@ class STKCallbackView(APIView):
             payment.mpesa_receipt = parsed.get("MpesaReceiptNumber")
             tr_date = parsed.get("TransactionDate")
             if tr_date:
-                payment.transaction_date = datetime.strptime(str(tr_date), "%Y%m%d%H%M%S")
+                payment.transaction_date = datetime.strptime(
+                    str(tr_date), "%Y%m%d%H%M%S")
         else:
             payment.status = PaymentTransaction.STATUS_FAILED
         payment.save()
@@ -369,7 +369,8 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
         if lease.unit.property.manager:
             recipients.append(lease.unit.property.manager)
         for user in recipients:
-            Notification.objects.create(user=user, title="Maintenance request", message=f"New issue from {self.request.user.username}: {maintenance.issue}")
+            Notification.objects.create(user=user, title="Maintenance request",
+                                        message=f"New issue from {self.request.user.username}: {maintenance.issue}")
 
     def perform_update(self, serializer):
         prev = self.get_object()
@@ -378,14 +379,12 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Tenants cannot update status")
         updated = serializer.save()
         if prev.status != updated.status:
-            Notification.objects.create(user=updated.tenant, title="Maintenance updated", message=f"Your request status is now {updated.status}.")
-
-
+            Notification.objects.create(user=updated.tenant, title="Maintenance updated",
+                                        message=f"Your request status is now {updated.status}.")
 
 
 class TenantViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = TenantSerializer
-
 
 
 class STKInitiateView(APIView):
@@ -427,7 +426,8 @@ class STKCallbackView(APIView):
         payload = request.data
         callback = payload.get("Body", {}).get("stkCallback", {})
         checkout_id = callback.get("CheckoutRequestID")
-        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).first()
+        payment = PaymentTransaction.objects.filter(
+            checkout_request_id=checkout_id).first()
         if not payment:
             return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
         result_code = callback.get("ResultCode")
@@ -441,7 +441,8 @@ class STKCallbackView(APIView):
             payment.mpesa_receipt = parsed.get("MpesaReceiptNumber")
             tr_date = parsed.get("TransactionDate")
             if tr_date:
-                payment.transaction_date = datetime.strptime(str(tr_date), "%Y%m%d%H%M%S")
+                payment.transaction_date = datetime.strptime(
+                    str(tr_date), "%Y%m%d%H%M%S")
         else:
             payment.status = PaymentTransaction.STATUS_FAILED
         payment.save()
@@ -450,12 +451,10 @@ class STKCallbackView(APIView):
 
 class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = PaymentTransactionSerializer
- master
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         role = _get_role(self.request.user)
- codex/implement-full-krib-rental-workflow-prps6l
         if role in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
             return Tenant.objects.select_related("user").all()
         if role == Profile.ROLE_TENANT:
@@ -495,7 +494,8 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
         if lease.unit.property.manager:
             recipients.append(lease.unit.property.manager)
         for user in recipients:
-            Notification.objects.create(user=user, title="Maintenance request", message=f"New issue from {self.request.user.username}: {maintenance.issue}")
+            Notification.objects.create(user=user, title="Maintenance request",
+                                        message=f"New issue from {self.request.user.username}: {maintenance.issue}")
 
     def perform_update(self, serializer):
         prev = self.get_object()
@@ -504,8 +504,8 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Tenants cannot update status")
         updated = serializer.save()
         if prev.status != updated.status:
-            Notification.objects.create(user=updated.tenant, title="Maintenance updated", message=f"Your request status is now {updated.status}.")
- master
+            Notification.objects.create(user=updated.tenant, title="Maintenance updated",
+                                        message=f"Your request status is now {updated.status}.")
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -522,12 +522,14 @@ def dashboard_summary(request):
     period = timezone.localdate().strftime("%Y-%m")
     role = _get_role(request.user)
     if role == Profile.ROLE_TENANT:
-        active_lease = Lease.objects.filter(tenant=request.user, status=Lease.STATUS_ACTIVE).select_related("unit", "unit__property").first()
+        active_lease = Lease.objects.filter(
+            tenant=request.user, status=Lease.STATUS_ACTIVE).select_related("unit", "unit__property").first()
         if not active_lease:
             return Response({"active_lease": None, "payments": []})
         status_data = compute_lease_rent_status(active_lease, period=period)
         show_overdue_banner = status_data["status"] == "OVERDUE"
-        payments = PaymentTransaction.objects.filter(lease=active_lease).order_by("-created_at")
+        payments = PaymentTransaction.objects.filter(
+            lease=active_lease).order_by("-created_at")
         return Response({
             "active_lease": LeaseSerializer(active_lease).data,
             "rent": status_data,
@@ -569,7 +571,8 @@ def _daraja_access_token():
     env = os.getenv("DARAJA_ENV", "sandbox")
     base = "https://api.safaricom.co.ke" if env == "production" else "https://sandbox.safaricom.co.ke"
     credentials = base64.b64encode(f"{key}:{secret}".encode()).decode()
-    req = urllib_request.Request(f"{base}/oauth/v1/generate?grant_type=client_credentials")
+    req = urllib_request.Request(
+        f"{base}/oauth/v1/generate?grant_type=client_credentials")
     req.add_header("Authorization", f"Basic {credentials}")
     with urllib_request.urlopen(req, timeout=15) as resp:
         payload = json.loads(resp.read().decode())
@@ -584,7 +587,8 @@ def initiate_stk_push(payment):
         return {"errorMessage": "Daraja credentials not fully configured."}
     token, base = _daraja_access_token()
     timestamp = timezone.now().strftime("%Y%m%d%H%M%S")
-    password = base64.b64encode(f"{shortcode}{passkey}{timestamp}".encode()).decode()
+    password = base64.b64encode(
+        f"{shortcode}{passkey}{timestamp}".encode()).decode()
     payload = {
         "BusinessShortCode": shortcode,
         "Password": password,
@@ -602,7 +606,8 @@ def initiate_stk_push(payment):
     req = urllib_request.Request(
         f"{base}/mpesa/stkpush/v1/processrequest",
         data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
         method="POST",
     )
     try:
