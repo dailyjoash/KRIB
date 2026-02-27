@@ -15,7 +15,7 @@ export default function NavBar() {
 
   return (
     <nav style={{ display: "flex", gap: 12, padding: 12, background: "#111", color: "#fff", flexWrap: "wrap" }}>
-      <Link to={user.role === "landlord" ? "/dashboard" : user.role === "manager" ? "/manager-dashboard" : "/tenant-dashboard"} style={{ color: "#fff" }}>KRIB</Link>
+      <Link to={user.role === "landlord" ? "/dashboard" : user.role === "manager" ? "/manager" : "/tenant"} style={{ color: "#fff" }}>KRIB</Link>
 
       {user.role === "landlord" && (
         <>
@@ -30,16 +30,18 @@ export default function NavBar() {
         <>
           <Link to="/invites/new" style={{ color: "#fff" }}>Invites</Link>
           <Link to="/leases/new" style={{ color: "#fff" }}>Leases</Link>
-          <Link to="/manager-dashboard" style={{ color: "#fff" }}>Maintenance Queue</Link>
+          <Link to="/manager" style={{ color: "#fff" }}>Maintenance Queue</Link>
         </>
       )}
 
       {user.role === "tenant" && (
         <>
-          <Link to="/tenant-dashboard" style={{ color: "#fff" }}>Dashboard</Link>
+          <Link to="/tenant" style={{ color: "#fff" }}>Dashboard</Link>
           <Link to="/maintenance/new" style={{ color: "#fff" }}>Report Maintenance</Link>
         </>
       )}
+
+      <Link to="/profile" style={{ color: "#fff" }}>Profile</Link>
 
       <button onClick={doLogout} style={{ marginLeft: "auto" }}>Logout</button>
     </nav>

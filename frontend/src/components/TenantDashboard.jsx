@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../services/api";
+import BackButton from "./BackButton";
 
 export default function TenantDashboard() {
   const [summary, setSummary] = useState(null);
@@ -68,7 +69,9 @@ export default function TenantDashboard() {
 
   return (
     <div className="dashboard-container">
+      <BackButton />
       <h2>Tenant Dashboard</h2>
+      <p><Link to="/profile">Profile</Link></p>
 
       {error && <p className="error">{error}</p>}
       {summary.show_overdue_banner && <p className="error">Your rent is overdue.</p>}

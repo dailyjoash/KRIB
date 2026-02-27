@@ -14,25 +14,21 @@ export function AuthProvider({ children }) {
   }, []);
 
   const login = async (credentials) => {
-    try {
-      const res = await api.post("/api/token/", credentials);
-      const { access, refresh } = res.data;
-      localStorage.setItem("access", access);
-      localStorage.setItem("refresh", refresh);
-      const meRes = await api.get("/api/auth/me/");
-      const userData = {
-        token: access,
-        username: meRes.data.username,
-        role: meRes.data.role,
-      };
-      localStorage.setItem("role", meRes.data.role);
-      localStorage.setItem("user", JSON.stringify(userData));
-      setUser(userData);
-      return userData;
-    } catch (error) {
-      console.error("Login failed:", error);
-      throw error;
-    }
+    const res = await api.post("/api/token/", credentials);
+    const { access, refresh } = res.data;
+    localStorage.setItem("access", access);
+    localStorage.setItem("refresh", refresh);
+
+    const meRes = await api.get("/api/me/");
+    const userData = {
+      token: access,
+      username: meRes.data.username,
+      role: meRes.data.role,
+    };
+    localStorage.setItem("role", meRes.data.role);
+    localStorage.setItem("user", JSON.stringify(userData));
+    setUser(userData);
+    return userData;
   };
 
   const logout = () => {

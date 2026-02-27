@@ -1,10 +1,11 @@
 import React, { useState, useContext } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
 
 const Login = () => {
   const navigate = useNavigate();
   const { login } = useContext(AuthContext);
+  const location = useLocation();
 
   const [formData, setFormData] = useState({
     username: "",
@@ -35,8 +36,8 @@ const Login = () => {
         userData.role === "landlord"
           ? "/dashboard"
           : userData.role === "tenant"
-            ? "/tenant-dashboard"
-            : "/manager-dashboard"
+            ? "/tenant"
+            : "/manager"
       );
     } catch (err) {
       console.error("❌ Login failed:", err.response?.data || err.message);
@@ -73,6 +74,7 @@ const Login = () => {
             required
           />
 
+          {location.state?.message && <p className="success">{location.state.message}</p>}
           {error && <p className="error">{error}</p>}
 
           <button type="submit" className="btn-primary" disabled={loading}>
