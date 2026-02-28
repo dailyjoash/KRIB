@@ -19,20 +19,13 @@ export default function TenantDashboard() {
       ]);
       setSummary(sumRes.data);
       setMaintenance(maintRes.data || []);
-    } catch (err) {
+    } catch {
       setError("Failed to load tenant dashboard");
-      setSummary({
-        active_lease: null,
-        payments: [],
-        rent: {},
-        show_overdue_banner: false
-      });
+      setSummary({ active_lease: null, payments: [], rent: {}, show_overdue_banner: false });
     }
   };
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
   if (!summary) return <p>Loading...</p>;
   if (!summary.active_lease) return <p>No active lease yet.</p>;
@@ -56,10 +49,7 @@ export default function TenantDashboard() {
   const createIssue = async () => {
     setError("");
     try {
-      await api.post("/api/maintenance/", {
-        lease_id: summary.active_lease.id,
-        issue,
-      });
+      await api.post("/api/maintenance/", { lease_id: summary.active_lease.id, issue });
       setIssue("");
       await load();
     } catch (err) {
@@ -71,63 +61,42 @@ export default function TenantDashboard() {
     <div className="dashboard-container">
       <BackButton />
       <h2>Tenant Dashboard</h2>
-      <p><Link to="/profile">Profile</Link></p>
+      <p className="subtitle"><Link to="/profile">Manage profile</Link></p>
 
       {error && <p className="error">{error}</p>}
       {summary.show_overdue_banner && <p className="error">Your rent is overdue.</p>}
 
-      {/* Active Lease Info */}
-      <div className="card">
-        <h3>
-          {summary.active_lease.unit.property.name} - Unit {summary.active_lease.unit.unit_number}
-        </h3>
-        <p>Status: {summary.rent.status}</p>
-        <p>
-          Due: ${Number(summary.rent.rent_due || 0).toFixed(2)} |
-          Paid: ${Number(summary.rent.paid_sum || 0).toFixed(2)} |
-          Balance: ${Number(summary.rent.balance || 0).toFixed(2)}
-        </p>
+      <div className="summary-stats">
+        <div className="stat-card"><h3>${Number(summary.rent.rent_due || 0).toFixed(2)}</h3><p>Due</p></div>
+        <div className="stat-card"><h3>${Number(summary.rent.paid_sum || 0).toFixed(2)}</h3><p>Paid</p></div>
+        <div className="stat-card"><h3>${Number(summary.rent.balance || 0).toFixed(2)}</h3><p>Balance</p></div>
       </div>
 
-      {/* Pay Rent Section */}
+      <div className="card">
+        <h3>{summary.active_lease.unit.property.name} - Unit {summary.active_lease.unit.unit_number}</h3>
+        <p className="subtitle">Status: {summary.rent.status}</p>
+      </div>
+
       <div className="card">
         <h3>Pay Rent</h3>
-        <div style={{ display: "flex", gap: "10px", flexDirection: "column", maxWidth: "300px" }}>
-          <input
-            placeholder="Phone (e.g., 2547...)"
-            value={phone}
-            onChange={(e) => setPhone(e.target.value)}
-          />
-          <input
-            placeholder="Amount"
-            type="number"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value)}
-          />
+        <div className="form-stack">
+          <input placeholder="Phone (e.g., 2547...)" value={phone} onChange={(e) => setPhone(e.target.value)} />
+          <input placeholder="Amount" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
           <button onClick={pay}>Initiate STK Push</button>
         </div>
       </div>
 
-      {/* Report Maintenance Issue */}
       <div className="card">
         <h3>Report Maintenance Issue</h3>
-        <div style={{ display: "flex", gap: "10px", flexDirection: "column", maxWidth: "300px" }}>
-          <textarea
-            value={issue}
-            onChange={(e) => setIssue(e.target.value)}
-            placeholder="Describe the issue..."
-            rows="3"
-          />
+        <div className="form-stack">
+          <textarea value={issue} onChange={(e) => setIssue(e.target.value)} placeholder="Describe the issue..." rows="3" />
           <button onClick={createIssue}>Submit Request</button>
         </div>
       </div>
 
-      {/* Maintenance Queue */}
       <div className="card">
         <h3>Your Maintenance Requests</h3>
-        {maintenance.length === 0 ? (
-          <p>No maintenance requests found.</p>
-        ) : (
+        {maintenance.length === 0 ? <p>No maintenance requests found.</p> : (
           <ul>
             {maintenance.map((m) => (
               <li key={m.id}>
@@ -137,17 +106,12 @@ export default function TenantDashboard() {
             ))}
           </ul>
         )}
-        <Link to="/maintenance/new">
-          <button style={{ marginTop: "10px" }}>Report via Form</button>
-        </Link>
+        <Link to="/maintenance/new"><button>Report via Form</button></Link>
       </div>
 
-      {/* Payment History */}
       <div className="card">
         <h3>Payment History</h3>
-        {summary.payments?.length === 0 ? (
-          <p>No payment history found.</p>
-        ) : (
+        {summary.payments?.length === 0 ? <p>No payment history found.</p> : (
           <ul>
             {summary.payments?.map((p) => (
               <li key={p.id}>

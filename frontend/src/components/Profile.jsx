@@ -5,7 +5,7 @@ import BackButton from "./BackButton";
 export default function Profile() {
   const [form, setForm] = useState({ email: "", phone_number: "" });
   const [passwordForm, setPasswordForm] = useState({ old_password: "", new_password: "", confirm_password: "" });
-  const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
+  const [theme, setTheme] = useState(localStorage.getItem("theme") || "dark");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 

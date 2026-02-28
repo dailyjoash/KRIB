@@ -12,14 +12,14 @@ export default function ManagerDashboard() {
   const load = async () => {
     try {
       const [sRes, mRes, pRes] = await Promise.all([
-        api.get('/api/dashboard/summary/'),
-        api.get('/api/maintenance/'),
-        api.get('/api/payments/'),
+        api.get("/api/dashboard/summary/"),
+        api.get("/api/maintenance/"),
+        api.get("/api/payments/"),
       ]);
       setSummary(sRes.data);
       setMaintenance(mRes.data || []);
       setPayments(pRes.data || []);
-    } catch (err) {
+    } catch {
       setError("Failed to load manager data");
       setSummary({ period: "-", totals: { expected: 0, collected: 0, outstanding: 0 } });
     }
@@ -37,21 +37,29 @@ export default function ManagerDashboard() {
   return (
     <div className="dashboard-container">
       <BackButton />
-      <h2>Manager Dashboard ({summary.period})</h2>
+      <h2>Manager Dashboard</h2>
+      <p className="subtitle">Reporting period: {summary.period}</p>
       {error && <p className="error">{error}</p>}
-      <p>
-        Expected: {summary.totals.expected.toFixed(2)} | Collected: {summary.totals.collected.toFixed(2)} |
-        Outstanding: {summary.totals.outstanding.toFixed(2)}
-      </p>
+
+      <div className="summary-stats">
+        <div className="stat-card"><h3>{summary.totals.expected.toFixed(2)}</h3><p>Expected</p></div>
+        <div className="stat-card"><h3>{summary.totals.collected.toFixed(2)}</h3><p>Collected</p></div>
+        <div className="stat-card"><h3>{summary.totals.outstanding.toFixed(2)}</h3><p>Outstanding</p></div>
+      </div>
 
       <div className="card">
         <h3>Quick Actions</h3>
-        <Link to="/invites/new">Invite Tenant</Link> | <Link to="/leases/new">Create Lease</Link> | <Link to="/profile">Profile</Link>
+        <div className="action-links">
+          <Link to="/invites/new">Invite Tenant</Link>
+          <Link to="/leases/new">Create Lease</Link>
+          <Link to="/profile">Profile</Link>
+        </div>
       </div>
 
       <div className="card">
         <h3>Maintenance Queue</h3>
-        <table><thead><tr><th>Tenant</th><th>Issue</th><th>Status</th><th>Action</th></tr></thead>
+        <table>
+          <thead><tr><th>Tenant</th><th>Issue</th><th>Status</th><th>Action</th></tr></thead>
           <tbody>
             {maintenance.map((m) => (
               <tr key={m.id}>
@@ -72,7 +80,8 @@ export default function ManagerDashboard() {
 
       <div className="card">
         <h3>Payments (assigned properties)</h3>
-        <table><thead><tr><th>Tenant</th><th>Period</th><th>Amount</th><th>Status</th></tr></thead>
+        <table>
+          <thead><tr><th>Tenant</th><th>Period</th><th>Amount</th><th>Status</th></tr></thead>
           <tbody>{payments.map((p) => <tr key={p.id}><td>{p.tenant?.username}</td><td>{p.period}</td><td>{p.amount}</td><td>{p.status}</td></tr>)}</tbody>
         </table>
       </div>
