@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { CreditCard, Send } from "lucide-react";
 import api from "../services/api";
-import BackButton from "./BackButton";
+import StatCards from "./StatCards";
+import StatusBadge from "./StatusBadge";
 
 export default function TenantDashboard() {
   const [summary, setSummary] = useState(null);
@@ -25,7 +27,9 @@ export default function TenantDashboard() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
   if (!summary) return <p>Loading...</p>;
   if (!summary.active_lease) return <p>No active lease yet.</p>;
@@ -59,22 +63,20 @@ export default function TenantDashboard() {
 
   return (
     <div className="dashboard-container">
-      <BackButton />
-      <h2>Tenant Dashboard</h2>
       <p className="subtitle"><Link to="/profile">Manage profile</Link></p>
 
       {error && <p className="error">{error}</p>}
       {summary.show_overdue_banner && <p className="error">Your rent is overdue.</p>}
 
-      <div className="summary-stats">
-        <div className="stat-card"><h3>${Number(summary.rent.rent_due || 0).toFixed(2)}</h3><p>Due</p></div>
-        <div className="stat-card"><h3>${Number(summary.rent.paid_sum || 0).toFixed(2)}</h3><p>Paid</p></div>
-        <div className="stat-card"><h3>${Number(summary.rent.balance || 0).toFixed(2)}</h3><p>Balance</p></div>
-      </div>
+      <StatCards
+        expected={summary.rent.rent_due}
+        collected={summary.rent.paid_sum}
+        outstanding={summary.rent.balance}
+      />
 
       <div className="card">
         <h3>{summary.active_lease.unit.property.name} - Unit {summary.active_lease.unit.unit_number}</h3>
-        <p className="subtitle">Status: {summary.rent.status}</p>
+        <p className="subtitle">Current status: <StatusBadge status={summary.rent.status} /></p>
       </div>
 
       <div className="card">
@@ -82,7 +84,7 @@ export default function TenantDashboard() {
         <div className="form-stack">
           <input placeholder="Phone (e.g., 2547...)" value={phone} onChange={(e) => setPhone(e.target.value)} />
           <input placeholder="Amount" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
-          <button onClick={pay}>Initiate STK Push</button>
+          <button onClick={pay}><CreditCard size={16} /> Initiate STK Push</button>
         </div>
       </div>
 
@@ -90,33 +92,33 @@ export default function TenantDashboard() {
         <h3>Report Maintenance Issue</h3>
         <div className="form-stack">
           <textarea value={issue} onChange={(e) => setIssue(e.target.value)} placeholder="Describe the issue..." rows="3" />
-          <button onClick={createIssue}>Submit Request</button>
+          <button onClick={createIssue}><Send size={16} /> Submit Request</button>
         </div>
       </div>
 
       <div className="card">
         <h3>Your Maintenance Requests</h3>
         {maintenance.length === 0 ? <p>No maintenance requests found.</p> : (
-          <ul>
+          <ul className="clean-list">
             {maintenance.map((m) => (
               <li key={m.id}>
-                <strong>{m.issue}</strong> - Status: {m.status}
-                {m.created_at && <span> (Submitted: {new Date(m.created_at).toLocaleDateString()})</span>}
+                <strong>{m.issue}</strong> <StatusBadge status={m.status} />
+                {m.created_at && <span> • Submitted: {new Date(m.created_at).toLocaleDateString()}</span>}
               </li>
             ))}
           </ul>
         )}
-        <Link to="/maintenance/new"><button>Report via Form</button></Link>
+        <Link to="/maintenance/new" className="action-link">Report via Form</Link>
       </div>
 
       <div className="card">
         <h3>Payment History</h3>
         {summary.payments?.length === 0 ? <p>No payment history found.</p> : (
-          <ul>
+          <ul className="clean-list">
             {summary.payments?.map((p) => (
               <li key={p.id}>
-                ${Number(p.amount).toFixed(2)} - {p.status}
-                {p.created_at && <span> ({new Date(p.created_at).toLocaleDateString()})</span>}
+                ${Number(p.amount).toFixed(2)} <StatusBadge status={p.status} />
+                {p.created_at && <span> • {new Date(p.created_at).toLocaleDateString()}</span>}
               </li>
             ))}
           </ul>
