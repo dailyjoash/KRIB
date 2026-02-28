@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { FilePlus2, Send } from "lucide-react";
 import api from "../services/api";
-import BackButton from "./BackButton";
+import StatCards from "./StatCards";
+import StatusBadge from "./StatusBadge";
 
 export default function ManagerDashboard() {
   const [summary, setSummary] = useState(null);
@@ -25,7 +27,9 @@ export default function ManagerDashboard() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
   const updateStatus = async (id, status) => {
     await api.patch(`/api/maintenance/${id}/`, { status });
@@ -36,34 +40,42 @@ export default function ManagerDashboard() {
 
   return (
     <div className="dashboard-container">
-      <BackButton />
-      <h2>Manager Dashboard</h2>
       <p className="subtitle">Reporting period: {summary.period}</p>
       {error && <p className="error">{error}</p>}
 
-      <div className="summary-stats">
-        <div className="stat-card"><h3>{summary.totals.expected.toFixed(2)}</h3><p>Expected</p></div>
-        <div className="stat-card"><h3>{summary.totals.collected.toFixed(2)}</h3><p>Collected</p></div>
-        <div className="stat-card"><h3>{summary.totals.outstanding.toFixed(2)}</h3><p>Outstanding</p></div>
-      </div>
+      <StatCards
+        expected={summary.totals.expected}
+        collected={summary.totals.collected}
+        outstanding={summary.totals.outstanding}
+      />
 
       <div className="card">
         <h3>Quick Actions</h3>
         <div className="action-links">
-          <Link to="/invites/new">Invite Tenant</Link>
-          <Link to="/leases/new">Create Lease</Link>
-          <Link to="/profile">Profile</Link>
+          <Link to="/invites/new" className="action-link"><Send size={16} /> Invite Tenant</Link>
+          <Link to="/leases/new" className="action-link"><FilePlus2 size={16} /> Create Lease</Link>
         </div>
       </div>
 
       <div className="card">
         <h3>Maintenance Queue</h3>
         <table>
-          <thead><tr><th>Tenant</th><th>Issue</th><th>Status</th><th>Action</th></tr></thead>
+          <thead>
+            <tr>
+              <th>Tenant</th>
+              <th>Unit</th>
+              <th>Issue</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
           <tbody>
             {maintenance.map((m) => (
               <tr key={m.id}>
-                <td>{m.tenant?.username}</td><td>{m.issue}</td><td>{m.status}</td>
+                <td>{m.tenant?.username}</td>
+                <td>{m.lease?.unit?.unit_number || "-"}</td>
+                <td>{m.issue}</td>
+                <td><StatusBadge status={m.status} /></td>
                 <td>
                   <select onChange={(e) => updateStatus(m.id, e.target.value)} defaultValue="">
                     <option value="" disabled>Update</option>
@@ -81,8 +93,26 @@ export default function ManagerDashboard() {
       <div className="card">
         <h3>Payments (assigned properties)</h3>
         <table>
-          <thead><tr><th>Tenant</th><th>Period</th><th>Amount</th><th>Status</th></tr></thead>
-          <tbody>{payments.map((p) => <tr key={p.id}><td>{p.tenant?.username}</td><td>{p.period}</td><td>{p.amount}</td><td>{p.status}</td></tr>)}</tbody>
+          <thead>
+            <tr>
+              <th>Tenant</th>
+              <th>Unit</th>
+              <th>Period</th>
+              <th>Amount</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {payments.map((p) => (
+              <tr key={p.id}>
+                <td>{p.tenant?.username}</td>
+                <td>{p.lease?.unit?.unit_number || "-"}</td>
+                <td>{p.period}</td>
+                <td>{p.amount}</td>
+                <td><StatusBadge status={p.status} /></td>
+              </tr>
+            ))}
+          </tbody>
         </table>
       </div>
     </div>
