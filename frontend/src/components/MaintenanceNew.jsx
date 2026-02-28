@@ -40,7 +40,8 @@ export default function MaintenanceNew() {
   };
 
   return (
-    <div className="card">
+    <div className="dashboard-container">
+      <div className="card">
       <BackButton />
       <h3>Report Maintenance</h3>
 
@@ -63,6 +64,7 @@ export default function MaintenanceNew() {
 
         <button type="submit">Submit</button>
       </form>
+    </div>
     </div>
   );
 }

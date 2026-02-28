@@ -1,10 +1,16 @@
-import React, { useContext } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import React, { useContext, useState } from "react";
+import { Link, useNavigate, useLocation } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
+
+const getHomePath = (role) => (
+  role === "landlord" ? "/dashboard" : role === "manager" ? "/manager" : "/tenant"
+);
 
 export default function NavBar() {
   const { user, logout } = useContext(AuthContext);
   const navigate = useNavigate();
+  const location = useLocation();
+  const [theme, setTheme] = useState(localStorage.getItem("theme") || "dark");
 
   if (!user) return null;
 
@@ -13,37 +19,63 @@ export default function NavBar() {
     navigate("/");
   };
 
+  const links = [
+    ...(user.role === "landlord"
+      ? [
+        { to: "/properties/new", label: "Properties" },
+        { to: "/units/new", label: "Units" },
+        { to: "/invites/new", label: "Invites" },
+        { to: "/leases/new", label: "Leases" },
+      ]
+      : []),
+    ...(user.role === "manager"
+      ? [
+        { to: "/invites/new", label: "Invites" },
+        { to: "/leases/new", label: "Leases" },
+        { to: "/manager", label: "Maintenance" },
+      ]
+      : []),
+    ...(user.role === "tenant"
+      ? [
+        { to: "/tenant", label: "Dashboard" },
+        { to: "/maintenance/new", label: "Report Issue" },
+      ]
+      : []),
+    { to: "/profile", label: "Profile" },
+  ];
+
+  const toggleTheme = () => {
+    const nextTheme = theme === "dark" ? "light" : "dark";
+    setTheme(nextTheme);
+    localStorage.setItem("theme", nextTheme);
+    document.documentElement.classList.toggle("theme-dark", nextTheme === "dark");
+  };
+
   return (
-    <nav style={{ display: "flex", gap: 12, padding: 12, background: "#111", color: "#fff", flexWrap: "wrap" }}>
-      <Link to={user.role === "landlord" ? "/dashboard" : user.role === "manager" ? "/manager" : "/tenant"} style={{ color: "#fff" }}>KRIB</Link>
+    <aside className="sidebar">
+      <Link to={getHomePath(user.role)} className="sidebar-brand">
+        KRIB
+      </Link>
+      <p className="sidebar-role">{user.role} workspace</p>
 
-      {user.role === "landlord" && (
-        <>
-          <Link to="/properties/new" style={{ color: "#fff" }}>Properties</Link>
-          <Link to="/units/new" style={{ color: "#fff" }}>Units</Link>
-          <Link to="/invites/new" style={{ color: "#fff" }}>Invites</Link>
-          <Link to="/leases/new" style={{ color: "#fff" }}>Leases</Link>
-        </>
-      )}
+      <nav className="sidebar-nav">
+        {links.map((item) => (
+          <Link
+            key={item.to}
+            to={item.to}
+            className={`sidebar-link ${location.pathname === item.to ? "active" : ""}`}
+          >
+            {item.label}
+          </Link>
+        ))}
+      </nav>
 
-      {user.role === "manager" && (
-        <>
-          <Link to="/invites/new" style={{ color: "#fff" }}>Invites</Link>
-          <Link to="/leases/new" style={{ color: "#fff" }}>Leases</Link>
-          <Link to="/manager" style={{ color: "#fff" }}>Maintenance Queue</Link>
-        </>
-      )}
-
-      {user.role === "tenant" && (
-        <>
-          <Link to="/tenant" style={{ color: "#fff" }}>Dashboard</Link>
-          <Link to="/maintenance/new" style={{ color: "#fff" }}>Report Maintenance</Link>
-        </>
-      )}
-
-      <Link to="/profile" style={{ color: "#fff" }}>Profile</Link>
-
-      <button onClick={doLogout} style={{ marginLeft: "auto" }}>Logout</button>
-    </nav>
+      <div className="sidebar-actions">
+        <button className="btn-muted" onClick={toggleTheme}>
+          {theme === "dark" ? "Switch to light" : "Switch to dark"}
+        </button>
+        <button className="btn-secondary" onClick={doLogout}>Logout</button>
+      </div>
+    </aside>
   );
 }
