@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { Building2, CirclePlus, FilePlus2, Send, UserPlus } from "lucide-react";
 import api from "../services/api";
-import BackButton from "./BackButton";
+import StatCards from "./StatCards";
+import StatusBadge from "./StatusBadge";
 
 const SECTIONS = ["PAID", "PARTIAL", "UNPAID", "OVERDUE"];
 
@@ -9,7 +11,10 @@ const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 const PaymentTable = ({ section, rows }) => (
   <div className="card">
-    <h3>{section}</h3>
+    <div className="card-head">
+      <h3>{section} Payments</h3>
+      <StatusBadge status={section} />
+    </div>
     <table>
       <thead>
         <tr>
@@ -72,28 +77,29 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-container">
-      <BackButton />
-      <h2>Landlord Dashboard</h2>
       <p className="subtitle">Reporting period: {data.period}</p>
-
       {error && <p className="error">{error}</p>}
 
       <div className="card">
         <h3>Quick Actions</h3>
         <div className="action-links">
-          <Link to="/properties/new">Add Property</Link>
-          <Link to="/units/new">Add Unit</Link>
-          <Link to="/invites/new">Invite Tenant</Link>
-          <Link to="/managers/invite">Invite Manager</Link>
-          <Link to="/leases/new">Create Lease</Link>
-          <Link to="/profile">Profile</Link>
+          <Link to="/properties/new" className="action-link"><Building2 size={16} /> Add Property</Link>
+          <Link to="/units/new" className="action-link"><CirclePlus size={16} /> Add Unit</Link>
+          <Link to="/invites/new" className="action-link"><Send size={16} /> Invite Tenant</Link>
+          <Link to="/managers/invite" className="action-link"><UserPlus size={16} /> Invite Manager</Link>
+          <Link to="/leases/new" className="action-link"><FilePlus2 size={16} /> Create Lease</Link>
         </div>
       </div>
 
-      <div className="summary-stats">
-        <div className="stat-card"><h3>${formatCurrency(data.totals?.expected)}</h3><p>Expected</p></div>
-        <div className="stat-card"><h3>${formatCurrency(data.totals?.collected)}</h3><p>Collected</p></div>
-        <div className="stat-card"><h3>${formatCurrency(data.totals?.outstanding)}</h3><p>Outstanding</p></div>
+      <StatCards
+        expected={data.totals?.expected}
+        collected={data.totals?.collected}
+        outstanding={data.totals?.outstanding}
+      />
+
+      <div className="card">
+        <h3>Maintenance Overview</h3>
+        <p className="subtitle">Track payment progress and pending actions by lease status.</p>
       </div>
 
       {SECTIONS.map((section) => (

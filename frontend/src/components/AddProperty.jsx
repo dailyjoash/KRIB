@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
+import { Save, UserPlus } from "lucide-react";
 import api from "../services/api";
-import BackButton from "./BackButton";
 
 export default function AddProperty() {
   const [name, setName] = useState("");
@@ -67,20 +67,17 @@ export default function AddProperty() {
 
   return (
     <div className="dashboard-container">
-      <BackButton />
-      <h2>Property Management</h2>
-
       {error && <p className="error">{error}</p>}
       {success && <p className="success">{success}</p>}
 
       <div className="card">
         <h3>Add New Property</h3>
         <form onSubmit={createProperty}>
-          <div style={{ display: "flex", gap: "10px", flexDirection: "column", maxWidth: "400px" }}>
+          <div className="form-stack">
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Property name" required />
             <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Location" required />
             <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" rows="3" />
-            <button type="submit">Create Property</button>
+            <button type="submit"><Save size={16} /> Create Property</button>
           </div>
         </form>
       </div>
@@ -90,28 +87,28 @@ export default function AddProperty() {
         {properties.length === 0 ? (
           <p>No properties found.</p>
         ) : (
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <table>
             <thead>
               <tr>
-                <th style={{ textAlign: "left", padding: "8px" }}>Name</th>
-                <th style={{ textAlign: "left", padding: "8px" }}>Location</th>
-                <th style={{ textAlign: "left", padding: "8px" }}>Manager</th>
-                <th style={{ textAlign: "left", padding: "8px" }}>Actions</th>
+                <th>Name</th>
+                <th>Location</th>
+                <th>Manager</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               {properties.map((p) => (
                 <tr key={p.id}>
-                  <td style={{ padding: "8px" }}>{p.name}</td>
-                  <td style={{ padding: "8px" }}>{p.location}</td>
-                  <td style={{ padding: "8px" }}>{p.manager?.username || "Not assigned"}</td>
-                  <td style={{ padding: "8px" }}>
-                    <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                  <td>{p.name}</td>
+                  <td>{p.location}</td>
+                  <td>{p.manager?.username || "Not assigned"}</td>
+                  <td>
+                    <div className="inline-actions">
                       <select value={selection[p.id] || ""} onChange={(e) => setSelection({ ...selection, [p.id]: e.target.value })}>
                         <option value="">Select manager</option>
                         {managers.map((m) => <option key={m.id} value={m.id}>{m.username}</option>)}
                       </select>
-                      <button onClick={() => assignManager(p.id)}>Assign</button>
+                      <button type="button" onClick={() => assignManager(p.id)}><UserPlus size={16} /> Assign</button>
                     </div>
                   </td>
                 </tr>
