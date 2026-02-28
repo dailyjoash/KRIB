@@ -104,8 +104,6 @@ def get_me(request):
     })
 
 
-
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def change_password(request):
@@ -167,7 +165,8 @@ class ManagerInviteAcceptView(APIView):
     def post(self, request):
         serializer = ManagerInviteAcceptSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        invite = ManagerInvite.objects.filter(token=serializer.validated_data["token"]).first()
+        invite = ManagerInvite.objects.filter(
+            token=serializer.validated_data["token"]).first()
         if not invite or not invite.is_active:
             return Response({"detail": "Invalid invite token."}, status=400)
         if invite.is_expired() or invite.accepted_at:
@@ -175,7 +174,8 @@ class ManagerInviteAcceptView(APIView):
         if User.objects.filter(username=serializer.validated_data["username"]).exists():
             return Response({"username": ["Username already exists."]}, status=400)
 
-        user = User.objects.create(username=serializer.validated_data["username"], email=invite.email or "")
+        user = User.objects.create(
+            username=serializer.validated_data["username"], email=invite.email or "")
         user.set_password(serializer.validated_data["password"])
         user.save()
         profile, _ = Profile.objects.get_or_create(user=user)
@@ -201,6 +201,7 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
             q = q.filter(profile__role=wanted_role.lower())
         data = [{"id": u.id, "username": u.username} for u in q]
         return Response(data)
+
 
 class PropertyViewSet(viewsets.ModelViewSet):
     serializer_class = PropertySerializer
@@ -587,26 +588,6 @@ class STKCallbackView(APIView):
             payment.status = PaymentTransaction.STATUS_FAILED
         payment.save()
         return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
-
-
-class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
-    serializer_class = PaymentTransactionSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        role = _get_role(self.request.user)
-        if role in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
-            return Tenant.objects.select_related("user").all()
-        if role == Profile.ROLE_TENANT:
-            return Tenant.objects.filter(user=self.request.user).select_related("user")
-        return Tenant.objects.none()
-        if role == Profile.ROLE_TENANT:
-            return PaymentTransaction.objects.filter(tenant=self.request.user).select_related("lease", "lease__unit")
-        if role == Profile.ROLE_LANDLORD:
-            return PaymentTransaction.objects.all().select_related("lease", "lease__unit", "lease__unit__property")
-        if role == Profile.ROLE_MANAGER:
-            return PaymentTransaction.objects.filter(lease__unit__property__manager=self.request.user).select_related("lease", "lease__unit")
-        return PaymentTransaction.objects.none()
 
 
 class MaintenanceViewSet(viewsets.ModelViewSet):
