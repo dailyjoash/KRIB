@@ -27,9 +27,7 @@ export default function ManagerDashboard() {
     }
   };
 
-  useEffect(() => {
-    load();
-  }, []);
+  useEffect(() => { load(); }, []);
 
   const updateStatus = async (id, status) => {
     await api.patch(`/api/maintenance/${id}/`, { status });
@@ -43,11 +41,7 @@ export default function ManagerDashboard() {
       <p className="subtitle">Reporting period: {summary.period}</p>
       {error && <p className="error">{error}</p>}
 
-      <StatCards
-        expected={summary.totals.expected}
-        collected={summary.totals.collected}
-        outstanding={summary.totals.outstanding}
-      />
+      <StatCards expected={summary.totals.expected} collected={summary.totals.collected} outstanding={summary.totals.outstanding} />
 
       <div className="card">
         <h3>Quick Actions</h3>
@@ -73,7 +67,7 @@ export default function ManagerDashboard() {
             {maintenance.map((m) => (
               <tr key={m.id}>
                 <td>{m.tenant?.username}</td>
-                <td>{m.lease?.unit?.unit_number || "-"}</td>
+                <td>{m.lease?.unit ? `${m.lease.unit.property?.name || ""} / ${m.lease.unit.unit_number}` : "-"}</td>
                 <td>{m.issue}</td>
                 <td><StatusBadge status={m.status} /></td>
                 <td>
@@ -106,7 +100,7 @@ export default function ManagerDashboard() {
             {payments.map((p) => (
               <tr key={p.id}>
                 <td>{p.tenant?.username}</td>
-                <td>{p.lease?.unit?.unit_number || "-"}</td>
+                <td>{p.lease?.unit ? `${p.lease.unit.property?.name || ""} / ${p.lease.unit.unit_number}` : "-"}</td>
                 <td>{p.period}</td>
                 <td>{p.amount}</td>
                 <td><StatusBadge status={p.status} /></td>

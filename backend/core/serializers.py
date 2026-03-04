@@ -1,11 +1,12 @@
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import RegexValidator
-from django.utils import timezone
 from rest_framework import serializers
 
 from .models import (
+    LandlordPayout,
     Lease,
+    LedgerTransaction,
     MaintenanceRequest,
     Notification,
     PaymentTransaction,
@@ -22,7 +23,7 @@ from .models import (
 class UserLiteSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ["id", "username", "email"]
+        fields = ["id", "username", "email", "is_staff"]
 
 
 class ProfileSerializer(serializers.ModelSerializer):
@@ -30,13 +31,14 @@ class ProfileSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Profile
-        fields = ["id", "user", "role", "phone_number"]
+        fields = ["id", "user", "role", "phone_number", "wallet_available", "wallet_locked"]
 
 
 class MeSerializer(serializers.Serializer):
     id = serializers.IntegerField(read_only=True)
     username = serializers.CharField(read_only=True)
     role = serializers.CharField(read_only=True)
+    is_staff = serializers.BooleanField(read_only=True)
     email = serializers.EmailField(required=False, allow_blank=True)
     phone_number = serializers.CharField(
         required=False,
@@ -156,12 +158,29 @@ class InviteAcceptSerializer(serializers.Serializer):
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     lease = LeaseSerializer(read_only=True)
-    lease_id = serializers.PrimaryKeyRelatedField(queryset=Lease.objects.all(), source="lease", write_only=True)
+    lease_id = serializers.PrimaryKeyRelatedField(queryset=Lease.objects.all(), source="lease", write_only=True, required=False)
     tenant = UserLiteSerializer(read_only=True)
 
     class Meta:
         model = PaymentTransaction
-        fields = "__all__"
+        fields = [
+            "id",
+            "lease",
+            "lease_id",
+            "tenant",
+            "period",
+            "phone_number",
+            "amount",
+            "merchant_request_id",
+            "checkout_request_id",
+            "status",
+            "mpesa_receipt",
+            "result_code",
+            "result_desc",
+            "transaction_date",
+            "raw_callback",
+            "created_at",
+        ]
         read_only_fields = [
             "merchant_request_id",
             "checkout_request_id",
@@ -171,6 +190,7 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             "result_desc",
             "transaction_date",
             "raw_callback",
+            "created_at",
         ]
 
 
@@ -204,3 +224,25 @@ class DashboardRowSerializer(serializers.Serializer):
     paid_sum = serializers.DecimalField(max_digits=12, decimal_places=2)
     balance = serializers.DecimalField(max_digits=12, decimal_places=2)
     status = serializers.CharField()
+
+
+class LedgerTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LedgerTransaction
+        fields = ["id", "kind", "amount", "status", "available_at", "reference_text", "created_at"]
+
+
+class WalletWithdrawSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class LandlordPayoutSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LandlordPayout
+        fields = ["id", "amount", "method", "destination", "status", "created_at", "paid_at"]
+
+
+class LandlordPayoutRequestSerializer(serializers.Serializer):
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    method = serializers.ChoiceField(choices=[LandlordPayout.METHOD_MPESA, LandlordPayout.METHOD_BANK])
+    destination = serializers.CharField(max_length=255)

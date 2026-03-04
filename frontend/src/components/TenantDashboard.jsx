@@ -1,29 +1,33 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { CreditCard, Send } from "lucide-react";
+import { CreditCard, Send, Wallet } from "lucide-react";
 import api from "../services/api";
-import StatCards from "./StatCards";
 import StatusBadge from "./StatusBadge";
 
 export default function TenantDashboard() {
   const [summary, setSummary] = useState(null);
+  const [wallet, setWallet] = useState(null);
   const [phone, setPhone] = useState("");
   const [amount, setAmount] = useState("");
+  const [withdrawAmount, setWithdrawAmount] = useState("");
   const [issue, setIssue] = useState("");
   const [maintenance, setMaintenance] = useState([]);
   const [error, setError] = useState("");
 
   const load = async () => {
     try {
-      const [sumRes, maintRes] = await Promise.all([
+      const [sumRes, maintRes, walletRes] = await Promise.all([
         api.get("/api/dashboard/summary/"),
         api.get("/api/maintenance/"),
+        api.get("/api/wallet/"),
       ]);
       setSummary(sumRes.data);
       setMaintenance(maintRes.data || []);
+      setWallet(walletRes.data);
     } catch {
       setError("Failed to load tenant dashboard");
       setSummary({ active_lease: null, payments: [], rent: {}, show_overdue_banner: false });
+      setWallet({ wallet_available: 0, wallet_locked: 0, recent: [] });
     }
   };
 
@@ -31,7 +35,7 @@ export default function TenantDashboard() {
     load();
   }, []);
 
-  if (!summary) return <p>Loading...</p>;
+  if (!summary || !wallet) return <p>Loading...</p>;
   if (!summary.active_lease) return <p>No active lease yet.</p>;
 
   const pay = async () => {
@@ -47,6 +51,17 @@ export default function TenantDashboard() {
       await load();
     } catch (err) {
       setError(JSON.stringify(err.response?.data || "Failed to initiate payment"));
+    }
+  };
+
+  const requestWithdrawal = async () => {
+    setError("");
+    try {
+      await api.post("/api/wallet/withdraw/", { amount: withdrawAmount });
+      setWithdrawAmount("");
+      await load();
+    } catch (err) {
+      setError(JSON.stringify(err.response?.data || "Failed to request withdrawal"));
     }
   };
 
@@ -68,15 +83,33 @@ export default function TenantDashboard() {
       {error && <p className="error">{error}</p>}
       {summary.show_overdue_banner && <p className="error">Your rent is overdue.</p>}
 
-      <StatCards
-        expected={summary.rent.rent_due}
-        collected={summary.rent.paid_sum}
-        outstanding={summary.rent.balance}
-      />
-
       <div className="card">
         <h3>{summary.active_lease.unit.property.name} - Unit {summary.active_lease.unit.unit_number}</h3>
         <p className="subtitle">Current status: <StatusBadge status={summary.rent.status} /></p>
+        <p>Rent due: {Number(summary.rent.rent_due || 0).toFixed(2)}</p>
+        <p>Paid: {Number(summary.rent.paid_sum || 0).toFixed(2)}</p>
+        <p>Balance: {Number(summary.rent.balance || 0).toFixed(2)}</p>
+      </div>
+
+      <div className="card">
+        <h3><Wallet size={16} /> Wallet</h3>
+        <p>Available: {Number(wallet.wallet_available || 0).toFixed(2)}</p>
+        <p>Locked: {Number(wallet.wallet_locked || 0).toFixed(2)}</p>
+        <p className="subtitle">Withdrawals are processed after 7 days.</p>
+        <div className="form-stack">
+          <input placeholder="Withdraw amount" type="number" value={withdrawAmount} onChange={(e) => setWithdrawAmount(e.target.value)} />
+          <button onClick={requestWithdrawal}>Request Withdrawal</button>
+        </div>
+        <h4>Recent Wallet Transactions</h4>
+        {wallet.recent?.length === 0 ? <p>No wallet transactions yet.</p> : (
+          <ul className="clean-list">
+            {wallet.recent?.map((row) => (
+              <li key={row.id}>
+                {row.kind} - {Number(row.amount || 0).toFixed(2)} <StatusBadge status={row.status} />
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       <div className="card">
@@ -117,7 +150,7 @@ export default function TenantDashboard() {
           <ul className="clean-list">
             {summary.payments?.map((p) => (
               <li key={p.id}>
-                ${Number(p.amount).toFixed(2)} <StatusBadge status={p.status} />
+                {Number(p.amount).toFixed(2)} <StatusBadge status={p.status} />
                 {p.created_at && <span> • {new Date(p.created_at).toLocaleDateString()}</span>}
               </li>
             ))}

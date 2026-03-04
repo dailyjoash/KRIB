@@ -6,9 +6,9 @@ from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Sum
 from django.db.models.functions import Coalesce
-from django.utils import timezone
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+from django.utils import timezone
 
 
 class Profile(models.Model):
@@ -24,6 +24,9 @@ class Profile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default=ROLE_TENANT)
     phone_number = models.CharField(max_length=20, blank=True, null=True)
+    wallet_available = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    wallet_locked = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return f"{self.user.username} ({self.role})"
@@ -172,7 +175,7 @@ class PaymentTransaction(models.Model):
 
     lease = models.ForeignKey(Lease, on_delete=models.CASCADE, related_name="payment_transactions")
     tenant = models.ForeignKey(User, on_delete=models.CASCADE, related_name="payment_transactions")
-    period = models.CharField(max_length=7)  # YYYY-MM
+    period = models.CharField(max_length=7)
     phone_number = models.CharField(max_length=20)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     merchant_request_id = models.CharField(max_length=100, blank=True, null=True)
@@ -183,10 +186,77 @@ class PaymentTransaction(models.Model):
     result_desc = models.CharField(max_length=255, blank=True, null=True)
     transaction_date = models.DateTimeField(blank=True, null=True)
     raw_callback = models.JSONField(blank=True, null=True)
+    allocation_done = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"{self.tenant.username} {self.period} {self.amount}"
+
+
+class LandlordBalance(models.Model):
+    landlord = models.OneToOneField(User, on_delete=models.CASCADE, related_name="landlord_balance")
+    available_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    locked_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class LedgerTransaction(models.Model):
+    KIND_WALLET_CREDIT = "WALLET_CREDIT"
+    KIND_WALLET_DEBIT_RENT = "WALLET_DEBIT_RENT"
+    KIND_WALLET_WITHDRAW_REQUEST = "WALLET_WITHDRAW_REQUEST"
+    KIND_WALLET_WITHDRAW_PAID = "WALLET_WITHDRAW_PAID"
+    KIND_LANDLORD_CREDIT_RENT = "LANDLORD_CREDIT_RENT"
+    KIND_LANDLORD_PAYOUT_REQUEST = "LANDLORD_PAYOUT_REQUEST"
+    KIND_LANDLORD_PAYOUT_PAID = "LANDLORD_PAYOUT_PAID"
+    KIND_CHOICES = [
+        (KIND_WALLET_CREDIT, "Wallet Credit"),
+        (KIND_WALLET_DEBIT_RENT, "Wallet Debit Rent"),
+        (KIND_WALLET_WITHDRAW_REQUEST, "Wallet Withdrawal Request"),
+        (KIND_WALLET_WITHDRAW_PAID, "Wallet Withdrawal Paid"),
+        (KIND_LANDLORD_CREDIT_RENT, "Landlord Credit Rent"),
+        (KIND_LANDLORD_PAYOUT_REQUEST, "Landlord Payout Request"),
+        (KIND_LANDLORD_PAYOUT_PAID, "Landlord Payout Paid"),
+    ]
+
+    STATUS_PENDING = "PENDING"
+    STATUS_LOCKED = "LOCKED"
+    STATUS_AVAILABLE = "AVAILABLE"
+    STATUS_PAID = "PAID"
+    STATUS_REJECTED = "REJECTED"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_LOCKED, "Locked"),
+        (STATUS_AVAILABLE, "Available"),
+        (STATUS_PAID, "Paid"),
+        (STATUS_REJECTED, "Rejected"),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="ledger_transactions")
+    kind = models.CharField(max_length=40, choices=KIND_CHOICES)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    available_at = models.DateTimeField(blank=True, null=True)
+    reference_text = models.CharField(max_length=255, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class LandlordPayout(models.Model):
+    METHOD_MPESA = "MPESA"
+    METHOD_BANK = "BANK"
+    METHOD_CHOICES = [(METHOD_MPESA, "Mpesa"), (METHOD_BANK, "Bank")]
+
+    STATUS_PENDING = "PENDING"
+    STATUS_PAID = "PAID"
+    STATUS_FAILED = "FAILED"
+    STATUS_CHOICES = [(STATUS_PENDING, "Pending"), (STATUS_PAID, "Paid"), (STATUS_FAILED, "Failed")]
+
+    landlord = models.ForeignKey(User, on_delete=models.CASCADE, related_name="landlord_payouts")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    method = models.CharField(max_length=20, choices=METHOD_CHOICES)
+    destination = models.CharField(max_length=255)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    paid_at = models.DateTimeField(blank=True, null=True)
 
 
 class MaintenanceRequest(models.Model):
