@@ -9,11 +9,9 @@ import {
   Home,
   LogOut,
   Menu,
-  Moon,
   Receipt,
   Send,
   ShieldCheck,
-  Sun,
   UserCircle,
   Wallet,
   Users,
@@ -22,12 +20,11 @@ import { AuthContext } from "../context/AuthContext";
 
 const getHomePath = (role) => (role === "landlord" ? "/dashboard" : role === "manager" ? "/manager" : "/tenant");
 
-export default function Layout({ title, subtitle, children }) {
+export default function Layout({ title, children }) {
   const { user, logout } = useContext(AuthContext);
   const navigate = useNavigate();
   const location = useLocation();
 
-  const [theme, setTheme] = useState(localStorage.getItem("theme") || "dark");
   const [mobileOpen, setMobileOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(localStorage.getItem("sidebarCollapsed") === "1");
 
@@ -48,11 +45,6 @@ export default function Layout({ title, subtitle, children }) {
   );
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem("theme", theme);
-  }, [theme]);
-
-  useEffect(() => {
     setMobileOpen(false);
   }, [location.pathname]);
 
@@ -64,6 +56,8 @@ export default function Layout({ title, subtitle, children }) {
     logout();
     navigate("/login");
   };
+
+  const topbarLabel = typeof title === "string" ? title : null;
 
   return (
     <div className={`layout-root ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
@@ -108,10 +102,6 @@ export default function Layout({ title, subtitle, children }) {
         </nav>
 
         <div className="sidebar-actions">
-          <button className="btn btn-outline" onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))} type="button">
-            {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
-            {!sidebarCollapsed ? <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span> : null}
-          </button>
           <button className="btn btn-primary" onClick={doLogout} type="button">
             <LogOut size={18} />
             {!sidebarCollapsed ? <span>Logout</span> : null}
@@ -128,10 +118,7 @@ export default function Layout({ title, subtitle, children }) {
             <button className="icon-btn back-btn" onClick={() => navigate(-1)} type="button" aria-label="Go back">
               <ChevronLeft size={20} />
             </button>
-            <div className="topbar-title-wrap">
-              <h1 className="topbar-title">{title}</h1>
-              {subtitle ? <p className="subtitle">{subtitle}</p> : null}
-            </div>
+            {topbarLabel ? <span className="topbar-label">{topbarLabel}</span> : null}
           </div>
         </header>
 
