@@ -1,21 +1,25 @@
 import React from "react";
-import { Routes, Route } from "react-router-dom";
-
-import Login from "./components/Login";
-import Dashboard from "./components/Dashboard";
-import ManagerDashboard from "./components/ManagerDashboard";
-import TenantDashboard from "./components/TenantDashboard";
-import AddProperty from "./components/AddProperty";
-import UnitsNew from "./components/UnitsNew";
-import InvitesNew from "./components/InvitesNew";
-import LeasesNew from "./components/LeasesNew";
-import MaintenanceNew from "./components/MaintenanceNew";
-import InviteManager from "./components/InviteManager";
+import { Route, Routes } from "react-router-dom";
 import AcceptInvite from "./components/AcceptInvite";
+import Dashboard from "./components/Dashboard";
+import Greeting from "./components/Greeting";
+import InviteManager from "./components/InviteManager";
+import InvitesNew from "./components/InvitesNew";
+import Layout from "./components/Layout";
+import LeasesNew from "./components/LeasesNew";
+import Login from "./components/Login";
+import MaintenanceNew from "./components/MaintenanceNew";
+import ManagerDashboard from "./components/ManagerDashboard";
 import Profile from "./components/Profile";
 import ProtectedRoute from "./components/ProtectedRoute";
-import Layout from "./components/Layout";
-import Greeting from "./components/Greeting";
+import AddProperty from "./components/AddProperty";
+import TenantDashboard from "./components/TenantDashboard";
+import TenantLease from "./components/TenantLease";
+import TenantMaintenance from "./components/TenantMaintenance";
+import TenantPayments from "./components/TenantPayments";
+import TenantPayRent from "./components/TenantPayRent";
+import TenantWallet from "./components/TenantWallet";
+import UnitsNew from "./components/UnitsNew";
 
 const ProtectedPage = ({ allowedRoles, title, subtitle, children }) => (
   <ProtectedRoute allowedRoles={allowedRoles}>
@@ -35,11 +39,7 @@ export default function App() {
       <Route
         path="/dashboard"
         element={(
-          <ProtectedPage
-            allowedRoles={["landlord"]}
-            title={<Greeting />}
-            subtitle="Landlord view"
-          >
+          <ProtectedPage allowedRoles={["landlord"]} title={<Greeting />} subtitle="Landlord view">
             <Dashboard />
           </ProtectedPage>
         )}
@@ -47,11 +47,7 @@ export default function App() {
       <Route
         path="/manager"
         element={(
-          <ProtectedPage
-            allowedRoles={["manager"]}
-            title={<Greeting />}
-            subtitle="Manager view"
-          >
+          <ProtectedPage allowedRoles={["manager"]} title={<Greeting />} subtitle="Manager view">
             <ManagerDashboard />
           </ProtectedPage>
         )}
@@ -59,15 +55,53 @@ export default function App() {
       <Route
         path="/tenant"
         element={(
-          <ProtectedPage
-            allowedRoles={["tenant"]}
-            title={<Greeting />}
-            subtitle="Tenant view"
-          >
+          <ProtectedPage allowedRoles={["tenant"]} title={<Greeting />} subtitle="Tenant view">
             <TenantDashboard />
           </ProtectedPage>
         )}
       />
+
+      <Route
+        path="/tenant/lease"
+        element={(
+          <ProtectedPage allowedRoles={["tenant"]} title="Current Lease" subtitle="Tenant view">
+            <TenantLease />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/tenant/pay"
+        element={(
+          <ProtectedPage allowedRoles={["tenant"]} title="Pay Rent" subtitle="Tenant view">
+            <TenantPayRent />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/tenant/wallet"
+        element={(
+          <ProtectedPage allowedRoles={["tenant"]} title="Wallet" subtitle="Tenant view">
+            <TenantWallet />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/tenant/payments"
+        element={(
+          <ProtectedPage allowedRoles={["tenant"]} title="Payments" subtitle="Tenant view">
+            <TenantPayments />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/tenant/maintenance"
+        element={(
+          <ProtectedPage allowedRoles={["tenant"]} title="Maintenance" subtitle="Tenant view">
+            <TenantMaintenance />
+          </ProtectedPage>
+        )}
+      />
+
       <Route
         path="/manager-dashboard"
         element={(
