@@ -2,7 +2,6 @@ import React from "react";
 import { Route, Routes } from "react-router-dom";
 import AcceptInvite from "./components/AcceptInvite";
 import Dashboard from "./components/Dashboard";
-import Greeting from "./components/Greeting";
 import InviteManager from "./components/InviteManager";
 import InvitesNew from "./components/InvitesNew";
 import Layout from "./components/Layout";
@@ -39,7 +38,7 @@ export default function App() {
       <Route
         path="/dashboard"
         element={(
-          <ProtectedPage allowedRoles={["landlord"]} title={<Greeting />} subtitle="Landlord view">
+          <ProtectedPage allowedRoles={["landlord"]} title={null} subtitle={null}>
             <Dashboard />
           </ProtectedPage>
         )}
@@ -47,7 +46,7 @@ export default function App() {
       <Route
         path="/manager"
         element={(
-          <ProtectedPage allowedRoles={["manager"]} title={<Greeting />} subtitle="Manager view">
+          <ProtectedPage allowedRoles={["manager"]} title={null} subtitle={null}>
             <ManagerDashboard />
           </ProtectedPage>
         )}
@@ -55,7 +54,7 @@ export default function App() {
       <Route
         path="/tenant"
         element={(
-          <ProtectedPage allowedRoles={["tenant"]} title={<Greeting />} subtitle="Tenant view">
+          <ProtectedPage allowedRoles={["tenant"]} title={null} subtitle={null}>
             <TenantDashboard />
           </ProtectedPage>
         )}
@@ -105,7 +104,7 @@ export default function App() {
       <Route
         path="/manager-dashboard"
         element={(
-          <ProtectedPage allowedRoles={["manager"]} title={<Greeting />} subtitle="Manager view">
+          <ProtectedPage allowedRoles={["manager"]} title={null} subtitle={null}>
             <ManagerDashboard />
           </ProtectedPage>
         )}
@@ -113,7 +112,7 @@ export default function App() {
       <Route
         path="/tenant-dashboard"
         element={(
-          <ProtectedPage allowedRoles={["tenant"]} title={<Greeting />} subtitle="Tenant view">
+          <ProtectedPage allowedRoles={["tenant"]} title={null} subtitle={null}>
             <TenantDashboard />
           </ProtectedPage>
         )}

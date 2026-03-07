@@ -102,10 +102,6 @@ button.btn-primary {
   box-shadow: 0 12px 28px rgba(76, 103, 255, 0.35);
 }
 
-.btn-outline {
-  border-color: var(--border);
-  background: rgba(255, 255, 255, 0.04);
-}
 
 .btn-glass {
   border-color: rgba(255, 255, 255, 0.42);
@@ -320,7 +316,11 @@ form { display: grid; gap: 12px; }
   z-index: 92;
 }
 
-.topbar-title { font-size: clamp(1.15rem, 2.2vw, 1.45rem); }
+.topbar-label {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--muted);
+}
 
 .page-content {
   margin-top: 14px;
