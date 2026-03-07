@@ -40,6 +40,10 @@ export default function Layout({ title, subtitle, children }) {
   );
 
   useEffect(() => {
+    document.documentElement.classList.toggle("theme-dark", theme === "dark");
+  }, [theme]);
+
+  useEffect(() => {
     setOpen(false);
   }, [location.pathname]);
 
@@ -47,7 +51,6 @@ export default function Layout({ title, subtitle, children }) {
     const nextTheme = theme === "dark" ? "light" : "dark";
     setTheme(nextTheme);
     localStorage.setItem("theme", nextTheme);
-    document.documentElement.classList.toggle("theme-dark", nextTheme === "dark");
   };
 
   const doLogout = () => {
@@ -89,11 +92,11 @@ export default function Layout({ title, subtitle, children }) {
         </nav>
 
         <div className="sidebar-actions">
-          <button className="btn-muted" onClick={toggleTheme}>
+          <button className="btn btn-glass sidebar-theme-toggle" onClick={toggleTheme}>
             {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
             <span>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
           </button>
-          <button className="btn-secondary" onClick={doLogout}>
+          <button className="btn btn-primary" onClick={doLogout}>
             <LogOut size={16} />
             <span>Logout</span>
           </button>
