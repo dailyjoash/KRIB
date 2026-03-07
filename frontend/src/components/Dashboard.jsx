@@ -1,15 +1,28 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Building2, CirclePlus, FilePlus2, Send, UserPlus } from "lucide-react";
+import {
+  Banknote,
+  Building2,
+  CirclePlus,
+  Coins,
+  FilePlus2,
+  Send,
+  ShieldCheck,
+  UserPlus,
+  Wrench,
+} from "lucide-react";
 import api from "../services/api";
-import StatCards from "./StatCards";
+import Greeting from "./Greeting";
+import GradientCard from "./GradientCard";
+import GlassCard from "./GlassCard";
 import StatusBadge from "./StatusBadge";
+import WelcomeBanner from "./WelcomeBanner";
 
 const SECTIONS = ["PAID", "PARTIAL", "UNPAID", "OVERDUE"];
 const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 const PaymentTable = ({ section, rows }) => (
-  <div className="card">
+  <GlassCard>
     <div className="card-head">
       <h3>{section} Payments</h3>
       <StatusBadge status={section} />
@@ -38,7 +51,7 @@ const PaymentTable = ({ section, rows }) => (
         ))}
       </tbody>
     </table>
-  </div>
+  </GlassCard>
 );
 
 export default function Dashboard() {
@@ -90,10 +103,17 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-container">
+      <WelcomeBanner title={<Greeting />} subtitle="Landlord view" />
       <p className="subtitle">Reporting period: {data.period}</p>
       {error && <p className="error">{error}</p>}
 
-      <div className="card">
+      <section className="gradient-card-row">
+        <GradientCard variant="blue" icon={Banknote} title="Expected" subtitle="Period projection" value={formatCurrency(data.totals?.expected)} ctaLabel="Revenue" />
+        <GradientCard variant="indigo" icon={Coins} title="Collected" subtitle="Successfully paid" value={formatCurrency(data.totals?.collected)} ctaLabel="Receipts" />
+        <GradientCard variant="violet" icon={ShieldCheck} title="Outstanding" subtitle="Pending collection" value={formatCurrency(data.totals?.outstanding)} ctaLabel="Follow-up" />
+      </section>
+
+      <GlassCard>
         <h3>Quick Actions</h3>
         <div className="action-links">
           <Link to="/properties/new" className="action-link"><Building2 size={16} /> Add Property</Link>
@@ -102,12 +122,10 @@ export default function Dashboard() {
           <Link to="/managers/invite" className="action-link"><UserPlus size={16} /> Invite Manager</Link>
           <Link to="/leases/new" className="action-link"><FilePlus2 size={16} /> Create Lease</Link>
         </div>
-      </div>
+      </GlassCard>
 
-      <StatCards expected={data.totals?.expected} collected={data.totals?.collected} outstanding={data.totals?.outstanding} />
-
-      <div className="card">
-        <h3>Maintenance</h3>
+      <GlassCard>
+        <h3><Wrench size={16} /> Maintenance</h3>
         <table>
           <thead>
             <tr>
@@ -130,9 +148,9 @@ export default function Dashboard() {
             ))}
           </tbody>
         </table>
-      </div>
+      </GlassCard>
 
-      <div className="card">
+      <GlassCard>
         <h3>Payouts</h3>
         <p>Available: {formatCurrency(payouts.available_balance)}</p>
         <p>Locked: {formatCurrency(payouts.locked_balance)}</p>
@@ -143,7 +161,7 @@ export default function Dashboard() {
             <option value="BANK">BANK</option>
           </select>
           <input placeholder="Destination" value={form.destination} onChange={(e) => setForm({ ...form, destination: e.target.value })} />
-          <button onClick={requestPayout}>Request Payout</button>
+          <button className="btn btn-primary" onClick={requestPayout}>Request Payout</button>
         </div>
         <table>
           <thead>
@@ -164,12 +182,12 @@ export default function Dashboard() {
                 <td>{p.destination}</td>
                 <td><StatusBadge status={p.status} /></td>
                 <td>{p.created_at ? new Date(p.created_at).toLocaleDateString() : "-"}</td>
-                <td>{isStaff && p.status !== "PAID" ? <button onClick={() => markPaid(p.id)}>Mark Paid</button> : "-"}</td>
+                <td>{isStaff && p.status !== "PAID" ? <button className="btn btn-glass" onClick={() => markPaid(p.id)}>Mark Paid</button> : "-"}</td>
               </tr>
             ))}
           </tbody>
         </table>
-      </div>
+      </GlassCard>
 
       {SECTIONS.map((section) => <PaymentTable key={section} section={section} rows={data.lists?.[section] || []} />)}
     </div>

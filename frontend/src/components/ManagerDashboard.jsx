@@ -1,9 +1,14 @@
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { FilePlus2, Send } from "lucide-react";
+import { CircleDollarSign, FilePlus2, Landmark, Send, ShieldAlert, Wrench } from "lucide-react";
 import api from "../services/api";
-import StatCards from "./StatCards";
+import Greeting from "./Greeting";
+import GradientCard from "./GradientCard";
+import GlassCard from "./GlassCard";
 import StatusBadge from "./StatusBadge";
+import WelcomeBanner from "./WelcomeBanner";
+
+const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 export default function ManagerDashboard() {
   const [summary, setSummary] = useState(null);
@@ -38,21 +43,26 @@ export default function ManagerDashboard() {
 
   return (
     <div className="dashboard-container">
+      <WelcomeBanner title={<Greeting />} subtitle="Manager view" />
       <p className="subtitle">Reporting period: {summary.period}</p>
       {error && <p className="error">{error}</p>}
 
-      <StatCards expected={summary.totals.expected} collected={summary.totals.collected} outstanding={summary.totals.outstanding} />
+      <section className="gradient-card-row">
+        <GradientCard variant="blue" icon={Landmark} title="Expected" subtitle="Scheduled revenue" value={formatCurrency(summary.totals?.expected)} ctaLabel="Overview" />
+        <GradientCard variant="indigo" icon={CircleDollarSign} title="Collected" subtitle="Settled payments" value={formatCurrency(summary.totals?.collected)} ctaLabel="Review" />
+        <GradientCard variant="violet" icon={ShieldAlert} title="Outstanding" subtitle="Open balances" value={formatCurrency(summary.totals?.outstanding)} ctaLabel="Action" />
+      </section>
 
-      <div className="card">
+      <GlassCard>
         <h3>Quick Actions</h3>
         <div className="action-links">
           <Link to="/invites/new" className="action-link"><Send size={16} /> Invite Tenant</Link>
           <Link to="/leases/new" className="action-link"><FilePlus2 size={16} /> Create Lease</Link>
         </div>
-      </div>
+      </GlassCard>
 
-      <div className="card">
-        <h3>Maintenance Queue</h3>
+      <GlassCard>
+        <h3><Wrench size={16} /> Maintenance Queue</h3>
         <table>
           <thead>
             <tr>
@@ -67,7 +77,7 @@ export default function ManagerDashboard() {
             {maintenance.map((m) => (
               <tr key={m.id}>
                 <td>{m.tenant?.username}</td>
-                <td>{m.lease?.unit ? `${m.lease.unit.property?.name || ""} / ${m.lease.unit.unit_number}` : "-"}</td>
+                <td>{m.lease?.unit ? `${m.lease.unit.property?.name || "-"} / ${m.lease.unit.unit_number}` : "-"}</td>
                 <td>{m.issue}</td>
                 <td><StatusBadge status={m.status} /></td>
                 <td>
@@ -82,9 +92,9 @@ export default function ManagerDashboard() {
             ))}
           </tbody>
         </table>
-      </div>
+      </GlassCard>
 
-      <div className="card">
+      <GlassCard>
         <h3>Payments (assigned properties)</h3>
         <table>
           <thead>
@@ -108,7 +118,7 @@ export default function ManagerDashboard() {
             ))}
           </tbody>
         </table>
-      </div>
+      </GlassCard>
     </div>
   );
 }
