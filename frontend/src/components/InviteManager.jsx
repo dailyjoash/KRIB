@@ -1,6 +1,5 @@
 import React, { useState } from "react";
 import api from "../services/api";
-import BackButton from "./BackButton";
 
 export default function InviteManager() {
   const [email, setEmail] = useState("");
@@ -21,7 +20,6 @@ export default function InviteManager() {
 
   return (
     <div className="dashboard-container">
-      <BackButton />
       <h2>Invite Manager</h2>
       {error && <p className="error">{error}</p>}
       <div className="card">

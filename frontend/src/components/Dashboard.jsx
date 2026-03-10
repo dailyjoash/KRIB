@@ -30,7 +30,7 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-container dashboard-balanced">
-      <WelcomeBanner title={<Greeting />} subtitle="Landlord view" />
+      <WelcomeBanner title={<Greeting />} subtitle="Landlord overview" />
       {error && <p className="error">{error}</p>}
 
       <section className="gradient-card-row">
@@ -39,7 +39,7 @@ export default function Dashboard() {
         <GradientCard variant="violet" icon={ShieldCheck} title="Outstanding" subtitle="Pending collection" value={formatKES(data.totals?.outstanding)} ctaLabel="Follow-up" />
       </section>
 
-      <GlassCard title="Quick Actions">
+      <GlassCard title="Quick Actions" actions={<span className="subtitle">Property operations</span>}>
         <div className="action-links">
           <Link to="/properties/new" className="action-link"><Building2 size={18} /> Add Property</Link>
           <Link to="/units/new" className="action-link"><CirclePlus size={18} /> Add Unit</Link>
@@ -49,7 +49,7 @@ export default function Dashboard() {
         </div>
       </GlassCard>
 
-      <GlassCard title="Maintenance Preview" actions={<Link to="/leases/new">View all</Link>}>
+      <GlassCard title="Maintenance" actions={<Link to="/leases/new">View all</Link>}>
         <table>
           <thead>
             <tr>

@@ -38,8 +38,8 @@ export default function ManagerDashboard() {
   if (!summary) return <p className="loading">Loading...</p>;
 
   return (
-    <div className="dashboard-container">
-      <WelcomeBanner title={<Greeting />} subtitle="Manager view" />
+    <div className="dashboard-container dashboard-balanced">
+      <WelcomeBanner title={<Greeting />} subtitle="Manager overview" />
       {error && <p className="error">{error}</p>}
 
       <section className="gradient-card-row">
@@ -48,14 +48,14 @@ export default function ManagerDashboard() {
         <GradientCard variant="violet" icon={ShieldAlert} title="Outstanding" subtitle="Open balances" value={formatKES(summary.totals?.outstanding)} ctaLabel="Action" />
       </section>
 
-      <GlassCard title="Quick Actions">
+      <GlassCard title="Quick Actions" actions={<span className="subtitle">Tenant operations</span>}>
         <div className="action-links">
           <Link to="/invites/new" className="action-link"><Send size={18} /> Invite Tenant</Link>
           <Link to="/leases/new" className="action-link"><FilePlus2 size={18} /> Create Lease</Link>
         </div>
       </GlassCard>
 
-      <GlassCard title="Maintenance Queue" actions={<span className="subtitle">Showing latest 5</span>}>
+      <GlassCard title="Maintenance Queue" actions={<span className="subtitle">Latest requests</span>}>
         <table>
           <thead>
             <tr>
@@ -69,7 +69,7 @@ export default function ManagerDashboard() {
           <tbody>
             {maintenance.slice(0, 5).map((m) => (
               <tr key={m.id}>
-                <td>{m.tenant?.username}</td>
+                <td>{m.tenant?.username || "-"}</td>
                 <td>{m.lease?.unit ? `${m.lease.unit.property?.name || "-"} / ${m.lease.unit.unit_number}` : "-"}</td>
                 <td>{m.issue}</td>
                 <td><StatusBadge status={m.status} /></td>
