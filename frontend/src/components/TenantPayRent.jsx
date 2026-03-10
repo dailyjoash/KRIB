@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { CreditCard } from "lucide-react";
 import api from "../services/api";
+import { formatKES } from "../utils/money";
 import GlassCard from "./GlassCard";
 
 export default function TenantPayRent() {
@@ -49,7 +50,8 @@ export default function TenantPayRent() {
       <GlassCard title="Pay Rent via STK Push">
         <div className="form-stack">
           <input placeholder="Phone (e.g., 2547...)" value={phone} onChange={(e) => setPhone(e.target.value)} />
-          <input placeholder="Amount" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <input placeholder="Amount (KES)" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <p className="subtitle">Amount to be charged: {formatKES(amount)}</p>
           <button className="btn btn-primary" onClick={pay} type="button">
             <CreditCard size={18} />
             <span>Initiate STK Push</span>

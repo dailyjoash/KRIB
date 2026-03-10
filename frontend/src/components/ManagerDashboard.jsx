@@ -2,13 +2,12 @@ import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { CircleDollarSign, FilePlus2, Landmark, Send, ShieldAlert } from "lucide-react";
 import api from "../services/api";
+import { formatKES } from "../utils/money";
 import GradientCard from "./GradientCard";
 import GlassCard from "./GlassCard";
 import Greeting from "./Greeting";
 import StatusBadge from "./StatusBadge";
 import WelcomeBanner from "./WelcomeBanner";
-
-const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 export default function ManagerDashboard() {
   const [summary, setSummary] = useState(null);
@@ -44,9 +43,9 @@ export default function ManagerDashboard() {
       {error && <p className="error">{error}</p>}
 
       <section className="gradient-card-row">
-        <GradientCard variant="blue" icon={Landmark} title="Expected" subtitle={`Period: ${summary.period}`} value={formatCurrency(summary.totals?.expected)} ctaLabel="Overview" />
-        <GradientCard variant="indigo" icon={CircleDollarSign} title="Collected" subtitle="Settled payments" value={formatCurrency(summary.totals?.collected)} ctaLabel="Review" />
-        <GradientCard variant="violet" icon={ShieldAlert} title="Outstanding" subtitle="Open balances" value={formatCurrency(summary.totals?.outstanding)} ctaLabel="Action" />
+        <GradientCard variant="blue" icon={Landmark} title="Expected" subtitle={`Period: ${summary.period}`} value={formatKES(summary.totals?.expected)} ctaLabel="Overview" />
+        <GradientCard variant="indigo" icon={CircleDollarSign} title="Collected" subtitle="Settled payments" value={formatKES(summary.totals?.collected)} ctaLabel="Review" />
+        <GradientCard variant="violet" icon={ShieldAlert} title="Outstanding" subtitle="Open balances" value={formatKES(summary.totals?.outstanding)} ctaLabel="Action" />
       </section>
 
       <GlassCard title="Quick Actions">

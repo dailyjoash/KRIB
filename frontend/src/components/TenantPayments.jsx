@@ -1,9 +1,8 @@
 import React, { useEffect, useState } from "react";
 import api from "../services/api";
+import { formatKES } from "../utils/money";
 import GlassCard from "./GlassCard";
 import StatusBadge from "./StatusBadge";
-
-const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 export default function TenantPayments() {
   const [payments, setPayments] = useState([]);
@@ -40,7 +39,7 @@ export default function TenantPayments() {
               {payments.map((payment) => (
                 <tr key={payment.id}>
                   <td>{payment.created_at ? new Date(payment.created_at).toLocaleDateString() : "-"}</td>
-                  <td>{formatCurrency(payment.amount)}</td>
+                  <td>{formatKES(payment.amount)}</td>
                   <td><StatusBadge status={payment.status} /></td>
                 </tr>
               ))}

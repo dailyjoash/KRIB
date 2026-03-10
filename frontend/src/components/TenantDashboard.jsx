@@ -2,11 +2,10 @@ import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { CircleDollarSign, Home, Wallet } from "lucide-react";
 import api from "../services/api";
+import { formatKES } from "../utils/money";
 import GradientCard from "./GradientCard";
 import Greeting from "./Greeting";
 import WelcomeBanner from "./WelcomeBanner";
-
-const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 export default function TenantDashboard() {
   const navigate = useNavigate();
@@ -57,7 +56,7 @@ export default function TenantDashboard() {
           icon={CircleDollarSign}
           title="Amount Due"
           subtitle={`Status: ${summary.rent?.status || "pending"}`}
-          value={formatCurrency(summary.rent?.balance || summary.rent?.rent_due)}
+          value={formatKES(summary.rent?.balance || summary.rent?.rent_due)}
           ctaLabel="Pay now"
           onCta={() => navigate("/tenant/pay")}
           onClick={() => navigate("/tenant/pay")}
@@ -67,7 +66,7 @@ export default function TenantDashboard() {
           icon={Wallet}
           title="Wallet"
           subtitle="Available balance"
-          value={formatCurrency(wallet.wallet_available)}
+          value={formatKES(wallet.wallet_available)}
           ctaLabel="Withdraw / Wallet"
           onCta={() => navigate("/tenant/wallet")}
           onClick={() => navigate("/tenant/wallet")}

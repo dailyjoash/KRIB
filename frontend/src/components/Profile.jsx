@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from "react";
+import { Moon, Sun } from "lucide-react";
 import api from "../services/api";
-import BackButton from "./BackButton";
+import GlassCard from "./GlassCard";
 
 export default function Profile() {
   const [form, setForm] = useState({ email: "", phone_number: "" });
   const [passwordForm, setPasswordForm] = useState({ old_password: "", new_password: "", confirm_password: "" });
-  const [theme, setTheme] = useState(localStorage.getItem("theme") || "dark");
+  const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
@@ -20,7 +21,11 @@ export default function Profile() {
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
-    document.documentElement.classList.toggle("theme-dark", theme === "dark");
+    if (theme === "light") {
+      document.documentElement.classList.add("theme-light");
+    } else {
+      document.documentElement.classList.remove("theme-light");
+    }
   }, [theme]);
 
   const saveProfile = async (e) => {
@@ -57,34 +62,37 @@ export default function Profile() {
 
   return (
     <div className="dashboard-container">
-      <BackButton />
       <h2>Profile Settings</h2>
       {message && <p className="success">{message}</p>}
       {error && <p className="error">{error}</p>}
 
-      <div className="card">
-        <h3>Update details</h3>
+      <GlassCard title="Update details">
         <form onSubmit={saveProfile}>
           <input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Email" />
           <input value={form.phone_number} onChange={(e) => setForm({ ...form, phone_number: e.target.value })} placeholder="Phone number" />
           <button type="submit">Save</button>
         </form>
-      </div>
+      </GlassCard>
 
-      <div className="card">
-        <h3>Change password</h3>
+      <GlassCard title="Change password">
         <form onSubmit={changePassword}>
           <input type="password" value={passwordForm.old_password} onChange={(e) => setPasswordForm({ ...passwordForm, old_password: e.target.value })} placeholder="Old password" required />
           <input type="password" value={passwordForm.new_password} onChange={(e) => setPasswordForm({ ...passwordForm, new_password: e.target.value })} placeholder="New password" required />
           <input type="password" value={passwordForm.confirm_password} onChange={(e) => setPasswordForm({ ...passwordForm, confirm_password: e.target.value })} placeholder="Confirm new password" required />
           <button type="submit">Change Password</button>
         </form>
-      </div>
+      </GlassCard>
 
-      <div className="card">
-        <h3>Theme</h3>
-        <button onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>Switch to {theme === "dark" ? "light" : "dark"} mode</button>
-      </div>
+      <GlassCard
+        title="Appearance"
+        actions={(
+          <button className="icon-btn" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} type="button" aria-label="Toggle color theme">
+            {theme === "light" ? <Moon size={18} /> : <Sun size={18} />}
+          </button>
+        )}
+      >
+        <p className="subtitle">Current theme: {theme === "light" ? "Light" : "Dark"}</p>
+      </GlassCard>
     </div>
   );
 }
