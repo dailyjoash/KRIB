@@ -1,7 +1,6 @@
 import React, { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import api from "../services/api";
-import BackButton from "./BackButton";
 
 export default function AcceptInvite() {
   const { token } = useParams();
@@ -28,7 +27,6 @@ export default function AcceptInvite() {
 
   return (
     <div className="dashboard-container">
-      <BackButton />
       <h2>Accept Manager Invite</h2>
       {error && <p className="error">{error}</p>}
       <div className="card">
