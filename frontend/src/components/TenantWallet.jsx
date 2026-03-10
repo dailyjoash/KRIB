@@ -1,10 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { ArrowDownToLine } from "lucide-react";
 import api from "../services/api";
+import { formatKES } from "../utils/money";
 import GlassCard from "./GlassCard";
 import StatusBadge from "./StatusBadge";
-
-const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 export default function TenantWallet() {
   const [wallet, setWallet] = useState(null);
@@ -43,15 +42,15 @@ export default function TenantWallet() {
       {error ? <p className="error">{error}</p> : null}
       <GlassCard title="Wallet Balances">
         <div className="detail-grid">
-          <p>Available: <strong>{formatCurrency(wallet.wallet_available)}</strong></p>
-          <p>Locked: <strong>{formatCurrency(wallet.wallet_locked)}</strong></p>
+          <p>Available: <strong>{formatKES(wallet.wallet_available)}</strong></p>
+          <p>Locked: <strong>{formatKES(wallet.wallet_locked)}</strong></p>
         </div>
         <p className="subtitle">Available after 7 days before withdrawal is processed.</p>
       </GlassCard>
 
       <GlassCard title="Request Withdrawal">
         <div className="form-stack">
-          <input placeholder="Withdraw amount" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <input placeholder="Withdraw amount (KES)" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
           <button className="btn btn-primary" type="button" onClick={requestWithdrawal}>
             <ArrowDownToLine size={18} />
             <span>Request Withdrawal</span>
@@ -75,7 +74,7 @@ export default function TenantWallet() {
               {wallet.recent?.map((row) => (
                 <tr key={row.id}>
                   <td>{row.kind}</td>
-                  <td>{formatCurrency(row.amount)}</td>
+                  <td>{formatKES(row.amount)}</td>
                   <td><StatusBadge status={row.status} /></td>
                 </tr>
               ))}

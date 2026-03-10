@@ -6,9 +6,11 @@ import App from "./App";
 
 import "./styles.css";
 
-const savedTheme = localStorage.getItem("theme") || "dark";
-if (savedTheme === "dark") {
-  document.documentElement.classList.add("theme-dark");
+const savedTheme = localStorage.getItem("theme") || "light";
+if (savedTheme === "light") {
+  document.documentElement.classList.add("theme-light");
+} else {
+  document.documentElement.classList.remove("theme-light");
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(

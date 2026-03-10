@@ -9,9 +9,11 @@ import {
   Home,
   LogOut,
   Menu,
+  Moon,
   Receipt,
   Send,
   ShieldCheck,
+  Sun,
   UserCircle,
   Wallet,
   Users,
@@ -20,6 +22,8 @@ import { AuthContext } from "../context/AuthContext";
 
 const getHomePath = (role) => (role === "landlord" ? "/dashboard" : role === "manager" ? "/manager" : "/tenant");
 
+const MAIN_LANDING_PATHS = new Set(["/dashboard", "/manager", "/tenant", "/manager-dashboard", "/tenant-dashboard"]);
+
 export default function Layout({ title, children }) {
   const { user, logout } = useContext(AuthContext);
   const navigate = useNavigate();
@@ -27,6 +31,7 @@ export default function Layout({ title, children }) {
 
   const [mobileOpen, setMobileOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(localStorage.getItem("sidebarCollapsed") === "1");
+  const [theme, setTheme] = useState(localStorage.getItem("theme") || "light");
 
   const links = useMemo(
     () => [
@@ -52,12 +57,26 @@ export default function Layout({ title, children }) {
     localStorage.setItem("sidebarCollapsed", sidebarCollapsed ? "1" : "0");
   }, [sidebarCollapsed]);
 
+  useEffect(() => {
+    localStorage.setItem("theme", theme);
+    if (theme === "light") {
+      document.documentElement.classList.add("theme-light");
+    } else {
+      document.documentElement.classList.remove("theme-light");
+    }
+  }, [theme]);
+
   const doLogout = () => {
     logout();
     navigate("/login");
   };
 
+  const toggleTheme = () => {
+    setTheme((current) => (current === "light" ? "dark" : "light"));
+  };
+
   const topbarLabel = typeof title === "string" ? title : null;
+  const showBackButton = !MAIN_LANDING_PATHS.has(location.pathname);
 
   return (
     <div className={`layout-root ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
@@ -112,17 +131,28 @@ export default function Layout({ title, children }) {
       <div className="layout-main">
         <header className="topbar glass-card">
           <div className="topbar-row">
-            <button className="icon-btn mobile-only" onClick={() => setMobileOpen(true)} type="button">
-              <Menu size={18} />
-            </button>
-            <button className="icon-btn back-btn" onClick={() => navigate(-1)} type="button" aria-label="Go back">
-              <ChevronLeft size={20} />
-            </button>
-            {topbarLabel ? <span className="topbar-label">{topbarLabel}</span> : null}
+            <div className="topbar-left">
+              <button className="icon-btn mobile-only" onClick={() => setMobileOpen(true)} type="button">
+                <Menu size={18} />
+              </button>
+              {topbarLabel ? <span className="topbar-label">{topbarLabel}</span> : null}
+            </div>
+            <div className="topbar-right">
+              <button className="icon-btn" onClick={toggleTheme} type="button" aria-label="Toggle color theme">
+                {theme === "light" ? <Moon size={18} /> : <Sun size={18} />}
+              </button>
+            </div>
           </div>
         </header>
 
-        <main className="page-content">{children}</main>
+        <main className="page-content">
+          {showBackButton ? (
+            <button className="floating-back-btn" onClick={() => navigate(-1)} type="button" aria-label="Go back">
+              <ChevronLeft size={18} />
+            </button>
+          ) : null}
+          {children}
+        </main>
       </div>
     </div>
   );
