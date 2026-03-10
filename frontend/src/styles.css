@@ -323,6 +323,17 @@ form { display: grid; gap: 12px; }
   color: var(--muted);
 }
 
+
+.topbar-back-btn {
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
+  border-radius: 999px;
+  border-color: rgba(255, 255, 255, 0.36);
+  background: rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(10px);
+}
+
 .page-content {
   margin-top: 14px;
   display: grid;
@@ -330,27 +341,19 @@ form { display: grid; gap: 12px; }
   position: relative;
 }
 
-.floating-back-btn {
-  position: absolute;
-  top: 2px;
-  left: 0;
-  width: 38px;
-  height: 38px;
-  min-height: 38px;
-  padding: 0;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  backdrop-filter: blur(12px);
-  box-shadow: var(--shadow-soft);
-  z-index: 100;
-}
-
 .dashboard-container {
   width: min(1200px, 100%);
   margin: 0 auto;
   display: grid;
   gap: 16px;
+}
+
+.dashboard-balanced {
+  gap: 20px;
+}
+
+.dashboard-balanced .welcome-title {
+  letter-spacing: -0.02em;
 }
 
 .welcome-banner { padding: 24px; overflow: hidden; position: relative; }
@@ -526,8 +529,4 @@ tbody tr:hover {
   .app-sidebar.open { transform: translateX(0); }
   .mobile-only { display: inline-flex; }
   .desktop-only { display: none; }
-  .floating-back-btn {
-    position: static;
-    margin-bottom: 2px;
-  }
 }

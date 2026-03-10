@@ -1,5 +1,5 @@
 import React from "react";
-import { formatKES } from "../utils/money";
+import { formatKES } from "../utils/format";
 
 export default function StatCards({ expected = 0, collected = 0, outstanding = 0 }) {
   return (

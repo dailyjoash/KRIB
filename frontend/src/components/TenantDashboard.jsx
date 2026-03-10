@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { CircleDollarSign, Home, Wallet } from "lucide-react";
 import api from "../services/api";
-import { formatKES } from "../utils/money";
+import { formatKES } from "../utils/format";
 import GradientCard from "./GradientCard";
 import Greeting from "./Greeting";
 import WelcomeBanner from "./WelcomeBanner";
@@ -36,7 +36,7 @@ export default function TenantDashboard() {
   const leaseValue = summary.active_lease?.unit ? `Unit ${summary.active_lease.unit.unit_number}` : "Not assigned";
 
   return (
-    <div className="dashboard-container">
+    <div className="dashboard-container dashboard-balanced">
       <WelcomeBanner title={<Greeting />} subtitle="Tenant view" />
       {error ? <p className="error">{error}</p> : null}
 

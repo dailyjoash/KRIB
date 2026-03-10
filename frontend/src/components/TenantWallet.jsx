@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { ArrowDownToLine } from "lucide-react";
 import api from "../services/api";
-import { formatKES } from "../utils/money";
+import { formatKES } from "../utils/format";
 import GlassCard from "./GlassCard";
 import StatusBadge from "./StatusBadge";
 

@@ -11,7 +11,6 @@ import {
   Menu,
   Moon,
   Receipt,
-  Send,
   ShieldCheck,
   Sun,
   UserCircle,
@@ -59,11 +58,7 @@ export default function Layout({ title, children }) {
 
   useEffect(() => {
     localStorage.setItem("theme", theme);
-    if (theme === "light") {
-      document.documentElement.classList.add("theme-light");
-    } else {
-      document.documentElement.classList.remove("theme-light");
-    }
+    document.documentElement.classList.toggle("theme-light", theme === "light");
   }, [theme]);
 
   const doLogout = () => {
@@ -132,7 +127,12 @@ export default function Layout({ title, children }) {
         <header className="topbar glass-card">
           <div className="topbar-row">
             <div className="topbar-left">
-              <button className="icon-btn mobile-only" onClick={() => setMobileOpen(true)} type="button">
+              {showBackButton ? (
+                <button className="icon-btn topbar-back-btn" onClick={() => navigate(-1)} type="button" aria-label="Go back">
+                  <ChevronLeft size={16} />
+                </button>
+              ) : null}
+              <button className="icon-btn mobile-only" onClick={() => setMobileOpen(true)} type="button" aria-label="Open menu">
                 <Menu size={18} />
               </button>
               {topbarLabel ? <span className="topbar-label">{topbarLabel}</span> : null}
@@ -145,14 +145,7 @@ export default function Layout({ title, children }) {
           </div>
         </header>
 
-        <main className="page-content">
-          {showBackButton ? (
-            <button className="floating-back-btn" onClick={() => navigate(-1)} type="button" aria-label="Go back">
-              <ChevronLeft size={18} />
-            </button>
-          ) : null}
-          {children}
-        </main>
+        <main className="page-content">{children}</main>
       </div>
     </div>
   );

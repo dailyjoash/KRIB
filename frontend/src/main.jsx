@@ -6,12 +6,8 @@ import App from "./App";
 
 import "./styles.css";
 
-const savedTheme = localStorage.getItem("theme") || "light";
-if (savedTheme === "light") {
-  document.documentElement.classList.add("theme-light");
-} else {
-  document.documentElement.classList.remove("theme-light");
-}
+const theme = localStorage.getItem("theme") === "dark" ? "dark" : "light";
+document.documentElement.classList.toggle("theme-light", theme === "light");
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>

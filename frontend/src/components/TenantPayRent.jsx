@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { CreditCard } from "lucide-react";
 import api from "../services/api";
-import { formatKES } from "../utils/money";
+import { formatKES } from "../utils/format";
 import GlassCard from "./GlassCard";
 
 export default function TenantPayRent() {
