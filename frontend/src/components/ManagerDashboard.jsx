@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { CircleDollarSign, FilePlus2, Landmark, Send, ShieldAlert } from "lucide-react";
 import api from "../services/api";
-import { formatKES } from "../utils/money";
+import { formatKES } from "../utils/format";
 import GradientCard from "./GradientCard";
 import GlassCard from "./GlassCard";
 import Greeting from "./Greeting";

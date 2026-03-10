@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Banknote, Building2, CirclePlus, Coins, FilePlus2, Send, ShieldCheck, UserPlus } from "lucide-react";
 import api from "../services/api";
-import { formatKES } from "../utils/money";
+import { formatKES } from "../utils/format";
 import GradientCard from "./GradientCard";
 import GlassCard from "./GlassCard";
 import Greeting from "./Greeting";
@@ -29,7 +29,7 @@ export default function Dashboard() {
   if (!data) return <div className="loading">Loading dashboard...</div>;
 
   return (
-    <div className="dashboard-container">
+    <div className="dashboard-container dashboard-balanced">
       <WelcomeBanner title={<Greeting />} subtitle="Landlord view" />
       {error && <p className="error">{error}</p>}
 

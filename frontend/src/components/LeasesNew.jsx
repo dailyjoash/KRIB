@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import api from "../services/api";
+import { formatKES } from "../utils/format";
 import BackButton from "./BackButton";
 
 export default function LeasesNew() {
@@ -107,7 +108,7 @@ export default function LeasesNew() {
                 .filter(u => u.status === 'available' || u.status === 'vacant')
                 .map((u) => (
                   <option key={u.id} value={u.id}>
-                    {u.property?.name} / Unit {u.unit_number} - ${u.rent_amount}/mo ({u.status})
+                    {u.property?.name} / Unit {u.unit_number} - {formatKES(u.rent_amount)}/mo ({u.status})
                   </option>
                 ))}
             </select>
@@ -169,7 +170,7 @@ export default function LeasesNew() {
                     {l.unit?.property?.name || 'Unknown'} / Unit {l.unit?.unit_number || 'N/A'}
                   </td>
                   <td style={{ padding: "8px", textAlign: "right" }}>
-                    ${Number(l.rent_amount).toFixed(2)}
+                    {formatKES(l.rent_amount)}
                   </td>
                   <td style={{ padding: "8px" }}>
                     <span className={`status-${l.status?.toLowerCase()}`}>
