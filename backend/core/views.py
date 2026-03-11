@@ -221,6 +221,17 @@ def _daraja_access_token():
         return payload.get("access_token")
 
 
+def _missing_daraja_env_vars():
+    required_vars = [
+        "MPESA_CONSUMER_KEY",
+        "MPESA_CONSUMER_SECRET",
+        "MPESA_SHORTCODE",
+        "MPESA_PASSKEY",
+        "MPESA_CALLBACK_URL",
+    ]
+    return [name for name in required_vars if not os.getenv(name)]
+
+
 def _daraja_stk_push(phone_number, amount, reference):
     shortcode = os.getenv("MPESA_SHORTCODE", "")
     passkey = os.getenv("MPESA_PASSKEY", "")
@@ -388,9 +399,12 @@ class ManagerInviteAcceptView(APIView):
         if invite.is_expired() or invite.accepted_at:
             return Response({"detail": "Invite expired or already used."}, status=400)
 
-        user, created = User.objects.get_or_create(
-            username=serializer.validated_data["username"], defaults={"email": invite.email or ""}
-        )
+        username = serializer.validated_data["username"]
+        if User.objects.filter(username=username).exists():
+            return Response({"detail": "Username already exists."}, status=400)
+
+        user = User.objects.create(username=username, email=invite.email or "")
+        created = True
         user.set_password(serializer.validated_data["password"])
         user.save()
         profile, _ = Profile.objects.get_or_create(user=user)
@@ -430,6 +444,17 @@ class UnitViewSet(viewsets.ModelViewSet):
         props = _scoped_properties(self.request.user)
         return Unit.objects.filter(property__in=props).select_related("property").order_by("id")
 
+    def perform_create(self, serializer):
+        role = _get_role(self.request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not self.request.user.is_staff:
+            raise PermissionDenied("Only landlord/manager can create units")
+
+        unit_property = serializer.validated_data["property"]
+        if unit_property not in _scoped_properties(self.request.user):
+            raise PermissionDenied("Cannot create units outside your assigned properties")
+
+        serializer.save()
+
 
 class LeaseViewSet(viewsets.ModelViewSet):
     serializer_class = LeaseSerializer
@@ -441,6 +466,17 @@ class LeaseViewSet(viewsets.ModelViewSet):
         if role == Profile.ROLE_TENANT:
             return Lease.objects.filter(tenant=user).select_related("unit", "unit__property", "tenant")
         return Lease.objects.filter(unit__property__in=_scoped_properties(user)).select_related("unit", "unit__property", "tenant")
+
+    def perform_create(self, serializer):
+        role = _get_role(self.request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not self.request.user.is_staff:
+            raise PermissionDenied("Only landlord/manager can create leases")
+
+        lease_unit = serializer.validated_data["unit"]
+        if lease_unit.property not in _scoped_properties(self.request.user):
+            raise PermissionDenied("Cannot create leases outside your assigned properties")
+
+        serializer.save()
 
 
 class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
@@ -500,7 +536,11 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         serializer = InviteAcceptSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         username = serializer.validated_data.get("username") or (invite.email or invite.phone or f"tenant_{invite.token.hex[:8]}")
-        user, created = User.objects.get_or_create(username=username, defaults={"email": invite.email or ""})
+        if User.objects.filter(username=username).exists():
+            return Response({"detail": "Username already exists."}, status=400)
+
+        user = User.objects.create(username=username, email=invite.email or "")
+        created = True
         user.set_password(serializer.validated_data["password"])
         user.save()
         profile, _ = Profile.objects.get_or_create(user=user)
@@ -521,6 +561,17 @@ class STKInitiateView(APIView):
     def post(self, request):
         if _get_role(request.user) != Profile.ROLE_TENANT:
             return Response({"detail": "Only tenants can initiate payment."}, status=403)
+
+        missing_env_vars = _missing_daraja_env_vars()
+        if missing_env_vars:
+            return Response(
+                {
+                    "detail": "Payment gateway is not configured.",
+                    "missing_env_vars": missing_env_vars,
+                },
+                status=503,
+            )
+
         serializer = STKInitiateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         lease = serializer.validated_data["lease"]
@@ -567,7 +618,20 @@ class STKCallbackView(APIView):
 
         payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_request_id).first()
         if not payment:
+            logger.warning("Unmatched STK callback received", extra={"checkout_request_id": checkout_request_id})
             return Response({"detail": "No matching payment."}, status=404)
+
+        if payment.status != PaymentTransaction.STATUS_PENDING:
+            logger.info(
+                "Duplicate STK callback ignored",
+                extra={
+                    "payment_id": payment.id,
+                    "checkout_request_id": checkout_request_id,
+                    "current_status": payment.status,
+                    "incoming_result_code": result_code,
+                },
+            )
+            return Response({"detail": "Duplicate callback ignored."})
 
         payment.raw_callback = request.data
         payment.result_code = result_code
@@ -575,13 +639,23 @@ class STKCallbackView(APIView):
         payment.mpesa_receipt = mpesa_receipt
         if transaction_date:
             try:
-                payment.transaction_date = datetime.strptime(str(transaction_date), "%Y%m%d%H%M%S")
+                parsed = datetime.strptime(str(transaction_date), "%Y%m%d%H%M%S")
+                payment.transaction_date = timezone.make_aware(parsed, timezone.get_current_timezone())
             except ValueError:
                 payment.transaction_date = timezone.now()
 
         payment.status = PaymentTransaction.STATUS_SUCCESS if result_code == 0 else PaymentTransaction.STATUS_FAILED
         payment.save(
             update_fields=["raw_callback", "result_code", "result_desc", "mpesa_receipt", "transaction_date", "status"]
+        )
+        logger.info(
+            "STK callback transition processed",
+            extra={
+                "payment_id": payment.id,
+                "checkout_request_id": checkout_request_id,
+                "status": payment.status,
+                "result_code": result_code,
+            },
         )
         if payment.status == PaymentTransaction.STATUS_SUCCESS:
             _allocate_success_payment(payment)
@@ -877,6 +951,10 @@ class LandlordPayoutMarkPaidView(APIView):
         payout.status = LandlordPayout.STATUS_PAID
         payout.paid_at = timezone.now()
         payout.save(update_fields=["status", "paid_at"])
+        logger.info(
+            "Landlord payout marked as paid",
+            extra={"payout_id": payout.id, "landlord_id": payout.landlord_id, "amount": str(payout.amount)},
+        )
         LedgerTransaction.objects.create(
             user=payout.landlord,
             kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_PAID,
