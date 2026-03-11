@@ -1,5 +1,5 @@
 import React from "react";
-import { Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import AcceptInvite from "./components/AcceptInvite";
 import Dashboard from "./components/Dashboard";
 import InviteManager from "./components/InviteManager";
@@ -231,6 +231,7 @@ export default function App() {
           </ProtectedPage>
         )}
       />
+      <Route path="*" element={<Navigate to="/login" replace />} />
     </Routes>
   );
 }
