@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { CircleDollarSign, FilePlus2, Landmark, Send, ShieldAlert } from "lucide-react";
 import api from "../services/api";
 import { formatKES } from "../utils/format";
@@ -10,6 +10,7 @@ import StatusBadge from "./StatusBadge";
 import WelcomeBanner from "./WelcomeBanner";
 
 export default function ManagerDashboard() {
+  const navigate = useNavigate();
   const [summary, setSummary] = useState(null);
   const [maintenance, setMaintenance] = useState([]);
   const [error, setError] = useState("");
@@ -43,9 +44,9 @@ export default function ManagerDashboard() {
       {error && <p className="error">{error}</p>}
 
       <section className="gradient-card-row">
-        <GradientCard variant="blue" icon={Landmark} title="Expected" subtitle={`Period: ${summary.period}`} value={formatKES(summary.totals?.expected)} ctaLabel="Overview" />
-        <GradientCard variant="indigo" icon={CircleDollarSign} title="Collected" subtitle="Settled payments" value={formatKES(summary.totals?.collected)} ctaLabel="Review" />
-        <GradientCard variant="violet" icon={ShieldAlert} title="Outstanding" subtitle="Open balances" value={formatKES(summary.totals?.outstanding)} ctaLabel="Action" />
+        <GradientCard variant="blue" icon={Landmark} title="Expected" subtitle={`Period: ${summary.period}`} value={formatKES(summary.totals?.expected)} ctaLabel="Overview" onCta={() => navigate("/manager/overview")} />
+        <GradientCard variant="indigo" icon={CircleDollarSign} title="Collected" subtitle="Settled payments" value={formatKES(summary.totals?.collected)} ctaLabel="Review" onCta={() => navigate("/manager/review")} />
+        <GradientCard variant="violet" icon={ShieldAlert} title="Outstanding" subtitle="Open balances" value={formatKES(summary.totals?.outstanding)} ctaLabel="Action" onCta={() => navigate("/manager/action")} />
       </section>
 
       <GlassCard title="Quick Actions" actions={<span className="subtitle">Tenant operations</span>}>
