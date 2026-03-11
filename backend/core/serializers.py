@@ -5,6 +5,7 @@ from rest_framework import serializers
 
 from .models import (
     LandlordPayout,
+    LandlordSettings,
     Lease,
     LedgerTransaction,
     MaintenanceRequest,
@@ -18,6 +19,68 @@ from .models import (
     ManagerInvite,
     compute_lease_rent_status,
 )
+
+
+class LandlordSignupSerializer(serializers.Serializer):
+    business_name = serializers.CharField(max_length=200)
+    username = serializers.CharField(max_length=150)
+    email = serializers.EmailField(required=False, allow_blank=True)
+    phone_number = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        validators=[RegexValidator(regex=r"^[0-9+\-()\s]{7,20}$", message="Invalid phone number format.")],
+    )
+    password = serializers.CharField(write_only=True, min_length=6)
+
+    def validate_username(self, value):
+        if User.objects.filter(username=value).exists():
+            raise serializers.ValidationError("Username already exists.")
+        return value
+
+
+class LandlordRevenueSerializer(serializers.Serializer):
+    period = serializers.CharField(allow_null=True)
+    gross_collected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    fee_rate = serializers.DecimalField(max_digits=4, decimal_places=2)
+    fee_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    net_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    lifetime = serializers.DictField()
+
+
+class LandlordReceiptSerializer(serializers.ModelSerializer):
+    tenant = serializers.SerializerMethodField()
+    unit = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PaymentTransaction
+        fields = [
+            "id",
+            "mpesa_receipt",
+            "tenant",
+            "unit",
+            "amount",
+            "period",
+            "status",
+            "created_at",
+        ]
+
+    def get_tenant(self, obj):
+        return {"username": obj.tenant.username, "email": obj.tenant.email}
+
+    def get_unit(self, obj):
+        return {
+            "unit_number": obj.lease.unit.unit_number,
+            "property_name": obj.lease.unit.property.name,
+        }
+
+
+class LandlordFollowupSerializer(serializers.Serializer):
+    lease_id = serializers.IntegerField()
+    tenant = serializers.DictField()
+    unit = serializers.DictField()
+    status = serializers.CharField()
+    balance = serializers.DecimalField(max_digits=12, decimal_places=2)
+    period = serializers.CharField()
 
 
 class UserLiteSerializer(serializers.ModelSerializer):

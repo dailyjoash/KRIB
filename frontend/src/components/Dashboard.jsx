@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Banknote, Building2, CirclePlus, Coins, FilePlus2, Send, ShieldCheck, UserPlus } from "lucide-react";
 import api from "../services/api";
 import { formatKES } from "../utils/format";
@@ -10,6 +10,7 @@ import StatusBadge from "./StatusBadge";
 import WelcomeBanner from "./WelcomeBanner";
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
 
@@ -34,9 +35,9 @@ export default function Dashboard() {
       {error && <p className="error">{error}</p>}
 
       <section className="gradient-card-row">
-        <GradientCard variant="blue" icon={Banknote} title="Expected" subtitle={`Period: ${data.period}`} value={formatKES(data.totals?.expected)} ctaLabel="Revenue" />
-        <GradientCard variant="indigo" icon={Coins} title="Collected" subtitle="Successfully paid" value={formatKES(data.totals?.collected)} ctaLabel="Receipts" />
-        <GradientCard variant="violet" icon={ShieldCheck} title="Outstanding" subtitle="Pending collection" value={formatKES(data.totals?.outstanding)} ctaLabel="Follow-up" />
+        <GradientCard variant="blue" icon={Banknote} title="Expected" subtitle={`Period: ${data.period}`} value={formatKES(data.totals?.expected)} ctaLabel="Revenue" onCta={() => navigate("/landlord/revenue")} />
+        <GradientCard variant="indigo" icon={Coins} title="Collected" subtitle="Successfully paid" value={formatKES(data.totals?.collected)} ctaLabel="Receipts" onCta={() => navigate("/landlord/receipts")} />
+        <GradientCard variant="violet" icon={ShieldCheck} title="Outstanding" subtitle="Pending collection" value={formatKES(data.totals?.outstanding)} ctaLabel="Follow-up" onCta={() => navigate("/landlord/follow-up")} />
       </section>
 
       <GlassCard title="Quick Actions" actions={<span className="subtitle">Property operations</span>}>

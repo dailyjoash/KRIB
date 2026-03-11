@@ -6,6 +6,10 @@ import InviteManager from "./components/InviteManager";
 import InvitesNew from "./components/InvitesNew";
 import Layout from "./components/Layout";
 import LeasesNew from "./components/LeasesNew";
+import LandlordFollowUp from "./components/LandlordFollowUp";
+import LandlordReceipts from "./components/LandlordReceipts";
+import LandlordRevenue from "./components/LandlordRevenue";
+import LandlordSignup from "./components/LandlordSignup";
 import Login from "./components/Login";
 import MaintenanceNew from "./components/MaintenanceNew";
 import ManagerDashboard from "./components/ManagerDashboard";
@@ -34,6 +38,7 @@ export default function App() {
       <Route path="/" element={<Login />} />
       <Route path="/login" element={<Login />} />
       <Route path="/invite/:token" element={<AcceptInvite />} />
+      <Route path="/signup-landlord" element={<LandlordSignup />} />
 
       <Route
         path="/dashboard"
@@ -114,6 +119,31 @@ export default function App() {
         element={(
           <ProtectedPage allowedRoles={["tenant"]} title={null} subtitle={null}>
             <TenantDashboard />
+          </ProtectedPage>
+        )}
+      />
+
+      <Route
+        path="/landlord/revenue"
+        element={(
+          <ProtectedPage allowedRoles={["landlord"]} title="Revenue" subtitle="KRIB fee and net earnings">
+            <LandlordRevenue />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/landlord/receipts"
+        element={(
+          <ProtectedPage allowedRoles={["landlord"]} title="Receipts" subtitle="Successful rent collections">
+            <LandlordReceipts />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/landlord/follow-up"
+        element={(
+          <ProtectedPage allowedRoles={["landlord"]} title="Follow-up" subtitle="Unpaid and partial rent reminders">
+            <LandlordFollowUp />
           </ProtectedPage>
         )}
       />

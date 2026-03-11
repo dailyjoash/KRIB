@@ -12,7 +12,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.utils import timezone
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
@@ -23,6 +23,7 @@ from rest_framework.views import APIView
 
 from .models import (
     LandlordBalance,
+    LandlordSettings,
     LandlordPayout,
     Lease,
     LedgerTransaction,
@@ -39,6 +40,10 @@ from .models import (
 )
 from .serializers import (
     ChangePasswordSerializer,
+    LandlordFollowupSerializer,
+    LandlordReceiptSerializer,
+    LandlordRevenueSerializer,
+    LandlordSignupSerializer,
     InviteAcceptSerializer,
     LandlordPayoutRequestSerializer,
     LandlordPayoutSerializer,
@@ -295,6 +300,33 @@ def get_me(request):
             "phone_number": profile.phone_number,
         }
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def signup_landlord(request):
+    serializer = LandlordSignupSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    with transaction.atomic():
+        user = User.objects.create(
+            username=serializer.validated_data["username"],
+            email=serializer.validated_data.get("email", ""),
+        )
+        user.set_password(serializer.validated_data["password"])
+        user.save(update_fields=["password"])
+
+        profile, _ = Profile.objects.get_or_create(user=user)
+        profile.role = Profile.ROLE_LANDLORD
+        profile.phone_number = serializer.validated_data.get("phone_number") or ""
+        profile.save(update_fields=["role", "phone_number"])
+
+        LandlordSettings.objects.update_or_create(
+            user=user,
+            defaults={"business_name": serializer.validated_data["business_name"]},
+        )
+
+    return Response({"detail": "Landlord account created successfully."}, status=201)
 
 
 @api_view(["POST"])
@@ -842,3 +874,97 @@ class LandlordPayoutMarkPaidView(APIView):
             reference_text=f"payout:{payout.id}",
         )
         return Response({"detail": "Payout marked paid"})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def landlord_revenue(request):
+    if _get_role(request.user) != Profile.ROLE_LANDLORD:
+        return Response({"detail": "Landlord only endpoint"}, status=403)
+
+    period = request.GET.get("period")
+    payments = PaymentTransaction.objects.filter(
+        lease__unit__property__landlord=request.user,
+        status=PaymentTransaction.STATUS_SUCCESS,
+    )
+    if period:
+        payments = payments.filter(period=period)
+
+    gross = payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    fee = gross * Decimal("0.02")
+    payload = {
+        "period": period,
+        "gross_collected": gross,
+        "fee_rate": Decimal("0.02"),
+        "fee_amount": fee,
+        "net_amount": gross - fee,
+    }
+
+    all_payments = PaymentTransaction.objects.filter(
+        lease__unit__property__landlord=request.user,
+        status=PaymentTransaction.STATUS_SUCCESS,
+    )
+    lifetime_gross = all_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    lifetime_fee = lifetime_gross * Decimal("0.02")
+    payload["lifetime"] = {
+        "gross_collected": lifetime_gross,
+        "fee_amount": lifetime_fee,
+        "net_amount": lifetime_gross - lifetime_fee,
+    }
+
+    return Response(LandlordRevenueSerializer(payload).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def landlord_receipts(request):
+    if _get_role(request.user) != Profile.ROLE_LANDLORD:
+        return Response({"detail": "Landlord only endpoint"}, status=403)
+
+    period = request.GET.get("period")
+    receipts = PaymentTransaction.objects.filter(
+        lease__unit__property__landlord=request.user,
+        status=PaymentTransaction.STATUS_SUCCESS,
+    ).select_related("tenant", "lease", "lease__unit", "lease__unit__property").order_by("-created_at")
+    if period:
+        receipts = receipts.filter(period=period)
+    return Response(LandlordReceiptSerializer(receipts, many=True).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def landlord_followups(request):
+    if _get_role(request.user) != Profile.ROLE_LANDLORD:
+        return Response({"detail": "Landlord only endpoint"}, status=403)
+
+    period = request.GET.get("period") or timezone.localdate().strftime("%Y-%m")
+    leases = Lease.objects.filter(
+        status=Lease.STATUS_ACTIVE,
+        unit__property__landlord=request.user,
+    ).select_related("tenant", "unit", "unit__property", "tenant__profile")
+
+    rows = []
+    for lease in leases:
+        rent_row = compute_lease_rent_status(lease, period=period)
+        if rent_row["status"] not in ["UNPAID", "PARTIAL", "OVERDUE"]:
+            continue
+        tenant_profile = getattr(lease.tenant, "profile", None)
+        rows.append(
+            {
+                "lease_id": lease.id,
+                "tenant": {
+                    "username": lease.tenant.username,
+                    "email": lease.tenant.email,
+                    "phone_number": tenant_profile.phone_number if tenant_profile else "",
+                },
+                "unit": {
+                    "property_name": lease.unit.property.name,
+                    "unit_number": lease.unit.unit_number,
+                },
+                "status": "PARTIAL" if rent_row["status"] == "OVERDUE" and rent_row["paid_sum"] > 0 else ("UNPAID" if rent_row["status"] == "OVERDUE" else rent_row["status"]),
+                "balance": max(rent_row["balance"], Decimal("0.00")),
+                "period": period,
+            }
+        )
+
+    return Response(LandlordFollowupSerializer(rows, many=True).data)
