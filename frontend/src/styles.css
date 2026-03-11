@@ -530,3 +530,15 @@ tbody tr:hover {
   .mobile-only { display: inline-flex; }
   .desktop-only { display: none; }
 }
+
+.followup-toolbar {
+  display: grid;
+  grid-template-columns: 200px minmax(220px, 360px);
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.followup-actions {
+  display: grid;
+  gap: 8px;
+}

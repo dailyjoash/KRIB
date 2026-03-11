@@ -32,6 +32,14 @@ class Profile(models.Model):
         return f"{self.user.username} ({self.role})"
 
 
+class LandlordSettings(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="landlord_settings")
+    business_name = models.CharField(max_length=200)
+
+    def __str__(self):
+        return f"{self.business_name} ({self.user.username})"
+
+
 class Tenant(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="tenant_profile")
     phone = models.CharField(max_length=20, blank=True, null=True)
