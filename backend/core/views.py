@@ -596,12 +596,23 @@ class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
         role = _get_role(self.request.user)
         qs = PaymentTransaction.objects.select_related("lease", "lease__unit", "lease__unit__property", "tenant")
         if role == Profile.ROLE_TENANT:
-            return qs.filter(tenant=self.request.user).order_by("-created_at")
-        if role == Profile.ROLE_MANAGER:
-            return qs.filter(lease__unit__property__manager=self.request.user).order_by("-created_at")
-        if role == Profile.ROLE_LANDLORD:
-            return qs.filter(lease__unit__property__landlord=self.request.user).order_by("-created_at")
-        return qs.none()
+            qs = qs.filter(tenant=self.request.user)
+        elif role == Profile.ROLE_MANAGER:
+            qs = qs.filter(lease__unit__property__manager=self.request.user)
+        elif role == Profile.ROLE_LANDLORD:
+            qs = qs.filter(lease__unit__property__landlord=self.request.user)
+        else:
+            return qs.none()
+
+        period = self.request.query_params.get("period")
+        if period:
+            qs = qs.filter(period=period)
+
+        status_filter = self.request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter.upper())
+
+        return qs.order_by("-created_at")
 
 
 class MaintenanceViewSet(viewsets.ModelViewSet):
@@ -654,7 +665,7 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
 @permission_classes([IsAuthenticated])
 def dashboard_summary(request):
     role = _get_role(request.user)
-    period = timezone.localdate().strftime("%Y-%m")
+    period = request.query_params.get("period") or timezone.localdate().strftime("%Y-%m")
 
     if role == Profile.ROLE_TENANT:
         lease = (

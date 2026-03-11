@@ -13,6 +13,9 @@ import LandlordSignup from "./components/LandlordSignup";
 import Login from "./components/Login";
 import MaintenanceNew from "./components/MaintenanceNew";
 import ManagerDashboard from "./components/ManagerDashboard";
+import ManagerAction from "./components/ManagerAction";
+import ManagerOverview from "./components/ManagerOverview";
+import ManagerReview from "./components/ManagerReview";
 import Profile from "./components/Profile";
 import ProtectedRoute from "./components/ProtectedRoute";
 import AddProperty from "./components/AddProperty";
@@ -53,6 +56,30 @@ export default function App() {
         element={(
           <ProtectedPage allowedRoles={["manager"]} title={null} subtitle={null}>
             <ManagerDashboard />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/manager/overview"
+        element={(
+          <ProtectedPage allowedRoles={["manager"]} title="Overview" subtitle="Manager view">
+            <ManagerOverview />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/manager/review"
+        element={(
+          <ProtectedPage allowedRoles={["manager"]} title="Review" subtitle="Manager view">
+            <ManagerReview />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/manager/action"
+        element={(
+          <ProtectedPage allowedRoles={["manager"]} title="Action" subtitle="Manager view">
+            <ManagerAction />
           </ProtectedPage>
         )}
       />
