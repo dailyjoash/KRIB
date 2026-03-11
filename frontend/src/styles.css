@@ -291,6 +291,7 @@ form { display: grid; gap: 12px; }
   flex: 1;
   margin-left: 270px;
   padding: 14px 18px 28px;
+  padding-top: 76px;
   transition: margin-left 0.25s ease;
 }
 
@@ -298,9 +299,28 @@ form { display: grid; gap: 12px; }
 
 .topbar {
   padding: 10px 14px;
-  position: sticky;
+  position: fixed;
   top: 10px;
+  right: 18px;
+  left: 288px;
   z-index: 90;
+  transition: opacity 0.24s ease, transform 0.24s ease;
+}
+
+.layout-root.sidebar-collapsed .topbar {
+  left: 102px;
+}
+
+.topbar.is-hidden {
+  opacity: 0;
+  transform: translateY(-130%);
+  pointer-events: none;
+}
+
+.topbar.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
 }
 
 .topbar-row {
@@ -339,6 +359,73 @@ form { display: grid; gap: 12px; }
   display: grid;
   gap: 16px;
   position: relative;
+}
+
+.user-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
+
+.user-avatar-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(140deg, #4f6dff, #845bff);
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.sidebar-profile-chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.sidebar-profile-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.sidebar-profile-role {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: capitalize;
+}
+
+.profile-photo-section {
+  display: grid;
+  justify-items: start;
+  gap: 12px;
+}
+
+.profile-photo-preview {
+  width: 92px;
+  height: 92px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
+
+.profile-photo-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(140deg, #4f6dff, #845bff);
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.profile-photo-input {
+  display: none;
 }
 
 .dashboard-container {
@@ -527,6 +614,10 @@ tbody tr:hover {
     width: 270px;
   }
   .app-sidebar.open { transform: translateX(0); }
+  .topbar {
+    left: 12px !important;
+    right: 12px;
+  }
   .mobile-only { display: inline-flex; }
   .desktop-only { display: none; }
 }
