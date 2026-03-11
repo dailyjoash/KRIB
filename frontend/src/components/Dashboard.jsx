@@ -51,7 +51,8 @@ export default function Dashboard() {
       </GlassCard>
 
       <GlassCard title="Maintenance" actions={<Link to="/leases/new">View all</Link>}>
-        <table>
+        <div className="table-scroll">
+          <table>
           <thead>
             <tr>
               <th>Tenant</th>
@@ -70,7 +71,8 @@ export default function Dashboard() {
               </tr>
             ))}
           </tbody>
-        </table>
+          </table>
+        </div>
       </GlassCard>
     </div>
   );

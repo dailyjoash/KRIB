@@ -57,7 +57,8 @@ export default function ManagerDashboard() {
       </GlassCard>
 
       <GlassCard title="Maintenance Queue" actions={<span className="subtitle">Latest requests</span>}>
-        <table>
+        <div className="table-scroll">
+          <table>
           <thead>
             <tr>
               <th>Tenant</th>
@@ -85,7 +86,8 @@ export default function ManagerDashboard() {
               </tr>
             ))}
           </tbody>
-        </table>
+          </table>
+        </div>
       </GlassCard>
     </div>
   );
