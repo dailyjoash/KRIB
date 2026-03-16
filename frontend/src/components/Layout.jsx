@@ -81,7 +81,6 @@ export default function Layout({ title, children }) {
           <Link to={getHomePath(user?.role)} className="sidebar-brand" onClick={onNavClick}>
             <span className="brand">
               <img src={logo} alt="KRIB logo" className="brand-logo" />
-              <span className="brand-text">KRIB</span>
             </span>
           </Link>
           {isCompactView ? (

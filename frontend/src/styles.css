@@ -177,6 +177,11 @@ button.btn-primary {
   gap: 12px;
 }
 
+.login-card > .subtitle:first-of-type {
+  text-align: center;
+  margin-top: 0;
+}
+
 form {
   display: grid;
   gap: 10px;
@@ -185,12 +190,12 @@ form {
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  justify-content: center;
 }
 
 .brand-logo {
-  width: 42px;
-  height: 42px;
+  width: 52px;
+  height: 52px;
   border-radius: 12px;
   object-fit: contain;
 }
@@ -200,11 +205,12 @@ form {
 }
 
 .login-logo {
-  width: 70px;
-  height: 70px;
-  border-radius: 16px;
+  width: 104px;
+  height: 104px;
+  border-radius: 18px;
   object-fit: contain;
   justify-self: center;
+  margin-bottom: 2px;
 }
 
 .subtitle {
@@ -697,6 +703,16 @@ tbody tr:hover {
   .card,
   .login-card {
     padding: 14px;
+  }
+
+  .brand-logo {
+    width: 48px;
+    height: 48px;
+  }
+
+  .login-logo {
+    width: 92px;
+    height: 92px;
   }
 
   .action-link,
