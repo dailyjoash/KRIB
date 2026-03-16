@@ -220,7 +220,7 @@ form {
   display: flex;
   flex-direction: column;
   transform: translateX(-100%);
-  transition: width 0.25s ease, transform 0.25s ease;
+  transition: transform 0.25s ease;
 }
 
 .app-sidebar.open {
@@ -304,39 +304,10 @@ form {
   border-color: rgba(116, 141, 255, 0.24);
 }
 
-.app-sidebar.collapsed .sidebar-link {
-  justify-content: center;
-  padding: 0;
-}
-
-.app-sidebar.collapsed .sidebar-link span,
-.app-sidebar.collapsed .sidebar-role,
-.app-sidebar.collapsed .sidebar-brand > span:last-child {
-  display: none;
-}
-
-.app-sidebar.collapsed .sidebar-link[title]:hover::after {
-  content: attr(title);
-  position: absolute;
-  left: calc(100% + 10px);
-  top: 50%;
-  transform: translateY(-50%);
-  white-space: nowrap;
-  background: #101b35;
-  color: #f0f4ff;
-  border-radius: 8px;
-  padding: 6px 8px;
-  font-size: 12px;
-}
-
 .sidebar-actions {
   margin-top: auto;
   display: grid;
   gap: 8px;
-}
-
-.app-sidebar.collapsed .sidebar-actions .btn span {
-  display: none;
 }
 
 .layout-main {
@@ -355,12 +326,6 @@ form {
   left: 10px;
   z-index: 90;
   transition: opacity 0.24s ease, transform 0.24s ease;
-}
-
-.topbar.is-hidden {
-  opacity: 0;
-  transform: translateY(-130%);
-  pointer-events: none;
 }
 
 .topbar.is-visible {
@@ -393,88 +358,11 @@ form {
   max-width: min(43vw, 230px);
 }
 
-.topbar-back-btn {
-  width: 30px;
-  height: 30px;
-  min-height: 30px;
-  border-radius: 999px;
-  border-color: rgba(255, 255, 255, 0.36);
-  background: rgba(255, 255, 255, 0.12);
-  backdrop-filter: blur(10px);
-}
-
 .page-content {
   margin-top: 10px;
   display: grid;
   gap: 12px;
   position: relative;
-}
-
-.user-avatar {
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  object-fit: cover;
-  border: 1px solid var(--border);
-}
-
-.user-avatar-fallback {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: linear-gradient(140deg, #4f6dff, #845bff);
-  color: #fff;
-  font-size: 0.72rem;
-  font-weight: 700;
-}
-
-.sidebar-profile-chip {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.sidebar-profile-name {
-  font-size: 0.83rem;
-  font-weight: 600;
-}
-
-.sidebar-profile-role {
-  font-size: 0.74rem;
-  color: var(--muted);
-  text-transform: capitalize;
-}
-
-.profile-photo-section {
-  display: grid;
-  justify-items: start;
-  gap: 12px;
-}
-
-.profile-photo-preview {
-  width: 92px;
-  height: 92px;
-  border-radius: 50%;
-  object-fit: cover;
-  border: 1px solid var(--border);
-}
-
-.profile-photo-fallback {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: linear-gradient(140deg, #4f6dff, #845bff);
-  color: #fff;
-  font-size: 1.1rem;
-  font-weight: 700;
-}
-
-.profile-photo-input {
-  display: none;
 }
 
 .dashboard-container {
@@ -780,6 +668,41 @@ tbody tr:hover {
   gap: 8px;
 }
 
+.gradient-card-row.two-up {
+  grid-template-columns: 1fr;
+}
+
+@media (max-width: 900px) {
+  body {
+    font-size: 15px;
+  }
+
+  .layout-main {
+    padding: 10px 10px 20px;
+    padding-top: 68px;
+  }
+
+  .glass-card,
+  .welcome-banner,
+  .card,
+  .login-card {
+    padding: 14px;
+  }
+
+  .action-link,
+  .btn,
+  button {
+    min-height: 42px;
+  }
+
+  table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+    min-width: 100%;
+  }
+}
+
 @media (min-width: 481px) and (max-width: 900px) {
   .layout-main {
     padding: 12px 14px 24px;
@@ -843,24 +766,20 @@ tbody tr:hover {
     padding-top: 76px;
   }
 
-  .layout-root.sidebar-collapsed .layout-main {
-    margin-left: 84px;
-  }
-
-  .topbar {
+    .topbar {
     padding: 10px 14px;
     top: 10px;
     right: 18px;
     left: 288px;
   }
 
-  .layout-root.sidebar-collapsed .topbar {
-    left: 102px;
-  }
-
-  .gradient-card-row {
+    .gradient-card-row {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 14px;
+  }
+
+  .gradient-card-row.two-up {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .gcard {
@@ -933,12 +852,6 @@ tbody tr:hover {
     height: 40px;
     min-height: 40px;
     border-radius: 12px;
-  }
-
-  .topbar-back-btn {
-    width: 34px;
-    height: 34px;
-    min-height: 34px;
   }
 
   .table-scroll {

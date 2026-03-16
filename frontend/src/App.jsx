@@ -153,7 +153,7 @@ export default function App() {
       <Route
         path="/landlord/revenue"
         element={(
-          <ProtectedPage allowedRoles={["landlord"]} title="Revenue" subtitle="KRIB fee and net earnings">
+          <ProtectedPage allowedRoles={["landlord"]} title="Revenue" subtitle="Collected and net landlord earnings">
             <LandlordRevenue />
           </ProtectedPage>
         )}
