@@ -37,7 +37,7 @@ export default function TenantDashboard() {
 
   return (
     <div className="dashboard-container dashboard-balanced">
-      <WelcomeBanner title={<Greeting />} subtitle="Tenant view" />
+      <WelcomeBanner title={<Greeting />} />
       {error ? <p className="error">{error}</p> : null}
 
       <section className="gradient-card-row">

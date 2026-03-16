@@ -31,7 +31,7 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-container dashboard-balanced">
-      <WelcomeBanner title={<Greeting />} subtitle="Landlord overview" />
+      <WelcomeBanner title={<Greeting />} />
       {error && <p className="error">{error}</p>}
 
       <section className="gradient-card-row">
