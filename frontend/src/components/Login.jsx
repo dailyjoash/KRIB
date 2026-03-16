@@ -1,6 +1,7 @@
 import React, { useState, useContext } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { AuthContext } from "../context/AuthContext";
+import logo from "../assets/krib-logo.png";
 
 const Login = () => {
   const navigate = useNavigate();
@@ -50,8 +51,9 @@ const Login = () => {
   return (
     <div className="login-page">
       <div className="login-card">
+        <img src={logo} alt="KRIB logo" className="login-logo" />
         <h2>
-          Welcome to <span className="brand">KRIB</span> 🏠
+          Welcome to <span className="brand-text">KRIB</span> 🏠
         </h2>
         <p className="subtitle">Sign in to manage your rentals</p>
 
