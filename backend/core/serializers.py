@@ -41,8 +41,6 @@ class LandlordSignupSerializer(serializers.Serializer):
 class LandlordRevenueSerializer(serializers.Serializer):
     period = serializers.CharField(allow_null=True)
     gross_collected = serializers.DecimalField(max_digits=12, decimal_places=2)
-    fee_rate = serializers.DecimalField(max_digits=4, decimal_places=2)
-    fee_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     net_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     lifetime = serializers.DictField()
 

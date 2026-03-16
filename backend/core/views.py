@@ -980,13 +980,10 @@ def landlord_revenue(request):
         payments = payments.filter(period=period)
 
     gross = payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
-    fee = gross * Decimal("0.02")
     payload = {
         "period": period,
         "gross_collected": gross,
-        "fee_rate": Decimal("0.02"),
-        "fee_amount": fee,
-        "net_amount": gross - fee,
+        "net_amount": gross,
     }
 
     all_payments = PaymentTransaction.objects.filter(
@@ -994,11 +991,9 @@ def landlord_revenue(request):
         status=PaymentTransaction.STATUS_SUCCESS,
     )
     lifetime_gross = all_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
-    lifetime_fee = lifetime_gross * Decimal("0.02")
     payload["lifetime"] = {
         "gross_collected": lifetime_gross,
-        "fee_amount": lifetime_fee,
-        "net_amount": lifetime_gross - lifetime_fee,
+        "net_amount": lifetime_gross,
     }
 
     return Response(LandlordRevenueSerializer(payload).data)

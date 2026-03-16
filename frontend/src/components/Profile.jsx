@@ -2,14 +2,11 @@ import React, { useEffect, useState } from "react";
 import api from "../services/api";
 import GlassCard from "./GlassCard";
 
-const PHOTO_STORAGE_KEY = "profilePhoto";
-
 export default function Profile() {
   const [form, setForm] = useState({ email: "", phone_number: "" });
   const [passwordForm, setPasswordForm] = useState({ old_password: "", new_password: "", confirm_password: "" });
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
-  const [photo, setPhoto] = useState(localStorage.getItem(PHOTO_STORAGE_KEY) || "");
 
   useEffect(() => {
     api
@@ -55,50 +52,11 @@ export default function Profile() {
     }
   };
 
-  const handlePhotoUpload = (event) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    if (!["image/jpeg", "image/png"].includes(file.type)) {
-      setError("Please upload a JPG or PNG image.");
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      const base64 = typeof reader.result === "string" ? reader.result : "";
-      if (!base64) return;
-      localStorage.setItem(PHOTO_STORAGE_KEY, base64);
-      setPhoto(base64);
-      setMessage("Profile photo updated.");
-      setError("");
-      window.dispatchEvent(new Event("profile-photo-updated"));
-    };
-    reader.readAsDataURL(file);
-  };
-
-  const initials = (form.email || "KRIB User")
-    .split(/[\s@._-]+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("") || "K";
-
   return (
     <div className="dashboard-container">
       <h2>Profile Settings</h2>
       {message && <p className="success">{message}</p>}
       {error && <p className="error">{error}</p>}
-
-      <GlassCard title="Profile Photo">
-        <div className="profile-photo-section">
-          {photo ? <img src={photo} alt="Profile" className="profile-photo-preview" /> : <span className="profile-photo-preview profile-photo-fallback">{initials}</span>}
-          <label className="btn" htmlFor="profile-photo-input">
-            Upload JPG/PNG
-          </label>
-          <input id="profile-photo-input" type="file" accept="image/jpeg,image/png" onChange={handlePhotoUpload} className="profile-photo-input" />
-        </div>
-      </GlassCard>
 
       <GlassCard title="Update details">
         <form onSubmit={saveProfile}>
