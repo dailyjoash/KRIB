@@ -8,8 +8,10 @@ import {
   Home,
   LogOut,
   Menu,
+  Moon,
   Receipt,
   ShieldCheck,
+  Sun,
   UserCircle,
   Wallet,
   Users,
@@ -27,11 +29,13 @@ export default function Layout({ title, children }) {
 
   const [mobileOpen, setMobileOpen] = useState(false);
   const [isCompactView, setIsCompactView] = useState(() => window.matchMedia("(max-width: 900px)").matches);
+  const [theme, setTheme] = useState(() => (localStorage.getItem("theme") === "dark" ? "dark" : "light"));
 
   const links = useMemo(
     () =>
       [
         { to: getHomePath(user?.role), label: "Home", icon: Home, roles: ["landlord", "manager", "tenant"] },
+        { to: "/profile", label: "Profile", icon: UserCircle, roles: ["landlord", "manager", "tenant"] },
         { to: "/properties/new", label: "Properties", icon: Building2, roles: ["landlord"] },
         { to: "/units/new", label: "Units", icon: Boxes, roles: ["landlord"] },
         { to: "/invites/new", label: "Invites", icon: Users, roles: ["landlord", "manager"] },
@@ -40,7 +44,6 @@ export default function Layout({ title, children }) {
         { to: "/maintenance/new", label: "Maintenance", icon: Hammer, roles: ["tenant"] },
         { to: "/tenant/payments", label: "Payments", icon: Receipt, roles: ["tenant"] },
         { to: "/tenant/wallet", label: "Wallet", icon: Wallet, roles: ["tenant"] },
-        { to: "/profile", label: "Profile", icon: UserCircle, roles: ["landlord", "manager", "tenant"] },
       ].filter((item) => item.roles.includes(user?.role)),
     [user?.role]
   );
@@ -61,6 +64,11 @@ export default function Layout({ title, children }) {
     setMobileOpen(false);
   }, [location.pathname]);
 
+  useEffect(() => {
+    localStorage.setItem("theme", theme);
+    document.documentElement.classList.toggle("theme-light", theme === "light");
+  }, [theme]);
+
   const doLogout = () => {
     logout();
     navigate("/login");
@@ -68,6 +76,10 @@ export default function Layout({ title, children }) {
 
   const onNavClick = () => {
     if (isCompactView) setMobileOpen(false);
+  };
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === "light" ? "dark" : "light"));
   };
 
   const topbarLabel = typeof title === "string" ? title : null;
@@ -119,6 +131,12 @@ export default function Layout({ title, children }) {
                 <Menu size={18} />
               </button>
               {topbarLabel ? <span className="topbar-label">{topbarLabel}</span> : null}
+            </div>
+            <div className="topbar-right">
+              <button className="theme-toggle" onClick={toggleTheme} type="button" aria-label="Toggle theme">
+                {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
+                <span>{theme === "light" ? "Dark" : "Light"}</span>
+              </button>
             </div>
           </div>
         </header>

@@ -40,7 +40,7 @@ export default function ManagerDashboard() {
 
   return (
     <div className="dashboard-container dashboard-balanced">
-      <WelcomeBanner title={<Greeting />} subtitle="Manager overview" />
+      <WelcomeBanner title={<Greeting />} />
       {error && <p className="error">{error}</p>}
 
       <section className="gradient-card-row">

@@ -194,8 +194,8 @@ form {
 }
 
 .brand-logo {
-  width: 52px;
-  height: 52px;
+  width: 58px;
+  height: 58px;
   border-radius: 12px;
   object-fit: contain;
 }
@@ -205,8 +205,8 @@ form {
 }
 
 .login-logo {
-  width: 104px;
-  height: 104px;
+  width: clamp(112px, 28vw, 126px);
+  height: clamp(112px, 28vw, 126px);
   border-radius: 18px;
   object-fit: contain;
   justify-self: center;
@@ -434,6 +434,16 @@ form {
   margin-top: 6px;
   color: var(--muted);
   font-size: clamp(0.84rem, 2.9vw, 1rem);
+}
+
+.theme-toggle {
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font-size: 0.82rem;
 }
 
 .gradient-card-row {
@@ -706,13 +716,13 @@ tbody tr:hover {
   }
 
   .brand-logo {
-    width: 48px;
-    height: 48px;
+    width: 52px;
+    height: 52px;
   }
 
   .login-logo {
-    width: 92px;
-    height: 92px;
+    width: clamp(100px, 30vw, 112px);
+    height: clamp(100px, 30vw, 112px);
   }
 
   .action-link,
@@ -855,8 +865,10 @@ tbody tr:hover {
     font-size: clamp(1.55rem, 3.8vw, 2.2rem);
   }
 
-  .welcome-subtitle {
-    margin-top: 8px;
+  .theme-toggle {
+    min-height: 38px;
+    padding: 0 14px;
+    font-size: 0.88rem;
   }
 
   .glass-card {
