@@ -16,6 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { AuthContext } from "../context/AuthContext";
+import logo from "../assets/krib-logo.png";
 
 const getHomePath = (role) => (role === "landlord" ? "/dashboard" : role === "manager" ? "/manager" : "/tenant");
 
@@ -78,8 +79,10 @@ export default function Layout({ title, children }) {
       <aside className={`app-sidebar ${mobileOpen && isCompactView ? "open" : ""}`}>
         <div className="sidebar-header">
           <Link to={getHomePath(user?.role)} className="sidebar-brand" onClick={onNavClick}>
-            <span className="sidebar-brand-mark">K</span>
-            <span>KRIB</span>
+            <span className="brand">
+              <img src={logo} alt="KRIB logo" className="brand-logo" />
+              <span className="brand-text">KRIB</span>
+            </span>
           </Link>
           {isCompactView ? (
             <button className="icon-btn mobile-only" onClick={() => setMobileOpen(false)} type="button" aria-label="Close menu">
