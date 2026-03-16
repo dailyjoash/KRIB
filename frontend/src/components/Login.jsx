@@ -52,9 +52,6 @@ const Login = () => {
     <div className="login-page">
       <div className="login-card">
         <img src={logo} alt="KRIB logo" className="login-logo" />
-        <h2>
-          Welcome to <span className="brand-text">KRIB</span> 🏠
-        </h2>
         <p className="subtitle">Sign in to manage your rentals</p>
 
         <form onSubmit={handleSubmit}>
