@@ -283,8 +283,24 @@ form {
 .sidebar-brand {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
+  padding: 8px 6px;
+  border-radius: 14px;
+  color: var(--text);
+}
+
+.sidebar-logo {
+  width: 50px;
+  height: 50px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+.sidebar-brand-text {
+  font-size: 1.16rem;
   font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 1;
   color: var(--text);
 }
 
@@ -295,6 +311,19 @@ form {
   font-size: 0.86rem;
 }
 
+
+.app-sidebar.collapsed .sidebar-header {
+  justify-content: center;
+}
+
+.app-sidebar.collapsed .sidebar-brand {
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.app-sidebar.collapsed .sidebar-brand-text {
+  display: none;
+}
 .sidebar-nav {
   margin-top: 8px;
   display: grid;
