@@ -91,9 +91,8 @@ export default function Layout({ title, children }) {
       <aside className={`app-sidebar ${mobileOpen && isCompactView ? "open" : ""}`}>
         <div className="sidebar-header">
           <Link to={getHomePath(user?.role)} className="sidebar-brand" onClick={onNavClick}>
-            <span className="brand">
-              <img src={logo} alt="KRIB logo" className="brand-logo" />
-            </span>
+            <img src={logo} alt="KRIB logo" className="sidebar-logo" />
+            <span className="sidebar-brand-text">KRIB</span>
           </Link>
           {isCompactView ? (
             <button className="icon-btn mobile-only" onClick={() => setMobileOpen(false)} type="button" aria-label="Close menu">
