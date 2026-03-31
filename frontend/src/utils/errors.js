@@ -1,7 +1,13 @@
 export function getErrorMessage(error, fallback = "Something went wrong.") {
   if (!error) return fallback;
+  const message = String(error?.message || "").toLowerCase();
+
+  if (error.code === "ECONNABORTED" || message.includes("timeout")) {
+    return "The server may be waking up. Please wait a moment and try again.";
+  }
+
   if (error.code === "ERR_NETWORK" || !error.response) {
-    return "Network error. Please check your connection.";
+    return "Unable to reach the server right now. If this is the first request, please wait a moment and try again.";
   }
 
   const detail = error.response?.data?.detail;
