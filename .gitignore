@@ -9,6 +9,8 @@ __pycache__/
 
 # Django
 db.sqlite3
+backend/media/
+backend/staticfiles/
 *.log
 
 # Env files

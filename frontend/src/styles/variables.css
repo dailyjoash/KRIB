@@ -1,0 +1,52 @@
+:root {
+  --radius-sm: 12px;
+  --radius-md: 16px;
+  --radius-lg: 22px;
+  --bg: #07111b;
+  --bg-secondary: #0a1526;
+  --panel: rgba(10, 21, 38, 0.9);
+  --surface: #0d2036;
+  --surface-soft: #14304c;
+  --text: #edf4ff;
+  --muted: #bfd0e6;
+  --border: rgba(139, 170, 211, 0.26);
+  --primary: #15c3a8;
+  --success: #36c48d;
+  --warning: #f4b34c;
+  --danger: #f26b82;
+  --shadow-soft: 0 14px 30px rgba(7, 12, 30, 0.35);
+  --shadow-lg: 0 24px 55px rgba(5, 10, 28, 0.52);
+  --body-overlay: radial-gradient(circle at center, transparent 45%, rgba(6, 10, 24, 0.35));
+  --krib-mint: #69c7bb;
+  --krib-mint-strong: #61c8bc;
+  --krib-mint-soft: #82d8ca;
+  --krib-surface-light: #ffffff;
+  --krib-surface-muted: #f4fbf8;
+  --krib-text-dark: #17272c;
+  --krib-text-muted: #4f646b;
+  --krib-border-soft: rgba(97, 176, 164, 0.18);
+  --krib-shadow-card: 0 22px 48px rgba(25, 68, 70, 0.08);
+  --krib-shadow-float: 0 28px 56px rgba(25, 68, 70, 0.14);
+  --krib-status-pending: #e4b45d;
+  --krib-status-progress: #67a9f4;
+  --krib-status-success: #52c4a2;
+  --krib-status-danger: #f18771;
+}
+
+:root.theme-light {
+  --bg: #f4fbf8;
+  --bg-secondary: #edf7f3;
+  --panel: rgba(255, 255, 255, 0.9);
+  --surface: #ffffff;
+  --surface-soft: #f3f8f6;
+  --text: #17272c;
+  --muted: #4f646b;
+  --border: rgba(97, 176, 164, 0.18);
+  --primary: #2f968a;
+  --success: #2f9b73;
+  --warning: #b37a1f;
+  --danger: #ca5a70;
+  --shadow-soft: 0 18px 38px rgba(25, 68, 70, 0.08);
+  --shadow-lg: 0 24px 52px rgba(25, 68, 70, 0.12);
+  --body-overlay: radial-gradient(circle at center, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.32));
+}

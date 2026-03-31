@@ -10,7 +10,7 @@ export default function NavBar() {
   const { user, logout } = useContext(AuthContext);
   const navigate = useNavigate();
   const location = useLocation();
-  const [theme, setTheme] = useState(localStorage.getItem("theme") || "dark");
+  const [theme, setTheme] = useState(localStorage.getItem("theme") === "dark" ? "dark" : "light");
 
   if (!user) return null;
 
@@ -48,7 +48,7 @@ export default function NavBar() {
     const nextTheme = theme === "dark" ? "light" : "dark";
     setTheme(nextTheme);
     localStorage.setItem("theme", nextTheme);
-    document.documentElement.classList.toggle("theme-dark", nextTheme === "dark");
+    document.documentElement.classList.toggle("theme-light", nextTheme === "light");
   };
 
   return (

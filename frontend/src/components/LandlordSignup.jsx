@@ -6,7 +6,8 @@ export default function LandlordSignup() {
   const navigate = useNavigate();
   const [form, setForm] = useState({
     business_name: "",
-    username: "",
+    first_name: "",
+    last_name: "",
     email: "",
     phone_number: "",
     password: "",
@@ -35,7 +36,8 @@ export default function LandlordSignup() {
     try {
       await api.post("/api/auth/signup-landlord/", {
         business_name: form.business_name,
-        username: form.username,
+        first_name: form.first_name,
+        last_name: form.last_name,
         email: form.email,
         phone_number: form.phone_number,
         password: form.password,
@@ -55,7 +57,8 @@ export default function LandlordSignup() {
         <p className="subtitle">Start managing your properties with KRIB.</p>
         <form onSubmit={handleSubmit}>
           <input name="business_name" placeholder="Business name" value={form.business_name} onChange={handleChange} required />
-          <input name="username" placeholder="Username" value={form.username} onChange={handleChange} required />
+          <input name="first_name" placeholder="First name" value={form.first_name} onChange={handleChange} required />
+          <input name="last_name" placeholder="Last name" value={form.last_name} onChange={handleChange} required />
           <input type="email" name="email" placeholder="Email" value={form.email} onChange={handleChange} required />
           <input name="phone_number" placeholder="Phone number" value={form.phone_number} onChange={handleChange} required />
           <input type="password" name="password" placeholder="Password" value={form.password} onChange={handleChange} required />

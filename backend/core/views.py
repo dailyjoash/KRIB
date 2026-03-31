@@ -6,22 +6,39 @@ import random
 from datetime import datetime, timedelta
 from decimal import Decimal
 from urllib import request as urllib_request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 
+try:
+    import stripe
+except ImportError:  # pragma: no cover - optional dependency in lightweight builds
+    stripe = None
 from django.conf import settings
+from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
+from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
+from django.http import FileResponse, Http404
 from django.db import transaction
 from django.db.models import Q, Sum
+from django.db.models.functions import Coalesce
+from django.utils.encoding import force_bytes, force_str
+from django.utils.decorators import method_decorator
+from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
+    Document,
     LandlordBalance,
     LandlordSettings,
     LandlordPayout,
@@ -40,6 +57,8 @@ from .models import (
 )
 from .serializers import (
     ChangePasswordSerializer,
+    DocumentSerializer,
+    LoginSerializer,
     LandlordFollowupSerializer,
     LandlordReceiptSerializer,
     LandlordRevenueSerializer,
@@ -52,7 +71,13 @@ from .serializers import (
     MaintenanceRequestSerializer,
     ManagerInviteAcceptSerializer,
     MeSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
+    RegisterSerializer,
+    UserLiteSerializer,
     NotificationSerializer,
+    NotificationSendSerializer,
+    LeaseTenantContactSerializer,
     PaymentTransactionSerializer,
     PropertySerializer,
     STKInitiateSerializer,
@@ -61,6 +86,16 @@ from .serializers import (
     UnitSerializer,
     WalletWithdrawSerializer,
 )
+from .services import (
+    build_public_url,
+    current_billing_period,
+    current_period_string,
+    paypal_capture_order,
+    paypal_create_order,
+    period_string_to_date,
+    save_payment_receipt,
+    send_sms,
+)
 
 logger = logging.getLogger(__name__)
 LANDLORD_HOLD_DAYS = 2
@@ -68,9 +103,150 @@ WALLET_WITHDRAW_HOLD_DAYS = 7
 WALLET_CREDIT_HOLD_DAYS = 7
 
 
+def _notify_users(users, title, message, *, notification_type=Notification.TYPE_GENERIC, lease=None, period=None):
+    for user in users:
+        if user:
+            Notification.objects.create(
+                user=user,
+                title=title,
+                message=message,
+                type=notification_type,
+                lease=lease,
+                period=period,
+            )
+
+
+def _lease_tenant_phone_number(lease):
+    tenant_profile = getattr(lease.tenant, "profile", None)
+    return getattr(tenant_profile, "phone_number", "") or getattr(getattr(lease.tenant, "tenant_profile", None), "phone", "")
+
+
+def _user_phone_number(user):
+    profile = getattr(user, "profile", None)
+    return getattr(profile, "phone_number", "") or getattr(getattr(user, "tenant_profile", None), "phone", "")
+
+
+def _display_name(user):
+    if not user:
+        return ""
+    return user.get_full_name() or user.username
+
+
+def _generate_unique_username(full_name, email="", prefix="user"):
+    cleaned_name = "".join(char.lower() for char in (full_name or "") if char.isalnum())
+    email_base = (email or "").split("@")[0].strip().lower()
+    email_base = "".join(char for char in email_base if char.isalnum())
+    username_base = cleaned_name or email_base or f"{prefix}{random.randint(1000, 9999)}"
+    username = username_base
+    counter = 1
+    while User.objects.filter(username=username).exists():
+        counter += 1
+        username = f"{username_base}{counter}"
+    return username
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def health_check(_request):
+    return Response({"status": "ok", "service": "krib-api", "debug": settings.DEBUG})
+
+
 def _get_role(user):
     profile, _ = Profile.objects.get_or_create(user=user)
     return profile.role
+
+
+def _sync_manager_account_state(user):
+    if not user:
+        return
+
+    profile, _ = Profile.objects.get_or_create(user=user)
+    if profile.role != Profile.ROLE_MANAGER or user.is_staff:
+        return
+
+    should_be_active = user.managed_properties.exists()
+    if user.is_active != should_be_active:
+        user.is_active = should_be_active
+        user.save(update_fields=["is_active"])
+
+
+def _issue_tokens(user):
+    refresh = RefreshToken.for_user(user)
+    return {
+        "refresh": str(refresh),
+        "access": str(refresh.access_token),
+        "role": _get_role(user),
+    }
+
+
+def _current_period():
+    return current_period_string()
+
+
+def _tenant_active_lease(user):
+    return (
+        Lease.objects.filter(tenant=user, status=Lease.STATUS_ACTIVE)
+        .select_related("unit", "unit__property", "tenant")
+        .first()
+    )
+
+
+def _assert_active_lease(lease, user):
+    if not lease or lease.status != Lease.STATUS_ACTIVE:
+        raise DRFValidationError({"detail": "No active lease found."})
+    if lease.tenant_id != user.id:
+        raise PermissionDenied("Unauthorized request.")
+
+
+def _validate_payment_amount(lease, amount, period):
+    requested = Decimal(amount)
+    if requested <= 0:
+        raise DRFValidationError({"detail": "Enter an amount greater than zero."})
+
+    period_label = period.strftime("%Y-%m") if hasattr(period, "strftime") else str(period)
+    remaining_balance = compute_lease_rent_status(
+        lease,
+        period=period_label,
+        today=timezone.localdate(),
+    ).get("balance", Decimal("0.00"))
+
+    if remaining_balance <= 0:
+        raise DRFValidationError({"detail": "Rent for this period is already fully paid."})
+
+    if requested > remaining_balance:
+        raise DRFValidationError(
+            {"detail": f"Amount cannot exceed the remaining balance of Ksh {remaining_balance:.2f}."}
+        )
+
+
+def _user_can_access_document(user, document):
+    role = _get_role(user)
+    if role == Profile.ROLE_LANDLORD and document.property.landlord_id == user.id:
+        return True
+    if role == Profile.ROLE_MANAGER and document.property.manager_id == user.id:
+        return True
+    if role == Profile.ROLE_TENANT:
+        if document.tenant_id == user.id:
+            return True
+        if document.lease_id and document.lease.tenant_id == user.id:
+            return True
+        if document.document_type == Document.TYPE_LEASE:
+            return Lease.objects.filter(
+                tenant=user,
+                unit__property=document.property,
+                status=Lease.STATUS_ACTIVE,
+            ).exists()
+        return False
+    return False
+
+
+def _user_can_access_payment_receipt(user, payment):
+    role = _get_role(user)
+    if role == Profile.ROLE_TENANT and payment.tenant_id == user.id:
+        return True
+    if role == Profile.ROLE_LANDLORD and payment.lease.unit.property.landlord_id == user.id:
+        return True
+    return False
 
 
 def _scoped_properties(user):
@@ -82,6 +258,56 @@ def _scoped_properties(user):
     if role == Profile.ROLE_TENANT:
         return Property.objects.filter(units__leases__tenant=user, units__leases__status=Lease.STATUS_ACTIVE).distinct()
     return Property.objects.none()
+
+
+def _notification_recipients(user, audience, property_obj=None):
+    role = _get_role(user)
+    if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not user.is_staff:
+        raise PermissionDenied("Only landlord or manager can send notifications.")
+
+    if user.is_staff:
+        scoped_properties = Property.objects.all()
+    elif role == Profile.ROLE_MANAGER:
+        scoped_properties = Property.objects.filter(manager=user)
+    else:
+        scoped_properties = Property.objects.filter(landlord=user)
+
+    if property_obj is not None:
+        if not user.is_staff and not scoped_properties.filter(pk=property_obj.pk).exists():
+            raise PermissionDenied("You can only notify users in your own portfolio.")
+        scoped_properties = Property.objects.filter(pk=property_obj.pk)
+
+    tenants = User.objects.filter(profile__role=Profile.ROLE_TENANT)
+    managers = User.objects.filter(profile__role=Profile.ROLE_MANAGER)
+    landlords = User.objects.filter(profile__role=Profile.ROLE_LANDLORD)
+
+    if not user.is_staff or property_obj is not None:
+        tenants = tenants.filter(
+            leases__unit__property__in=scoped_properties,
+            leases__status=Lease.STATUS_ACTIVE,
+        )
+        managers = managers.filter(managed_properties__in=scoped_properties)
+        landlords = landlords.filter(properties__in=scoped_properties)
+
+    if audience == NotificationSendSerializer.AUDIENCE_TENANTS:
+        recipients = tenants
+    elif audience == NotificationSendSerializer.AUDIENCE_MANAGERS:
+        recipients = managers
+    elif audience == NotificationSendSerializer.AUDIENCE_LANDLORDS:
+        if not user.is_staff:
+            raise PermissionDenied("Only staff can notify landlords.")
+        recipients = landlords
+    else:
+        recipients = tenants | managers
+        if user.is_staff:
+            recipients = recipients | landlords
+
+    return recipients.exclude(pk=user.pk).distinct()
+
+
+def _require_landlord_or_staff(user):
+    if _get_role(user) != Profile.ROLE_LANDLORD and not user.is_staff:
+        raise PermissionDenied("Only landlord can modify properties")
 
 
 def _unlock_wallet(profile):
@@ -160,6 +386,13 @@ def _apply_wallet_to_current_rent(lease):
         available_at=timezone.now() + timedelta(days=LANDLORD_HOLD_DAYS),
         reference_text=f"wallet_debit_lease:{lease.id}",
     )
+    _notify_users(
+        [lease.tenant, landlord],
+        "Wallet rent applied",
+        f"KES {debit} from the tenant wallet has been applied to {lease.unit.property.name} / {lease.unit.unit_number}.",
+        lease=lease,
+        period=period,
+    )
     return debit
 
 
@@ -205,6 +438,14 @@ def _allocate_success_payment(payment):
         payment.allocation_done = True
         payment.save(update_fields=["allocation_done"])
 
+    _notify_users(
+        [payment.tenant, landlord],
+        "Rent payment received",
+        f"Rent payment of KES {payment.amount} for {payment.period} was processed successfully for {lease.unit.property.name} / {lease.unit.unit_number}.",
+        lease=lease,
+        period=payment.period,
+    )
+
 
 def _daraja_access_token():
     key = os.getenv("MPESA_CONSUMER_KEY", "")
@@ -216,9 +457,16 @@ def _daraja_access_token():
         os.getenv("MPESA_OAUTH_URL", "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"),
         headers={"Authorization": f"Basic {auth}"},
     )
-    with urllib_request.urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode())
-        return payload.get("access_token")
+    try:
+        with urllib_request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+            return payload.get("access_token")
+    except HTTPError as exc:
+        logger.warning("Daraja access token request failed: %s", exc.read().decode())
+        return None
+    except URLError as exc:
+        logger.warning("Daraja access token request failed: %s", exc)
+        return None
 
 
 def _missing_daraja_env_vars():
@@ -226,15 +474,48 @@ def _missing_daraja_env_vars():
         "MPESA_CONSUMER_KEY",
         "MPESA_CONSUMER_SECRET",
         "MPESA_SHORTCODE",
-        "MPESA_PASSKEY",
         "MPESA_CALLBACK_URL",
     ]
     return [name for name in required_vars if not os.getenv(name)]
 
 
+def _daraja_callback_url_error():
+    callback_url = os.getenv("MPESA_CALLBACK_URL", "").strip()
+    if not callback_url:
+        return "MPESA_CALLBACK_URL is missing."
+
+    parsed = urlparse(callback_url)
+    hostname = parsed.hostname or ""
+
+    if parsed.scheme != "https" or not parsed.netloc:
+        return "MPESA callback URL must be a public HTTPS URL."
+    if hostname in {"localhost", "127.0.0.1"}:
+        return "MPESA callback URL cannot point to localhost."
+    if "." not in hostname:
+        return "MPESA callback URL must use a valid public domain name."
+
+    return None
+
+
+def _daraja_passkey(shortcode):
+    configured = os.getenv("MPESA_PASSKEY", "").strip()
+    sandbox_passkey = "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919"
+    if shortcode == "174379" and configured and len(configured) < len(sandbox_passkey):
+        logger.warning(
+            "Ignoring truncated MPESA_PASSKEY for sandbox shortcode 174379 and using the shared test passkey."
+        )
+        return sandbox_passkey
+    if configured:
+        return configured
+    # Safaricom's shared sandbox shortcode 174379 uses the standard test passkey.
+    if shortcode == "174379":
+        return sandbox_passkey
+    return ""
+
+
 def _daraja_stk_push(phone_number, amount, reference):
     shortcode = os.getenv("MPESA_SHORTCODE", "")
-    passkey = os.getenv("MPESA_PASSKEY", "")
+    passkey = _daraja_passkey(shortcode)
     callback_url = os.getenv("MPESA_CALLBACK_URL", "")
     if not shortcode or not passkey or not callback_url:
         return None
@@ -243,7 +524,9 @@ def _daraja_stk_push(phone_number, amount, reference):
     if not token:
         return None
 
-    timestamp = timezone.now().strftime("%Y%m%d%H%M%S")
+    # Daraja password validation is sensitive to the request timestamp.
+    # Use local EAT time instead of Django's default UTC value here.
+    timestamp = timezone.localtime().strftime("%Y%m%d%H%M%S")
     password = base64.b64encode(f"{shortcode}{passkey}{timestamp}".encode()).decode()
 
     payload = {
@@ -272,6 +555,9 @@ def _daraja_stk_push(phone_number, amount, reference):
     except HTTPError as exc:
         logger.warning("Daraja STK push failed: %s", exc.read().decode())
         return None
+    except URLError as exc:
+        logger.warning("Daraja STK push failed: %s", exc)
+        return None
 
 
 @api_view(["GET", "PATCH"])
@@ -282,7 +568,10 @@ def get_me(request):
         return Response(
             {
                 "id": request.user.id,
-                "username": request.user.username,
+                "username": _display_name(request.user),
+                "full_name": _display_name(request.user),
+                "first_name": request.user.first_name,
+                "last_name": request.user.last_name,
                 "role": profile.role,
                 "is_staff": request.user.is_staff,
                 "email": request.user.email,
@@ -304,11 +593,95 @@ def get_me(request):
     return Response(
         {
             "id": request.user.id,
-            "username": request.user.username,
+            "username": _display_name(request.user),
+            "full_name": _display_name(request.user),
+            "first_name": request.user.first_name,
+            "last_name": request.user.last_name,
             "role": profile.role,
             "is_staff": request.user.is_staff,
             "email": request.user.email,
             "phone_number": profile.phone_number,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def register(request):
+    serializer = RegisterSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    name = serializer.validated_data["name"].strip()
+    email = serializer.validated_data["email"].strip().lower()
+    phone = serializer.validated_data.get("phone", "").strip()
+    role = serializer.validated_data["role"]
+
+    with transaction.atomic():
+        username = _generate_unique_username(name, email=email)
+        user = User.objects.create(username=username, email=email, first_name=name)
+        user.set_password(serializer.validated_data["password"])
+        user.save(update_fields=["password"])
+
+        profile, _ = Profile.objects.get_or_create(user=user)
+        profile.role = role
+        profile.phone_number = phone
+        profile.save(update_fields=["role", "phone_number"])
+
+        tenant_profile, _ = Tenant.objects.get_or_create(user=user)
+        if role == Profile.ROLE_TENANT:
+            tenant_profile.phone = phone
+            tenant_profile.save(update_fields=["phone"])
+
+    return Response(
+        {
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "name": user.first_name or user.username,
+                "phone": profile.phone_number,
+                "role": profile.role,
+                "is_staff": user.is_staff,
+            },
+            **_issue_tokens(user),
+        },
+        status=201,
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def login(request):
+    serializer = LoginSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    identifier = serializer.validated_data["email"].strip()
+    password = serializer.validated_data["password"]
+    user = User.objects.filter(email__iexact=identifier).first()
+    if not user:
+        user = User.objects.filter(username__iexact=identifier).first()
+    if not user:
+        return Response({"detail": "Invalid login details."}, status=400)
+
+    profile, _ = Profile.objects.get_or_create(user=user)
+    if profile.role == Profile.ROLE_MANAGER and not user.is_staff and not user.is_active:
+        return Response({"detail": "This manager account is inactive until a property is assigned."}, status=403)
+
+    authenticated = authenticate(username=user.username, password=password)
+    if not authenticated:
+        return Response({"detail": "Invalid login details."}, status=400)
+
+    profile, _ = Profile.objects.get_or_create(user=authenticated)
+    return Response(
+        {
+            "user": {
+                "id": authenticated.id,
+                "email": authenticated.email,
+                "name": authenticated.first_name or authenticated.username,
+                "phone": profile.phone_number,
+                "role": profile.role,
+                "is_staff": authenticated.is_staff,
+            },
+            **_issue_tokens(authenticated),
         }
     )
 
@@ -320,9 +693,14 @@ def signup_landlord(request):
     serializer.is_valid(raise_exception=True)
 
     with transaction.atomic():
+        first_name = serializer.validated_data["first_name"].strip()
+        last_name = serializer.validated_data["last_name"].strip()
+        full_name = f"{first_name} {last_name}".strip()
         user = User.objects.create(
-            username=serializer.validated_data["username"],
+            username=_generate_unique_username(full_name, email=serializer.validated_data.get("email", "")),
             email=serializer.validated_data.get("email", ""),
+            first_name=first_name,
+            last_name=last_name,
         )
         user.set_password(serializer.validated_data["password"])
         user.save(update_fields=["password"])
@@ -352,17 +730,134 @@ def change_password(request):
     return Response({"detail": "Password changed successfully."})
 
 
-def send_invite(invite):
-    invite_link = f"http://localhost:5173/invite/{invite.token}"
-    if getattr(settings, "EMAIL_HOST", "") and invite.email:
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def password_reset_request(request):
+    serializer = PasswordResetRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    email = serializer.validated_data["email"].strip().lower()
+    user = User.objects.filter(email__iexact=email).first()
+
+    if user:
+        frontend_base = settings.FRONTEND_URL or "http://localhost:5173"
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user)
+        reset_link = f"{frontend_base.rstrip('/')}/reset-password/{uid}/{token}"
         send_mail(
-            subject="KRIB Manager Invite",
-            message=f"Use this link to join as manager: {invite_link}",
+            subject="KRIB password reset",
+            message=f"Use this link to reset your KRIB password: {reset_link}",
             from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
-            recipient_list=[invite.email],
+            recipient_list=[user.email],
             fail_silently=True,
         )
-    return invite_link
+
+    return Response({"detail": "If that email exists, a password reset link has been sent."})
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def password_reset_confirm(request):
+    serializer = PasswordResetConfirmSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        user_id = force_str(urlsafe_base64_decode(serializer.validated_data["uid"]))
+        user = User.objects.get(pk=user_id)
+    except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        return Response({"detail": "Invalid reset link."}, status=400)
+
+    if not default_token_generator.check_token(user, serializer.validated_data["token"]):
+        return Response({"detail": "Invalid or expired reset link."}, status=400)
+
+    user.set_password(serializer.validated_data["new_password"])
+    user.save(update_fields=["password"])
+    return Response({"detail": "Password reset successfully."})
+
+
+def _frontend_base_url():
+    return (settings.FRONTEND_URL or "http://localhost:5173").rstrip("/")
+
+
+def _can_send_email():
+    backend = getattr(settings, "EMAIL_BACKEND", "")
+    return bool(
+        backend
+        and (
+            backend != "django.core.mail.backends.smtp.EmailBackend"
+            or getattr(settings, "EMAIL_HOST", "")
+        )
+    )
+
+
+def _send_invite_channels(*, subject, email_message, sms_message, email=None, phone=None):
+    email_sent = False
+    sms_sent = False
+
+    if email and _can_send_email():
+        send_mail(
+            subject=subject,
+            message=email_message,
+            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+            recipient_list=[email],
+            fail_silently=True,
+        )
+        email_sent = True
+
+    if phone:
+        sms_sent = send_sms(phone, sms_message)
+
+    return {"email_sent": email_sent, "sms_sent": sms_sent}
+
+
+def _manager_invite_link(invite):
+    return f"{_frontend_base_url()}/invite/manager/{invite.token}"
+
+
+def _tenant_invite_link(invite):
+    return f"{_frontend_base_url()}/invite/tenant/{invite.token}"
+
+
+def send_manager_invite(invite, display_name=""):
+    invite_link = _manager_invite_link(invite)
+    name = (display_name or "there").strip()
+    delivery = _send_invite_channels(
+        subject="KRIB Manager Invite",
+        email_message=(
+            f"Hello {name},\n\n"
+            f"You have been invited to join KRIB as a manager.\n"
+            f"Use this first-login link to create your account: {invite_link}"
+        ),
+        sms_message=(
+            f"KRIB manager invite for {name or 'you'}. "
+            f"Create your account here: {invite_link}"
+        ),
+        email=invite.email,
+        phone=invite.phone,
+    )
+    return {"invite_link": invite_link, **delivery}
+
+
+def send_tenant_invite(invite):
+    invite_link = _tenant_invite_link(invite)
+    unit_label = invite.unit.unit_number if invite.unit else ""
+    property_name = invite.property.name if invite.property else ""
+    location_bits = " / ".join(bit for bit in [property_name, unit_label] if bit)
+    context = f" for {location_bits}" if location_bits else ""
+    delivery = _send_invite_channels(
+        subject="KRIB Tenant Invite",
+        email_message=(
+            f"Hello {invite.full_name},\n\n"
+            f"You have been invited to KRIB{context}.\n"
+            f"Use this first-login link to create your tenant account: {invite_link}"
+        ),
+        sms_message=(
+            f"KRIB tenant invite{context}. "
+            f"Create your account here: {invite_link}"
+        ),
+        email=invite.email,
+        phone=invite.phone,
+    )
+    return {"invite_link": invite_link, **delivery}
 
 
 class ManagerInviteCreateView(APIView):
@@ -383,7 +878,15 @@ class ManagerInviteCreateView(APIView):
             expires_at=timezone.now() + timedelta(days=7),
             is_active=True,
         )
-        return Response({"token": str(invite.token), "expires_at": invite.expires_at, "invite_link": send_invite(invite)}, status=201)
+        delivery = send_manager_invite(invite, request.data.get("name", ""))
+        return Response(
+            {
+                "token": str(invite.token),
+                "expires_at": invite.expires_at,
+                **delivery,
+            },
+            status=201,
+        )
 
 
 class ManagerInviteAcceptView(APIView):
@@ -399,11 +902,16 @@ class ManagerInviteAcceptView(APIView):
         if invite.is_expired() or invite.accepted_at:
             return Response({"detail": "Invite expired or already used."}, status=400)
 
-        username = serializer.validated_data["username"]
-        if User.objects.filter(username=username).exists():
-            return Response({"detail": "Username already exists."}, status=400)
-
-        user = User.objects.create(username=username, email=invite.email or "")
+        first_name = serializer.validated_data["first_name"].strip()
+        last_name = serializer.validated_data["last_name"].strip()
+        full_name = f"{first_name} {last_name}".strip()
+        username = _generate_unique_username(full_name, email=invite.email or "", prefix="manager")
+        user = User.objects.create(
+            username=username,
+            email=invite.email or "",
+            first_name=first_name,
+            last_name=last_name,
+        )
         created = True
         user.set_password(serializer.validated_data["password"])
         user.save()
@@ -417,9 +925,20 @@ class ManagerInviteAcceptView(APIView):
 
 
 class UserViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = User.objects.all().order_by("id")
-    serializer_class = TenantSerializer
+    serializer_class = UserLiteSerializer
     permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user_role = _get_role(self.request.user)
+        if user_role != Profile.ROLE_LANDLORD and not self.request.user.is_staff:
+            return User.objects.none()
+        qs = User.objects.all().order_by("id")
+        role = self.request.query_params.get("role")
+        if role in dict(Profile.ROLE_CHOICES):
+            qs = qs.filter(profile__role=role)
+        else:
+            qs = qs.none()
+        return qs
 
 
 class PropertyViewSet(viewsets.ModelViewSet):
@@ -433,7 +952,25 @@ class PropertyViewSet(viewsets.ModelViewSet):
         role = _get_role(self.request.user)
         if role not in [Profile.ROLE_LANDLORD] and not self.request.user.is_staff:
             raise PermissionDenied("Only landlord can create properties")
-        serializer.save(landlord=self.request.user)
+        property_row = serializer.save(landlord=self.request.user)
+        _sync_manager_account_state(property_row.manager)
+
+    def perform_update(self, serializer):
+        _require_landlord_or_staff(self.request.user)
+        previous_manager = serializer.instance.manager
+        property_row = serializer.save()
+        manager_candidates = []
+        for manager in [previous_manager, property_row.manager]:
+            if manager and all(existing.id != manager.id for existing in manager_candidates):
+                manager_candidates.append(manager)
+        for manager in manager_candidates:
+            _sync_manager_account_state(manager)
+
+    def perform_destroy(self, instance):
+        _require_landlord_or_staff(self.request.user)
+        previous_manager = instance.manager
+        instance.delete()
+        _sync_manager_account_state(previous_manager)
 
 
 class UnitViewSet(viewsets.ModelViewSet):
@@ -459,13 +996,14 @@ class UnitViewSet(viewsets.ModelViewSet):
 class LeaseViewSet(viewsets.ModelViewSet):
     serializer_class = LeaseSerializer
     permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_queryset(self):
         user = self.request.user
         role = _get_role(user)
         if role == Profile.ROLE_TENANT:
-            return Lease.objects.filter(tenant=user).select_related("unit", "unit__property", "tenant")
-        return Lease.objects.filter(unit__property__in=_scoped_properties(user)).select_related("unit", "unit__property", "tenant")
+            return Lease.objects.filter(tenant=user).select_related("unit", "unit__property", "tenant").order_by("unit__property__name", "unit__unit_number", "id")
+        return Lease.objects.filter(unit__property__in=_scoped_properties(user)).select_related("unit", "unit__property", "tenant").order_by("unit__property__name", "unit__unit_number", "id")
 
     def perform_create(self, serializer):
         role = _get_role(self.request.user)
@@ -476,12 +1014,140 @@ class LeaseViewSet(viewsets.ModelViewSet):
         if lease_unit.property not in _scoped_properties(self.request.user):
             raise PermissionDenied("Cannot create leases outside your assigned properties")
 
-        serializer.save()
+        lease = serializer.save()
+        login_link = (settings.FRONTEND_URL or "http://localhost:5173").rstrip("/") + "/login"
+        phone_number = _lease_tenant_phone_number(lease)
+        tenant_name = lease.tenant.get_full_name() or lease.tenant.username
+        property_label = f"{lease.unit.property.name} / {lease.unit.unit_number}"
+
+        _notify_users(
+            [lease.tenant],
+            "Lease documents ready",
+            f"Your lease for {property_label} is active. Open Documents in KRIB to review your signed agreement and identification record.",
+            lease=lease,
+        )
+
+        if lease.tenant.email:
+            send_mail(
+                "KRIB lease documents ready",
+                (
+                    f"Hello {tenant_name},\n\n"
+                    f"Your lease for {property_label} is now active in KRIB.\n"
+                    f"Your signed tenant agreement and identification document are available in the Documents tab.\n"
+                    f"Sign in here: {login_link}\n"
+                ),
+                settings.DEFAULT_FROM_EMAIL or None,
+                [lease.tenant.email],
+                fail_silently=True,
+            )
+        if phone_number:
+            send_sms(
+                phone_number,
+                f"Your KRIB lease for {property_label} is active. Your signed agreement is ready in Documents. Log in here: {login_link}",
+            )
+
+    @action(detail=True, methods=["post"], url_path="contact-tenant")
+    def contact_tenant(self, request, pk=None):
+        role = _get_role(request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not request.user.is_staff:
+            return Response({"detail": "Unauthorized request."}, status=403)
+
+        lease = self.get_object()
+        serializer = LeaseTenantContactSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        channel = serializer.validated_data["channel"]
+        subject = (serializer.validated_data.get("subject") or "").strip()
+        message = serializer.validated_data["message"].strip()
+        default_subject = subject or f"KRIB update for {lease.unit.property.name} / {lease.unit.unit_number}"
+
+        if channel == LeaseTenantContactSerializer.CHANNEL_EMAIL:
+            if not lease.tenant.email:
+                return Response({"detail": "This tenant does not have an email address."}, status=400)
+            try:
+                send_mail(
+                    default_subject,
+                    message,
+                    settings.DEFAULT_FROM_EMAIL or None,
+                    [lease.tenant.email],
+                    fail_silently=False,
+                )
+            except Exception as exc:  # pragma: no cover - depends on env transport
+                logger.warning("Email delivery failed: %s", exc)
+                return Response({"detail": "Email delivery failed. Check your SMTP configuration."}, status=503)
+            delivery_label = "Email sent to tenant."
+        else:
+            phone_number = _lease_tenant_phone_number(lease)
+            if not phone_number:
+                return Response({"detail": "This tenant does not have a phone number."}, status=400)
+            sms_result = send_sms(phone_number, message, include_detail=True)
+            sms_ok = sms_result if isinstance(sms_result, bool) else sms_result.get("ok")
+            sms_detail = "" if isinstance(sms_result, bool) else sms_result.get("detail")
+            if not sms_ok:
+                return Response(
+                    {
+                        "detail": sms_detail
+                        or "SMS delivery failed. Check the Africa's Talking sandbox setup."
+                    },
+                    status=503,
+                )
+            delivery_label = "SMS sent to tenant."
+
+        _notify_users([lease.tenant], default_subject, message, lease=lease)
+        return Response({"detail": delivery_label})
+
+    @action(detail=True, methods=["post"], url_path="remove-tenant")
+    def remove_tenant(self, request, pk=None):
+        role = _get_role(request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not request.user.is_staff:
+            return Response({"detail": "Unauthorized request."}, status=403)
+
+        lease = self.get_object()
+        if lease.status != Lease.STATUS_ACTIVE:
+            return Response({"detail": "Only active leases can be ended."}, status=400)
+
+        today = timezone.localdate()
+        if not lease.end_date or lease.end_date > today:
+            lease.end_date = today
+        lease.status = Lease.STATUS_INACTIVE
+        lease.save()
+
+        tenant_name = lease.tenant.get_full_name() or lease.tenant.username
+        property_label = f"{lease.unit.property.name} / {lease.unit.unit_number}"
+        _notify_users(
+            [lease.tenant],
+            "Lease ended",
+            f"Your lease for {property_label} has been ended in KRIB. Contact the landlord or manager if you need any clarification.",
+            lease=lease,
+        )
+
+        if lease.tenant.email:
+            send_mail(
+                "KRIB lease ended",
+                (
+                    f"Hello {tenant_name},\n\n"
+                    f"Your lease for {property_label} has been ended in KRIB.\n"
+                    "Contact your landlord or manager if this needs follow-up.\n"
+                ),
+                settings.DEFAULT_FROM_EMAIL or None,
+                [lease.tenant.email],
+                fail_silently=True,
+            )
+
+        phone_number = _lease_tenant_phone_number(lease)
+        if phone_number:
+            send_sms(
+                phone_number,
+                f"Your KRIB lease for {property_label} has been ended. Contact the landlord or manager if you have any questions.",
+            )
+
+        return Response({"detail": "Tenant removed from the unit.", "lease": LeaseSerializer(lease).data})
 
 
 class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     queryset = TenantInvite.objects.all().order_by("-id")
     serializer_class = TenantInviteSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_permissions(self):
         if self.action in ["retrieve", "verify_otp", "accept"]:
@@ -498,6 +1164,15 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
             return TenantInvite.objects.filter(property__manager=self.request.user)
         return TenantInvite.objects.none()
 
+    def retrieve(self, request, *args, **kwargs):
+        invite = TenantInvite.objects.filter(token=kwargs.get("pk")).select_related("property", "unit__property", "invited_by").first()
+        if not invite:
+            return Response({"detail": "Tenant invite not found."}, status=404)
+        if invite.is_expired() and invite.status == TenantInvite.STATUS_PENDING:
+            invite.status = TenantInvite.STATUS_EXPIRED
+            invite.save(update_fields=["status"])
+        return Response(TenantInviteSerializer(invite).data)
+
     def create(self, request, *args, **kwargs):
         role = _get_role(request.user)
         if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
@@ -509,14 +1184,46 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
             invite.delete()
             return Response({"detail": "Managers can only invite for assigned properties."}, status=403)
         data = TenantInviteSerializer(invite).data
-        data["invite_link"] = f"/api/invites/{invite.token}/"
+        data.update(send_tenant_invite(invite))
         return Response(data, status=201)
+
+    @action(detail=True, methods=["post"], url_path="resend")
+    def resend(self, request, pk=None):
+        role = _get_role(request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
+            return Response({"detail": "Only landlord or manager can resend invites."}, status=403)
+
+        invite = self.get_object()
+        if invite.status != TenantInvite.STATUS_PENDING:
+            return Response({"detail": "Only pending tenant invites can be resent."}, status=400)
+        if invite.is_expired():
+            invite.status = TenantInvite.STATUS_EXPIRED
+            invite.save(update_fields=["status"])
+            return Response({"detail": "This tenant invite has expired. Create a fresh invite instead."}, status=400)
+
+        data = TenantInviteSerializer(invite).data
+        data.update(send_tenant_invite(invite))
+        return Response(data, status=200)
+
+    @action(detail=True, methods=["post"], url_path="cancel")
+    def cancel(self, request, pk=None):
+        role = _get_role(request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
+            return Response({"detail": "Only landlord or manager can cancel invites."}, status=403)
+
+        invite = self.get_object()
+        if invite.status != TenantInvite.STATUS_PENDING:
+            return Response({"detail": "Only pending tenant invites can be cancelled."}, status=400)
+
+        invite.status = TenantInvite.STATUS_CANCELLED
+        invite.save(update_fields=["status"])
+        return Response({"detail": "Tenant invite cancelled.", "status": invite.status}, status=200)
 
     @action(detail=True, methods=["post"], url_path="verify-otp")
     def verify_otp(self, request, pk=None):
         invite = TenantInvite.objects.filter(token=pk).first()
         if not invite:
-            return Response({"detail": "Not found"}, status=404)
+            return Response({"detail": "Tenant invite not found."}, status=404)
         otp = request.data.get("otp_code")
         if not invite.otp_code:
             return Response({"detail": "OTP not enabled for this invite."}, status=400)
@@ -530,29 +1237,49 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
     def accept(self, request, pk=None):
         invite = TenantInvite.objects.filter(token=pk).first()
         if not invite:
-            return Response({"detail": "Not found"}, status=404)
-        if invite.is_expired() or invite.status != TenantInvite.STATUS_PENDING:
-            return Response({"detail": "Invite is no longer valid."}, status=400)
+            return Response({"detail": "Tenant invite not found."}, status=404)
+        if invite.is_expired():
+            if invite.status == TenantInvite.STATUS_PENDING:
+                invite.status = TenantInvite.STATUS_EXPIRED
+                invite.save(update_fields=["status"])
+            return Response({"detail": "This tenant invite has expired."}, status=400)
+        if invite.status == TenantInvite.STATUS_CANCELLED:
+            return Response({"detail": "This tenant invite was cancelled."}, status=400)
+        if invite.status == TenantInvite.STATUS_ACCEPTED:
+            return Response({"detail": "This tenant invite has already been used."}, status=400)
+        if invite.status != TenantInvite.STATUS_PENDING:
+            return Response({"detail": "This tenant invite is no longer active."}, status=400)
         serializer = InviteAcceptSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        username = serializer.validated_data.get("username") or (invite.email or invite.phone or f"tenant_{invite.token.hex[:8]}")
-        if User.objects.filter(username=username).exists():
-            return Response({"detail": "Username already exists."}, status=400)
+        first_name = serializer.validated_data["first_name"].strip()
+        last_name = serializer.validated_data["last_name"].strip()
+        full_name = f"{first_name} {last_name}".strip()
+        username = _generate_unique_username(full_name, email=invite.email or "", prefix="tenant")
 
-        user = User.objects.create(username=username, email=invite.email or "")
-        created = True
-        user.set_password(serializer.validated_data["password"])
-        user.save()
-        profile, _ = Profile.objects.get_or_create(user=user)
-        profile.role = Profile.ROLE_TENANT
-        profile.save(update_fields=["role"])
-        tenant_profile, _ = Tenant.objects.get_or_create(user=user)
-        if invite.phone:
-            tenant_profile.phone = invite.phone
-            tenant_profile.save(update_fields=["phone"])
-        invite.status = TenantInvite.STATUS_ACCEPTED
-        invite.save(update_fields=["status"])
-        return Response({"detail": "Invite accepted.", "username": user.username, "created": created})
+        with transaction.atomic():
+            user = User.objects.create(
+                username=username,
+                email=invite.email or "",
+                first_name=first_name,
+                last_name=last_name,
+            )
+            created = True
+            user.set_password(serializer.validated_data["password"])
+            user.save()
+            profile, _ = Profile.objects.get_or_create(user=user)
+            profile.role = Profile.ROLE_TENANT
+            if invite.phone:
+                profile.phone_number = invite.phone
+                profile.save(update_fields=["role", "phone_number"])
+            else:
+                profile.save(update_fields=["role"])
+            tenant_profile, _ = Tenant.objects.get_or_create(user=user)
+            if invite.phone:
+                tenant_profile.phone = invite.phone
+                tenant_profile.save(update_fields=["phone"])
+            invite.status = TenantInvite.STATUS_ACCEPTED
+            invite.save(update_fields=["status"])
+        return Response({"detail": "Invite accepted.", "name": _display_name(user), "created": created})
 
 
 class STKInitiateView(APIView):
@@ -560,10 +1287,14 @@ class STKInitiateView(APIView):
 
     def post(self, request):
         if _get_role(request.user) != Profile.ROLE_TENANT:
-            return Response({"detail": "Only tenants can initiate payment."}, status=403)
+            return Response({"detail": "Unauthorized request."}, status=403)
 
         missing_env_vars = _missing_daraja_env_vars()
         if missing_env_vars:
+            logger.warning(
+                "M-Pesa initiate blocked: missing env vars %s",
+                missing_env_vars,
+            )
             return Response(
                 {
                     "detail": "Payment gateway is not configured.",
@@ -572,30 +1303,51 @@ class STKInitiateView(APIView):
                 status=503,
             )
 
+        callback_url_error = _daraja_callback_url_error()
+        if callback_url_error:
+            logger.warning(
+                "M-Pesa initiate blocked: %s (callback=%s)",
+                callback_url_error,
+                os.getenv("MPESA_CALLBACK_URL", "").strip(),
+            )
+            return Response({"detail": callback_url_error}, status=503)
+
         serializer = STKInitiateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         lease = serializer.validated_data["lease"]
-        if lease.tenant != request.user or lease.status != Lease.STATUS_ACTIVE:
-            return Response({"detail": "You can only pay your active lease."}, status=403)
+        try:
+            _assert_active_lease(lease, request.user)
+        except PermissionDenied:
+            return Response({"detail": "Unauthorized request."}, status=403)
+        except DRFValidationError:
+            return Response({"detail": "No active lease found."}, status=400)
 
-        _apply_wallet_to_current_rent(lease)
-        period = timezone.localdate().strftime("%Y-%m")
+        period = _current_period()
+        billing_period = current_billing_period()
+        _validate_payment_amount(lease, serializer.validated_data["amount"], billing_period)
         payment = PaymentTransaction.objects.create(
             lease=lease,
             tenant=request.user,
             period=period,
+            billing_period=billing_period,
             phone_number=serializer.validated_data["phone_number"],
             amount=serializer.validated_data["amount"],
+            payment_method=PaymentTransaction.METHOD_MPESA,
             status=PaymentTransaction.STATUS_PENDING,
         )
 
         result = _daraja_stk_push(payment.phone_number, payment.amount, f"LEASE-{lease.id}")
-        if result:
-            payment.merchant_request_id = result.get("MerchantRequestID")
-            payment.checkout_request_id = result.get("CheckoutRequestID")
-            payment.result_code = result.get("ResponseCode")
-            payment.result_desc = result.get("ResponseDescription")
-            payment.save(update_fields=["merchant_request_id", "checkout_request_id", "result_code", "result_desc"])
+        if not result:
+            payment.status = PaymentTransaction.STATUS_FAILED
+            payment.result_desc = "Payment failed. Please try again."
+            payment.save(update_fields=["status", "result_desc"])
+            return Response({"detail": "Payment failed. Please try again."}, status=502)
+
+        payment.merchant_request_id = result.get("MerchantRequestID")
+        payment.checkout_request_id = result.get("CheckoutRequestID")
+        payment.result_code = result.get("ResponseCode")
+        payment.result_desc = result.get("ResponseDescription")
+        payment.save(update_fields=["merchant_request_id", "checkout_request_id", "result_code", "result_desc"])
 
         return Response({"detail": "STK push initiated.", "payment": PaymentTransactionSerializer(payment).data}, status=201)
 
@@ -637,6 +1389,7 @@ class STKCallbackView(APIView):
         payment.result_code = result_code
         payment.result_desc = result_desc
         payment.mpesa_receipt = mpesa_receipt
+        payment.transaction_code = mpesa_receipt or payment.transaction_code
         if transaction_date:
             try:
                 parsed = datetime.strptime(str(transaction_date), "%Y%m%d%H%M%S")
@@ -646,7 +1399,7 @@ class STKCallbackView(APIView):
 
         payment.status = PaymentTransaction.STATUS_SUCCESS if result_code == 0 else PaymentTransaction.STATUS_FAILED
         payment.save(
-            update_fields=["raw_callback", "result_code", "result_desc", "mpesa_receipt", "transaction_date", "status"]
+            update_fields=["raw_callback", "result_code", "result_desc", "mpesa_receipt", "transaction_code", "transaction_date", "status"]
         )
         logger.info(
             "STK callback transition processed",
@@ -659,7 +1412,252 @@ class STKCallbackView(APIView):
         )
         if payment.status == PaymentTransaction.STATUS_SUCCESS:
             _allocate_success_payment(payment)
+            save_payment_receipt(payment)
+            tenant_profile = getattr(payment.tenant, "profile", None)
+            phone_number = getattr(tenant_profile, "phone_number", "") or payment.phone_number
+            if phone_number:
+                send_sms(
+                    phone_number,
+                    f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code or payment.id}",
+                )
         return Response({"detail": "Callback processed."})
+
+
+class MPesaPaymentStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, checkout_id):
+        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).select_related("lease", "lease__unit", "lease__unit__property", "tenant").first()
+        if not payment:
+            return Response({"detail": "Payment not found."}, status=404)
+        if payment.tenant_id != request.user.id:
+            return Response({"detail": "Unauthorized request."}, status=403)
+        return Response(
+            {
+                "checkout_id": checkout_id,
+                "status": payment.status,
+                "payment": PaymentTransactionSerializer(payment).data,
+            }
+        )
+
+
+class PayPalCreateOrderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if _get_role(request.user) != Profile.ROLE_TENANT:
+            return Response({"detail": "Unauthorized request."}, status=403)
+
+        lease_id = request.data.get("lease_id")
+        amount = request.data.get("amount")
+        lease = Lease.objects.filter(pk=lease_id).select_related("unit", "unit__property", "tenant").first()
+        try:
+            _assert_active_lease(lease, request.user)
+        except PermissionDenied:
+            return Response({"detail": "Unauthorized request."}, status=403)
+        except DRFValidationError:
+            return Response({"detail": "No active lease found."}, status=400)
+
+        billing_period = current_billing_period()
+        _validate_payment_amount(lease, amount, billing_period)
+
+        order = paypal_create_order(amount, f"lease-{lease.id}-{_current_period()}")
+        if not order or order.get("error") or not order.get("id"):
+            detail = order.get("detail") if isinstance(order, dict) else "Payment failed. Please try again."
+            error_status = order.get("status", 502) if isinstance(order, dict) else 502
+            return Response({"detail": detail}, status=error_status)
+
+        payment = PaymentTransaction.objects.create(
+            lease=lease,
+            tenant=request.user,
+            period=_current_period(),
+            billing_period=billing_period,
+            phone_number=getattr(getattr(request.user, "profile", None), "phone_number", ""),
+            amount=amount,
+            payment_method=PaymentTransaction.METHOD_PAYPAL,
+            paypal_order_id=order["id"],
+            checkout_request_id=order["id"],
+            status=PaymentTransaction.STATUS_PENDING,
+            raw_callback=order,
+        )
+        return Response({"order": order, "payment": PaymentTransactionSerializer(payment).data}, status=201)
+
+
+class PayPalCaptureView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if _get_role(request.user) != Profile.ROLE_TENANT:
+            return Response({"detail": "Unauthorized request."}, status=403)
+
+        order_id = request.data.get("order_id")
+        payment = PaymentTransaction.objects.filter(paypal_order_id=order_id, tenant=request.user).select_related("lease", "lease__unit", "lease__unit__property", "tenant").first()
+        if not payment:
+            return Response({"detail": "Payment not found."}, status=404)
+
+        capture = paypal_capture_order(order_id)
+        if not capture or capture.get("error") or capture.get("status") != "COMPLETED":
+            payment.status = PaymentTransaction.STATUS_FAILED
+            payment.raw_callback = capture
+            payment.result_desc = (
+                capture.get("detail")
+                if isinstance(capture, dict) and capture.get("detail")
+                else "Payment failed. Please try again."
+            )
+            payment.save(update_fields=["status", "raw_callback", "result_desc"])
+            return Response({"detail": payment.result_desc}, status=capture.get("status", 502) if isinstance(capture, dict) else 502)
+
+        purchase_units = capture.get("purchase_units", [])
+        capture_rows = purchase_units[0].get("payments", {}).get("captures", []) if purchase_units else []
+        capture_row = capture_rows[0] if capture_rows else {}
+        payment.status = PaymentTransaction.STATUS_SUCCESS
+        payment.transaction_code = capture_row.get("id") or order_id
+        payment.result_desc = capture.get("status")
+        payment.transaction_date = timezone.now()
+        payment.raw_callback = capture
+        payment.save(update_fields=["status", "transaction_code", "result_desc", "transaction_date", "raw_callback"])
+        _allocate_success_payment(payment)
+        save_payment_receipt(payment)
+        profile = getattr(request.user, "profile", None)
+        phone_number = getattr(profile, "phone_number", "")
+        if phone_number:
+            send_sms(phone_number, f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code}")
+        return Response({"payment": PaymentTransactionSerializer(payment).data})
+
+
+class StripeCreateIntentView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if _get_role(request.user) != Profile.ROLE_TENANT:
+            return Response({"detail": "Unauthorized request."}, status=403)
+
+        stripe_secret_key = os.getenv("STRIPE_SECRET_KEY", "").strip()
+        if stripe is None or not stripe_secret_key:
+            return Response({"detail": "Payment failed. Please try again."}, status=503)
+
+        lease_id = request.data.get("lease_id")
+        amount = request.data.get("amount")
+        lease = Lease.objects.filter(pk=lease_id).select_related("unit", "unit__property", "tenant").first()
+        try:
+            _assert_active_lease(lease, request.user)
+        except PermissionDenied:
+            return Response({"detail": "Unauthorized request."}, status=403)
+        except DRFValidationError:
+            return Response({"detail": "No active lease found."}, status=400)
+
+        billing_period = current_billing_period()
+        _validate_payment_amount(lease, amount, billing_period)
+
+        stripe.api_key = stripe_secret_key
+        currency = os.getenv("STRIPE_CURRENCY", "kes").strip().lower() or "kes"
+        metadata = {
+            "tenant_id": str(request.user.id),
+            "lease_id": str(lease.id),
+            "billing_period": str(billing_period),
+            "period": _current_period(),
+        }
+        try:
+            intent = stripe.PaymentIntent.create(
+                amount=int((Decimal(amount) * 100).quantize(Decimal("1"))),
+                currency=currency,
+                automatic_payment_methods={"enabled": True},
+                metadata=metadata,
+                description=f"KRIB rent payment for lease {lease.id} - {_current_period()}",
+            )
+        except stripe.error.StripeError as exc:
+            logger.warning("Stripe create intent failed: %s", exc)
+            return Response({"detail": "Payment failed. Please try again."}, status=502)
+
+        payment = PaymentTransaction.objects.create(
+            lease=lease,
+            tenant=request.user,
+            period=_current_period(),
+            billing_period=billing_period,
+            phone_number=getattr(getattr(request.user, "profile", None), "phone_number", "") or "CARD",
+            amount=amount,
+            payment_method=PaymentTransaction.METHOD_CARD,
+            stripe_payment_intent_id=intent["id"],
+            checkout_request_id=intent["id"],
+            status=PaymentTransaction.STATUS_PENDING,
+            raw_callback=intent,
+        )
+        return Response(
+            {
+                "client_secret": intent["client_secret"],
+                "payment_intent_id": intent["id"],
+                "publishable_key": os.getenv("STRIPE_PUBLISHABLE_KEY", "").strip(),
+                "payment": PaymentTransactionSerializer(payment).data,
+            },
+            status=201,
+        )
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class StripeWebhookView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        stripe_secret_key = os.getenv("STRIPE_SECRET_KEY", "").strip()
+        webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+        if stripe is None or not stripe_secret_key:
+            return Response({"detail": "Payment failed. Please try again."}, status=503)
+
+        stripe.api_key = stripe_secret_key
+        payload = request.body
+        signature = request.META.get("HTTP_STRIPE_SIGNATURE", "")
+
+        try:
+            if webhook_secret:
+                event = stripe.Webhook.construct_event(payload=payload, sig_header=signature, secret=webhook_secret)
+            else:
+                event = json.loads(payload.decode() or "{}")
+        except (ValueError, stripe.error.SignatureVerificationError) as exc:
+            logger.warning("Stripe webhook rejected: %s", exc)
+            return Response({"detail": "Unauthorized request."}, status=400)
+
+        event_type = event.get("type")
+        intent = event.get("data", {}).get("object", {})
+        intent_id = intent.get("id")
+        payment = PaymentTransaction.objects.filter(stripe_payment_intent_id=intent_id).select_related(
+            "lease",
+            "lease__unit",
+            "lease__unit__property",
+            "tenant",
+        ).first()
+        if not payment:
+            return Response({"detail": "Ignored."}, status=200)
+
+        if event_type == "payment_intent.succeeded":
+            charges = intent.get("charges", {}).get("data", [])
+            charge = charges[0] if charges else {}
+            payment.status = PaymentTransaction.STATUS_SUCCESS
+            payment.transaction_code = charge.get("id") or intent_id
+            payment.result_desc = intent.get("status", "succeeded")
+            payment.transaction_date = timezone.now()
+            payment.raw_callback = event
+            payment.save(
+                update_fields=["status", "transaction_code", "result_desc", "transaction_date", "raw_callback"]
+            )
+            _allocate_success_payment(payment)
+            save_payment_receipt(payment)
+            tenant_profile = getattr(payment.tenant, "profile", None)
+            phone_number = getattr(tenant_profile, "phone_number", "") or payment.phone_number
+            if phone_number:
+                send_sms(
+                    phone_number,
+                    f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code}",
+                )
+        elif event_type == "payment_intent.payment_failed":
+            payment.status = PaymentTransaction.STATUS_FAILED
+            payment.result_desc = (
+                intent.get("last_payment_error", {}) or {}
+            ).get("message") or "Payment failed. Please try again."
+            payment.raw_callback = event
+            payment.save(update_fields=["status", "result_desc", "raw_callback"])
+
+        return Response({"detail": "Webhook processed."})
 
 
 class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
@@ -689,6 +1687,129 @@ class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
         return qs.order_by("-created_at")
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def payments_arrears(request):
+    if _get_role(request.user) != Profile.ROLE_LANDLORD:
+        return Response({"detail": "Unauthorized request."}, status=403)
+
+    period = request.query_params.get("period") or _current_period()
+    today = timezone.localdate()
+    rows = []
+    leases = Lease.objects.filter(status=Lease.STATUS_ACTIVE, unit__property__landlord=request.user).select_related("tenant", "unit", "unit__property")
+    for lease in leases:
+        rent = compute_lease_rent_status(lease, period=period, today=today)
+        if rent["status"] != "OVERDUE":
+            continue
+        rows.append(
+            {
+                "lease_id": lease.id,
+                "tenant_id": lease.tenant_id,
+                "tenant_name": _display_name(lease.tenant),
+                "property_name": lease.unit.property.name,
+                "unit_number": lease.unit.unit_number,
+                "billing_period": period,
+                "rent_due": rent["rent_due"],
+                "amount_paid": rent["paid_sum"],
+                "balance": rent["balance"],
+                "status": rent["status"],
+                "cumulative_paid_sum": rent.get("cumulative_paid_sum", rent.get("paid_sum", Decimal("0.00"))),
+            }
+        )
+    return Response(rows)
+
+
+class PaymentReceiptView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        payment = PaymentTransaction.objects.filter(pk=pk).select_related("lease", "lease__unit", "lease__unit__property", "tenant").first()
+        if not payment:
+            raise Http404("Payment not found.")
+        if not _user_can_access_payment_receipt(request.user, payment):
+            return Response({"detail": "Unauthorized request."}, status=403)
+        if payment.status != PaymentTransaction.STATUS_SUCCESS:
+            return Response({"detail": "Payment failed. Please try again."}, status=400)
+        if not payment.receipt_file:
+            save_payment_receipt(payment)
+        if not payment.receipt_file:
+            return Response({"detail": "Receipt generation is currently unavailable."}, status=503)
+        return FileResponse(payment.receipt_file.open("rb"), content_type="application/pdf", filename=os.path.basename(payment.receipt_file.name))
+
+
+class DocumentListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        role = _get_role(request.user)
+        if role == Profile.ROLE_LANDLORD:
+            docs = Document.objects.filter(property__landlord=request.user).select_related("property", "lease", "lease__unit", "uploaded_by", "tenant")
+        elif role == Profile.ROLE_MANAGER:
+            docs = Document.objects.filter(property__manager=request.user).select_related("property", "lease", "lease__unit", "uploaded_by", "tenant")
+        elif role == Profile.ROLE_TENANT:
+            active_leases = Lease.objects.filter(tenant=request.user, status=Lease.STATUS_ACTIVE)
+            docs = Document.objects.filter(
+                Q(tenant=request.user)
+                | Q(lease__in=active_leases)
+                | Q(document_type=Document.TYPE_LEASE, property__units__leases__in=active_leases)
+                | Q(document_type=Document.TYPE_OTHER, property__units__leases__in=active_leases)
+            ).distinct().select_related("property", "lease", "lease__unit", "uploaded_by", "tenant")
+        else:
+            return Response([], status=200)
+        return Response(DocumentSerializer(docs, many=True).data)
+
+
+class DocumentUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def post(self, request):
+        property_id = request.data.get("property")
+        property_obj = Property.objects.filter(pk=property_id).first()
+        if not property_obj:
+            return Response({"detail": "Property not found."}, status=404)
+
+        role = _get_role(request.user)
+        if role == Profile.ROLE_LANDLORD and property_obj.landlord_id != request.user.id:
+            return Response({"detail": "Unauthorized request."}, status=403)
+        elif role == Profile.ROLE_MANAGER and property_obj.manager_id != request.user.id:
+            return Response({"detail": "Unauthorized request."}, status=403)
+        elif role == Profile.ROLE_TENANT:
+            if not Lease.objects.filter(tenant=request.user, unit__property=property_obj, status=Lease.STATUS_ACTIVE).exists():
+                return Response({"detail": "Unauthorized request."}, status=403)
+        else:
+            return Response({"detail": "Unauthorized request."}, status=403)
+
+        serializer = DocumentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        lease = serializer.validated_data.get("lease")
+        document_type = serializer.validated_data.get("document_type")
+        tenant = serializer.validated_data.get("tenant")
+        if role in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and document_type in [Document.TYPE_LEASE, Document.TYPE_IDENTITY]:
+            return Response(
+                {"detail": "Lease agreements and ID / passport files are created during lease onboarding."},
+                status=400,
+            )
+        if document_type == Document.TYPE_IDENTITY and not tenant:
+            tenant = getattr(lease, "tenant", None)
+            if not tenant:
+                return Response({"detail": "Select a lease tied to the tenant ID or passport."}, status=400)
+        document = serializer.save(uploaded_by=request.user, tenant=tenant)
+        return Response(DocumentSerializer(document).data, status=201)
+
+
+class DocumentDownloadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        document = Document.objects.filter(pk=pk).select_related("property", "lease", "uploaded_by").first()
+        if not document:
+            raise Http404("Document not found.")
+        if not _user_can_access_document(request.user, document):
+            return Response({"detail": "Unauthorized request."}, status=403)
+        return FileResponse(document.file_path.open("rb"), filename=os.path.basename(document.file_path.name))
+
+
 class MaintenanceViewSet(viewsets.ModelViewSet):
     serializer_class = MaintenanceRequestSerializer
     permission_classes = [IsAuthenticated]
@@ -711,7 +1832,31 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
         lease = serializer.validated_data["lease"]
         if lease.tenant != self.request.user:
             raise PermissionDenied("Can only report for your lease")
-        serializer.save(tenant=self.request.user)
+        request_row = serializer.save(tenant=self.request.user)
+        _notify_users(
+            [lease.unit.property.landlord, lease.unit.property.manager],
+            "New maintenance request",
+            f"{_display_name(lease.tenant)} reported a {request_row.urgency} priority issue for {lease.unit.property.name} / {lease.unit.unit_number}.",
+            lease=lease,
+        )
+
+    def perform_update(self, serializer):
+        role = _get_role(self.request.user)
+        if role == Profile.ROLE_TENANT:
+            raise PermissionDenied("Tenants cannot update maintenance requests.")
+        changed_fields = set(self.request.data.keys())
+        if changed_fields - {"status"}:
+            raise PermissionDenied("Only maintenance status updates are allowed.")
+
+        previous_status = self.get_object().status
+        updated = serializer.save()
+        if previous_status != updated.status:
+            _notify_users(
+                [updated.tenant],
+                "Maintenance status updated",
+                f"Your maintenance request for {updated.lease.unit.property.name} / {updated.lease.unit.unit_number} is now {updated.get_status_display()}.",
+                lease=updated.lease,
+            )
 
 
 class TenantViewSet(viewsets.ReadOnlyModelViewSet):
@@ -721,18 +1866,251 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         role = _get_role(self.request.user)
         if role == Profile.ROLE_LANDLORD:
-            return Tenant.objects.filter(user__leases__unit__property__landlord=self.request.user).distinct()
-        if role == Profile.ROLE_MANAGER:
-            return Tenant.objects.filter(user__leases__unit__property__manager=self.request.user).distinct()
-        return Tenant.objects.filter(user=self.request.user)
+            scoped_properties = Property.objects.filter(landlord=self.request.user)
+        elif role == Profile.ROLE_MANAGER:
+            scoped_properties = Property.objects.filter(manager=self.request.user)
+        else:
+            return Tenant.objects.filter(user=self.request.user)
+
+        accepted_invites = TenantInvite.objects.filter(
+            property__in=scoped_properties,
+            status=TenantInvite.STATUS_ACCEPTED,
+        )
+        invite_emails = [email for email in accepted_invites.values_list("email", flat=True) if email]
+        invite_phones = [phone for phone in accepted_invites.values_list("phone", flat=True) if phone]
+
+        filters = Q(user__leases__unit__property__in=scoped_properties)
+        if invite_emails:
+            filters |= Q(user__email__in=invite_emails)
+        if invite_phones:
+            filters |= Q(phone__in=invite_phones) | Q(user__profile__phone_number__in=invite_phones)
+
+        return Tenant.objects.filter(filters).select_related("user").distinct().order_by("user__username")
 
 
-class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
+class NotificationViewSet(mixins.ListModelMixin, mixins.UpdateModelMixin, mixins.DestroyModelMixin, viewsets.GenericViewSet):
     serializer_class = NotificationSerializer
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         return Notification.objects.filter(user=self.request.user).order_by("-created_at")
+
+    def perform_update(self, serializer):
+        changed_fields = set(self.request.data.keys())
+        if changed_fields - {"is_read"}:
+            raise PermissionDenied("Only read state updates are allowed.")
+        serializer.save(user=self.request.user)
+
+    @action(detail=False, methods=["post"])
+    def mark_all_read(self, request):
+        self.get_queryset().filter(is_read=False).update(is_read=True)
+        return Response({"detail": "Notifications marked as read."})
+
+    @action(detail=False, methods=["delete"], url_path="clear-read", url_name="clear-read")
+    def clear_read(self, request):
+        deleted_count, _ = self.get_queryset().filter(is_read=True).delete()
+        return Response({"detail": "Read notifications cleared.", "count": deleted_count})
+
+    @action(detail=False, methods=["post"], url_path="send", url_name="send")
+    def send_notification(self, request):
+        serializer = NotificationSendSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        recipients = list(
+            _notification_recipients(
+                request.user,
+                serializer.validated_data["audience"],
+                serializer.validated_data.get("property"),
+            )
+        )
+        if not recipients:
+            return Response({"detail": "No recipients matched the selected audience."}, status=status.HTTP_400_BAD_REQUEST)
+
+        title = serializer.validated_data["title"].strip()
+        message = serializer.validated_data["message"].strip()
+        send_in_app = serializer.validated_data.get("send_in_app", True)
+        send_email = serializer.validated_data.get("send_email", False)
+        send_sms_selected = serializer.validated_data.get("send_sms", False)
+
+        count = len(recipients)
+        suffix = "" if count == 1 else "s"
+        delivered = {"in_app": 0, "email": 0, "sms": 0}
+        warnings = []
+
+        if send_in_app:
+            Notification.objects.bulk_create(
+                [
+                    Notification(
+                        user=recipient,
+                        title=title,
+                        message=message,
+                        type=Notification.TYPE_GENERIC,
+                    )
+                    for recipient in recipients
+                ]
+            )
+            delivered["in_app"] = count
+
+        if send_email:
+            if not _can_send_email():
+                warnings.append("Email skipped because SMTP is not configured.")
+            else:
+                missing_email = 0
+                for recipient in recipients:
+                    if not recipient.email:
+                        missing_email += 1
+                        continue
+                    try:
+                        send_mail(
+                            subject=title,
+                            message=message,
+                            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                            recipient_list=[recipient.email],
+                            fail_silently=False,
+                        )
+                        delivered["email"] += 1
+                    except Exception as exc:  # pragma: no cover - env dependent
+                        logger.warning("Notification email delivery failed: %s", exc)
+                if missing_email:
+                    warnings.append(f"Email skipped for {missing_email} recipient{'' if missing_email == 1 else 's'} without an email address.")
+
+        if send_sms_selected:
+            missing_phone = 0
+            sms_failures = []
+            for recipient in recipients:
+                phone_number = _user_phone_number(recipient)
+                if not phone_number:
+                    missing_phone += 1
+                    continue
+                sms_result = send_sms(phone_number, message, include_detail=True)
+                sms_ok = sms_result if isinstance(sms_result, bool) else sms_result.get("ok")
+                sms_detail = "" if isinstance(sms_result, bool) else sms_result.get("detail")
+                if sms_ok:
+                    delivered["sms"] += 1
+                else:
+                    sms_failures.append(sms_detail or "SMS delivery failed.")
+            if missing_phone:
+                warnings.append(f"SMS skipped for {missing_phone} recipient{'' if missing_phone == 1 else 's'} without a phone number.")
+            if sms_failures:
+                warnings.append(f"SMS failed for {len(sms_failures)} recipient{'' if len(sms_failures) == 1 else 's'}: {sms_failures[0]}")
+
+        any_delivery = delivered["in_app"] or delivered["email"] or delivered["sms"]
+        if not any_delivery:
+            detail = warnings[0] if warnings else "No notification could be delivered."
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE if send_email or send_sms_selected else status.HTTP_400_BAD_REQUEST
+            return Response({"detail": detail, "count": count, "delivery": delivered}, status=status_code)
+
+        detail_parts = [f"Notification sent to {count} recipient{suffix}."]
+        if send_in_app:
+            detail_parts.append(f"In-app: {delivered['in_app']}.")
+        if send_email:
+            detail_parts.append(f"Email: {delivered['email']}.")
+        if send_sms_selected:
+            detail_parts.append(f"SMS: {delivered['sms']}.")
+        if warnings:
+            detail_parts.append(" ".join(warnings))
+
+        return Response(
+            {"detail": " ".join(detail_parts), "count": count, "delivery": delivered},
+            status=status.HTTP_201_CREATED,
+        )
+
+
+@api_view(["PATCH", "POST"])
+@permission_classes([IsAuthenticated])
+def notifications_read_all(request):
+    Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+    return Response({"detail": "Notifications marked as read."})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def tenant_dashboard(request):
+    if _get_role(request.user) != Profile.ROLE_TENANT:
+        return Response({"detail": "Unauthorized request."}, status=403)
+
+    lease = _tenant_active_lease(request.user)
+    if not lease:
+        return Response(
+            {
+                "rent_status": "NO_ACTIVE_LEASE",
+                "amount_due": Decimal("0.00"),
+                "current_period": _current_period(),
+                "recent_payments": [],
+                "open_maintenance_requests": [],
+                "unread_notification_count": Notification.objects.filter(user=request.user, is_read=False).count(),
+            }
+        )
+
+    period = _current_period()
+    rent = compute_lease_rent_status(lease, period=period)
+    recent_payments = PaymentTransaction.objects.filter(tenant=request.user).order_by("-created_at")[:5]
+    open_maintenance = MaintenanceRequest.objects.filter(tenant=request.user).exclude(status=MaintenanceRequest.STATUS_RESOLVED).order_by("-updated_at")
+    return Response(
+        {
+            "rent_status": rent["status"],
+            "amount_due": rent["balance"],
+            "current_period": period,
+            "recent_payments": PaymentTransactionSerializer(recent_payments, many=True).data,
+            "open_maintenance_requests": MaintenanceRequestSerializer(open_maintenance, many=True).data,
+            "unread_notification_count": Notification.objects.filter(user=request.user, is_read=False).count(),
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def landlord_dashboard(request):
+    if _get_role(request.user) != Profile.ROLE_LANDLORD:
+        return Response({"detail": "Unauthorized request."}, status=403)
+
+    period = _current_period()
+    today = timezone.localdate()
+    properties = Property.objects.filter(landlord=request.user)
+    units = Unit.objects.filter(property__landlord=request.user)
+    leases = Lease.objects.filter(status=Lease.STATUS_ACTIVE, unit__property__landlord=request.user).select_related("tenant", "unit", "unit__property")
+    payments = PaymentTransaction.objects.filter(
+        lease__unit__property__landlord=request.user,
+        status=PaymentTransaction.STATUS_SUCCESS,
+        billing_period=period_string_to_date(period),
+    )
+
+    tenants_in_arrears = []
+    total_arrears = Decimal("0.00")
+    for lease in leases:
+        rent = compute_lease_rent_status(lease, period=period, today=today)
+        if rent["status"] == "OVERDUE":
+            total_arrears += max(rent["balance"], Decimal("0.00"))
+            tenants_in_arrears.append(
+                {
+                    "lease_id": lease.id,
+                    "tenant_name": _display_name(lease.tenant),
+                    "property_name": lease.unit.property.name,
+                    "unit_number": lease.unit.unit_number,
+                    "balance": rent["balance"],
+                }
+            )
+
+    pending_maintenance = MaintenanceRequest.objects.filter(
+        lease__unit__property__landlord=request.user,
+    ).exclude(status=MaintenanceRequest.STATUS_RESOLVED)
+    recent_payments = PaymentTransaction.objects.filter(
+        lease__unit__property__landlord=request.user,
+    ).order_by("-created_at")[:5]
+
+    return Response(
+        {
+            "total_properties": properties.count(),
+            "occupied_units": units.filter(status=Unit.STATUS_OCCUPIED).count(),
+            "vacant_units": units.filter(status=Unit.STATUS_VACANT).count(),
+            "total_collected_this_month": payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00"),
+            "total_arrears": total_arrears,
+            "tenants_in_arrears": tenants_in_arrears,
+            "pending_maintenance": pending_maintenance.count(),
+            "recent_payments": PaymentTransactionSerializer(recent_payments, many=True).data,
+            "unread_notification_count": Notification.objects.filter(user=request.user, is_read=False).count(),
+        }
+    )
 
 
 @api_view(["GET"])
@@ -749,7 +2127,6 @@ def dashboard_summary(request):
         )
         if not lease:
             return Response({"active_lease": None, "rent": {}, "payments": [], "maintenance": [], "show_overdue_banner": False})
-        _apply_wallet_to_current_rent(lease)
         rent = compute_lease_rent_status(lease, period=period)
         payments = PaymentTransaction.objects.filter(tenant=request.user).order_by("-created_at")[:10]
         maintenance = MaintenanceRequest.objects.filter(tenant=request.user).order_by("-updated_at")[:10]
@@ -783,12 +2160,16 @@ def dashboard_summary(request):
         lists[status_row["status"]].append(
             {
                 "lease_id": lease.id,
-                "tenant": lease.tenant.username,
+                "tenant": _display_name(lease.tenant),
+                "tenant_email": lease.tenant.email,
+                "tenant_phone_number": getattr(getattr(lease.tenant, "profile", None), "phone_number", "") or getattr(getattr(lease.tenant, "tenant_profile", None), "phone", ""),
                 "unit": f"{lease.unit.property.name} / {lease.unit.unit_number}",
                 "rent_due": status_row["rent_due"],
                 "paid_sum": status_row["paid_sum"],
                 "balance": status_row["balance"],
                 "status": status_row["status"],
+                "cumulative_paid_sum": status_row.get("cumulative_paid_sum", status_row.get("paid_sum", Decimal("0.00"))),
+                "carried_forward_balance": status_row.get("carried_forward_balance", Decimal("0.00")),
             }
         )
 
@@ -1037,7 +2418,7 @@ def landlord_followups(request):
             {
                 "lease_id": lease.id,
                 "tenant": {
-                    "username": lease.tenant.username,
+                    "username": _display_name(lease.tenant),
                     "email": lease.tenant.email,
                     "phone_number": tenant_profile.phone_number if tenant_profile else "",
                 },
@@ -1045,7 +2426,7 @@ def landlord_followups(request):
                     "property_name": lease.unit.property.name,
                     "unit_number": lease.unit.unit_number,
                 },
-                "status": "PARTIAL" if rent_row["status"] == "OVERDUE" and rent_row["paid_sum"] > 0 else ("UNPAID" if rent_row["status"] == "OVERDUE" else rent_row["status"]),
+                "status": "PARTIAL" if rent_row["status"] == "OVERDUE" and rent_row.get("cumulative_paid_sum", rent_row["paid_sum"]) > 0 else ("UNPAID" if rent_row["status"] == "OVERDUE" else rent_row["status"]),
                 "balance": max(rent_row["balance"], Decimal("0.00")),
                 "period": period,
             }

@@ -1,29 +1,33 @@
 import React, { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { CircleDollarSign, FilePlus2, Landmark, Send, ShieldAlert } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { ClipboardList, Users, Wrench } from "lucide-react";
 import api from "../services/api";
-import { formatKES } from "../utils/format";
-import GradientCard from "./GradientCard";
-import GlassCard from "./GlassCard";
+import { formatDateTime } from "../utils/format";
 import Greeting from "./Greeting";
 import StatusBadge from "./StatusBadge";
-import WelcomeBanner from "./WelcomeBanner";
+import { PageLayout, SectionCard } from "./ui";
 
 export default function ManagerDashboard() {
   const navigate = useNavigate();
-  const [summary, setSummary] = useState(null);
   const [maintenance, setMaintenance] = useState([]);
+  const [notifications, setNotifications] = useState([]);
   const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
 
   const load = async () => {
     try {
-      const [sRes, mRes] = await Promise.all([api.get("/api/dashboard/summary/"), api.get("/api/maintenance/")]);
-      setSummary(sRes.data);
-      setMaintenance(mRes.data || []);
+      const [maintenanceRes, notificationsRes] = await Promise.all([
+        api.get("/api/maintenance/"),
+        api.get("/api/notifications/"),
+      ]);
+      setMaintenance(maintenanceRes.data || []);
+      setNotifications(notificationsRes.data || []);
     } catch {
       setError("Failed to load manager data");
-      setSummary({ period: "-", totals: { expected: 0, collected: 0, outstanding: 0 } });
       setMaintenance([]);
+      setNotifications([]);
+    } finally {
+      setLoaded(true);
     }
   };
 
@@ -32,63 +36,75 @@ export default function ManagerDashboard() {
   }, []);
 
   const updateStatus = async (id, status) => {
-    await api.patch(`/api/maintenance/${id}/`, { status });
-    await load();
+    try {
+      await api.patch(`/api/maintenance/${id}/`, { status });
+      await load();
+    } catch {
+      setError("Failed to update maintenance status");
+    }
   };
 
-  if (!summary) return <p className="loading">Loading...</p>;
+  const openMaintenance = maintenance.filter((item) => item.status !== "resolved");
+  const unreadNotifications = notifications.filter((item) => !item.is_read);
+
+  if (!loaded) {
+    return <p className="loading">Loading...</p>;
+  }
 
   return (
-    <div className="dashboard-container dashboard-balanced">
-      <WelcomeBanner title={<Greeting />} />
-      {error && <p className="error">{error}</p>}
+    <PageLayout variant="executive" kicker="Welcome" title={<Greeting />} chip={`${openMaintenance.length} open tickets / ${unreadNotifications.length} unread notifications`}>
+      {error ? <p className="error">{error}</p> : null}
 
-      <section className="gradient-card-row">
-        <GradientCard variant="blue" icon={Landmark} title="Expected" subtitle={`Period: ${summary.period}`} value={formatKES(summary.totals?.expected)} ctaLabel="Overview" onCta={() => navigate("/manager/overview")} />
-        <GradientCard variant="indigo" icon={CircleDollarSign} title="Collected" subtitle="Settled payments" value={formatKES(summary.totals?.collected)} ctaLabel="Review" onCta={() => navigate("/manager/review")} />
-        <GradientCard variant="violet" icon={ShieldAlert} title="Outstanding" subtitle="Open balances" value={formatKES(summary.totals?.outstanding)} ctaLabel="Action" onCta={() => navigate("/manager/action")} />
-      </section>
-
-      <GlassCard title="Quick Actions" actions={<span className="subtitle">Tenant operations</span>}>
-        <div className="action-links">
-          <Link to="/invites/new" className="action-link"><Send size={18} /> Invite Tenant</Link>
-          <Link to="/leases/new" className="action-link"><FilePlus2 size={18} /> Create Lease</Link>
+      <SectionCard title="Actions">
+        <div className="manager-home-gradient-grid">
+          <button className="resident-gradient-card purple manager-home-gradient-card" type="button" onClick={() => navigate("/invites/new")}>
+            <div className="resident-feature-head">
+              <h3>Invite Tenant</h3>
+              <span className="resident-round-icon">
+                <Users size={18} />
+              </span>
+            </div>
+          </button>
+          <button className="resident-gradient-card blue manager-home-gradient-card" type="button" onClick={() => navigate("/leases/new")}>
+            <div className="resident-feature-head">
+              <h3>Create Lease</h3>
+              <span className="resident-round-icon">
+                <ClipboardList size={18} />
+              </span>
+            </div>
+          </button>
         </div>
-      </GlassCard>
+      </SectionCard>
 
-      <GlassCard title="Maintenance Queue" actions={<span className="subtitle">Latest requests</span>}>
-        <div className="table-scroll">
-          <table>
-          <thead>
-            <tr>
-              <th>Tenant</th>
-              <th>Unit</th>
-              <th>Issue</th>
-              <th>Status</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {maintenance.slice(0, 5).map((m) => (
-              <tr key={m.id}>
-                <td>{m.tenant?.username || "-"}</td>
-                <td>{m.lease?.unit ? `${m.lease.unit.property?.name || "-"} / ${m.lease.unit.unit_number}` : "-"}</td>
-                <td>{m.issue}</td>
-                <td><StatusBadge status={m.status} /></td>
-                <td>
-                  <select onChange={(e) => updateStatus(m.id, e.target.value)} defaultValue="">
+      <SectionCard icon={Wrench} title="Priority Queue" action={<span className="resident-chip">{openMaintenance.length} open</span>}>
+        <div className="resident-table-list">
+          {openMaintenance.length === 0 ? (
+            <p className="subtitle">No open maintenance tickets right now.</p>
+          ) : (
+            openMaintenance.slice(0, 4).map((item, index) => (
+              <article className="resident-row-card" key={item.id}>
+                <div className="resident-row-id">{index + 1}</div>
+                <div className="resident-row-main">
+                  <h4>{item.tenant?.username || "Tenant"}</h4>
+                  <p>{item.lease?.unit ? `${item.lease.unit.property?.name || "-"} / ${item.lease.unit.unit_number}` : "-"}</p>
+                  <p>{item.issue}</p>
+                </div>
+                <div className="resident-row-meta">
+                  {item.urgency ? <StatusBadge status={item.urgency} /> : null}
+                  <StatusBadge status={item.status} />
+                  <span>{formatDateTime(item.updated_at)}</span>
+                  <select onChange={(e) => updateStatus(item.id, e.target.value)} defaultValue="">
                     <option value="" disabled>Update</option>
                     <option value="open">Open</option>
                     <option value="in_progress">In Progress</option>
                     <option value="resolved">Resolved</option>
                   </select>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-          </table>
+                </div>
+              </article>
+            ))
+          )}
         </div>
-      </GlassCard>
-    </div>
+      </SectionCard>
+    </PageLayout>
   );
 }

@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 import { AuthProvider } from "./context/AuthContext";
 import App from "./App";
 
+import "./styles/variables.css";
 import "./styles.css";
 
 const theme = localStorage.getItem("theme") === "dark" ? "dark" : "light";

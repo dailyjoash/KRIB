@@ -1,0 +1,92 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: krib-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: krib_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: dev
+    container_name: krib-backend
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      DJANGO_SECRET_KEY: replace-me
+      DJANGO_DEBUG: "1"
+      DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+      DJANGO_CORS_ALLOWED_ORIGINS: http://localhost:5173
+      DJANGO_CSRF_TRUSTED_ORIGINS: http://localhost:5173
+      DJANGO_SECURE_SSL_REDIRECT: "0"
+      DJANGO_LOG_LEVEL: INFO
+      JWT_ACCESS_MINUTES: "60"
+      JWT_REFRESH_DAYS: "7"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/krib_db
+      DATABASE_SSLMODE: disable
+      DJANGO_CONN_MAX_AGE: "60"
+      PUBLIC_BASE_URL: http://localhost:8000
+      FRONTEND_URL: http://localhost:5173
+      BACKEND_URL: http://localhost:8000
+      VITE_API_URL: http://localhost:8000
+      BUSINESS_NAME: KRIB LTD
+      SUPPORT_PHONE: +254751558762
+      SUPPORT_EMAIL: support@krib.co.ke
+      BUSINESS_ADDRESS: Nairobi, Kenya
+      MPESA_CONSUMER_KEY: ${MPESA_CONSUMER_KEY:-}
+      MPESA_CONSUMER_SECRET: ${MPESA_CONSUMER_SECRET:-}
+      MPESA_SHORTCODE: ${MPESA_SHORTCODE:-174379}
+      MPESA_PASSKEY: ${MPESA_PASSKEY:-}
+      MPESA_CALLBACK_URL: ${MPESA_CALLBACK_URL:-http://localhost:8000/api/mpesa/callback/}
+      MPESA_BUSINESS_NAME: ${MPESA_BUSINESS_NAME:-KRIB}
+      PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:-}
+      PAYPAL_SECRET: ${PAYPAL_SECRET:-}
+      PAYPAL_MODE: ${PAYPAL_MODE:-sandbox}
+      PAYPAL_API_BASE: ${PAYPAL_API_BASE:-https://api-m.sandbox.paypal.com}
+      PAYPAL_CURRENCY: ${PAYPAL_CURRENCY:-KES}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_CURRENCY: ${STRIPE_CURRENCY:-kes}
+      AFRICASTALKING_USERNAME: ${AFRICASTALKING_USERNAME:-}
+      AFRICASTALKING_API_KEY: ${AFRICASTALKING_API_KEY:-}
+      AFRICASTALKING_SENDER_ID: ${AFRICASTALKING_SENDER_ID:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "python manage.py migrate &&
+      python manage.py seed_krib &&
+      python manage.py runserver 0.0.0.0:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      target: dev
+    container_name: krib-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:-}
+      VITE_PAYPAL_CURRENCY: ${PAYPAL_CURRENCY:-KES}
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+volumes:
+  postgres_data:

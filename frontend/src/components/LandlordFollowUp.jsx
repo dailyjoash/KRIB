@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
 import api from "../services/api";
+import { getErrorMessage } from "../utils/errors";
 import GlassCard from "./GlassCard";
 import StatusBadge from "./StatusBadge";
 import { formatKES } from "../utils/format";
+import { sendLeaseContactMessage } from "../utils/leaseContact";
 
 const templates = {
   friendly: "Hi {tenant}, friendly reminder that your rent balance for {period} is {balance} for {unit}. Kindly clear it at your earliest convenience. Thank you.",
@@ -23,6 +25,9 @@ export default function LandlordFollowUp() {
   const [period, setPeriod] = useState("");
   const [templateKey, setTemplateKey] = useState("friendly");
   const [customMessages, setCustomMessages] = useState({});
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [sendingKey, setSendingKey] = useState("");
 
   useEffect(() => {
     const load = async () => {
@@ -46,9 +51,34 @@ export default function LandlordFollowUp() {
     if (navigator.clipboard) await navigator.clipboard.writeText(message);
   };
 
+  const deliverFollowUp = async (row, channel, message) => {
+    const recipientMissing = channel === "email" ? !row.tenant?.email : !row.tenant?.phone_number;
+    if (recipientMissing) return;
+
+    const key = `${channel}-${row.lease_id}`;
+    setSendingKey(key);
+    setError("");
+    setSuccess("");
+    try {
+      const response = await sendLeaseContactMessage({
+        leaseId: row.lease_id,
+        channel,
+        subject: `Rent follow-up ${row.period}`,
+        message,
+      });
+      setSuccess(response?.detail || `${channel.toUpperCase()} sent.`);
+    } catch (err) {
+      setError(getErrorMessage(err, `Failed to send ${channel}.`));
+    } finally {
+      setSendingKey("");
+    }
+  };
+
   return (
     <div className="dashboard-container">
       <GlassCard title="Follow-up" actions={<span className="subtitle">Current unpaid or partial balances</span>}>
+        {error ? <p className="error">{error}</p> : null}
+        {success ? <p className="success">{success}</p> : null}
         <div className="followup-toolbar">
           <input type="month" value={period} onChange={(e) => setPeriod(e.target.value)} />
           <select value={templateKey} onChange={(e) => setTemplateKey(e.target.value)}>
@@ -60,13 +90,13 @@ export default function LandlordFollowUp() {
           </select>
         </div>
 
-        <table>
+        <table className="mobile-table">
           <thead>
             <tr>
               <th>Tenant</th>
               <th>Unit</th>
-              <th>Status</th>
               <th>Balance due</th>
+              <th>Status</th>
               <th>Message</th>
               <th>Actions</th>
             </tr>
@@ -74,22 +104,33 @@ export default function LandlordFollowUp() {
           <tbody>
             {rows.map((row) => {
               const message = messages[row.lease_id] || "";
-              const smsUri = `sms:${row.tenant?.phone_number || ""}?body=${encodeURIComponent(message)}`;
-              const email = row.tenant?.email || "";
-              const mailto = `mailto:${email}?subject=${encodeURIComponent(`Rent follow-up ${row.period}`)}&body=${encodeURIComponent(message)}`;
               return (
                 <tr key={row.lease_id}>
-                  <td>{row.tenant?.username || row.tenant?.email || "-"}</td>
-                  <td>{row.unit ? `${row.unit.property_name} / ${row.unit.unit_number}` : "-"}</td>
-                  <td><StatusBadge status={row.status} /></td>
-                  <td>{formatKES(row.balance)}</td>
-                  <td>
+                  <td data-label="Tenant">{row.tenant?.username || row.tenant?.email || "-"}</td>
+                  <td data-label="Unit">{row.unit ? `${row.unit.property_name} / ${row.unit.unit_number}` : "-"}</td>
+                  <td data-label="Balance Due">{formatKES(row.balance)}</td>
+                  <td data-label="Status"><StatusBadge status={row.status} /></td>
+                  <td data-label="Message">
                     <textarea value={message} onChange={(e) => setMessage(row.lease_id, e.target.value)} rows={3} />
                   </td>
-                  <td>
+                  <td data-label="Actions">
                     <div className="followup-actions">
-                      <a className="btn btn-glass" href={smsUri}>Text</a>
-                      <a className="btn btn-glass" href={mailto}>Email</a>
+                      <button
+                        type="button"
+                        className="btn btn-glass"
+                        onClick={() => deliverFollowUp(row, "sms", message)}
+                        disabled={!row.tenant?.phone_number || sendingKey === `sms-${row.lease_id}`}
+                      >
+                        {sendingKey === `sms-${row.lease_id}` ? "Sending..." : "Text"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-glass"
+                        onClick={() => deliverFollowUp(row, "email", message)}
+                        disabled={!row.tenant?.email || sendingKey === `email-${row.lease_id}`}
+                      >
+                        {sendingKey === `email-${row.lease_id}` ? "Sending..." : "Email"}
+                      </button>
                       <button type="button" className="btn" onClick={() => copyMessage(message)}>Copy message</button>
                     </div>
                   </td>

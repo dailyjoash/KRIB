@@ -1,8 +1,12 @@
-
-Django>=4.2
+﻿Django>=4.2
 djangorestframework
 djangorestframework-simplejwt
-psycopg2-binary
+gunicorn
+psycopg[binary]
 python-dotenv
 
 django-cors-headers
+django-crontab
+reportlab
+stripe
+whitenoise

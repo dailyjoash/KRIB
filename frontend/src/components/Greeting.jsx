@@ -13,7 +13,7 @@ const getStoredName = () => {
     const stored = localStorage.getItem("user");
     if (!stored) return null;
     const parsed = JSON.parse(stored);
-    return parsed?.username || null;
+    return parsed?.name || parsed?.username || null;
   } catch {
     return null;
   }
@@ -22,7 +22,7 @@ const getStoredName = () => {
 export default function Greeting() {
   const { user } = useContext(AuthContext);
 
-  const name = useMemo(() => user?.username || getStoredName() || "there", [user?.username]);
+  const name = useMemo(() => user?.name || user?.username || getStoredName() || "there", [user?.name, user?.username]);
 
   return <>{`${getGreeting()}, ${name}`}</>;
 }

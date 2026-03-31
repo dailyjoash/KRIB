@@ -1,6 +1,9 @@
-import React, { useEffect, useState } from "react";
-import { Save, UserPlus } from "lucide-react";
+import React, { useEffect, useMemo, useState } from "react";
+import { Building2, Save, UserPlus } from "lucide-react";
 import api from "../services/api";
+import { getErrorMessage } from "../utils/errors";
+import StatusBadge from "./StatusBadge";
+import { PageLayout, SectionCard, StatCard } from "./ui";
 
 export default function AddProperty() {
   const [name, setName] = useState("");
@@ -20,8 +23,8 @@ export default function AddProperty() {
       ]);
       setProperties(propRes.data || []);
       setManagers(managersRes.data || []);
-    } catch {
-      setError("Failed to load properties/managers");
+    } catch (err) {
+      setError(getErrorMessage(err, "Failed to load properties and managers."));
     }
   };
 
@@ -29,94 +32,126 @@ export default function AddProperty() {
     loadData();
   }, []);
 
-  const createProperty = async (e) => {
-    e.preventDefault();
+  const createProperty = async (event) => {
+    event.preventDefault();
     setError("");
     setSuccess("");
 
     try {
       await api.post("/api/properties/", { name, location, description });
-      setSuccess("Property created successfully!");
+      setSuccess("Property created successfully.");
       setName("");
       setLocation("");
       setDescription("");
       await loadData();
     } catch (err) {
-      setError(err.response?.data?.detail || "Failed to create property");
+      setError(getErrorMessage(err, "Failed to create property."));
     }
   };
 
   const assignManager = async (propertyId) => {
     const managerId = selection[propertyId];
     if (!managerId) {
-      setError("Please select a manager");
+      setError("Please select a manager.");
       return;
     }
 
     setError("");
     setSuccess("");
-
     try {
       await api.patch(`/api/properties/${propertyId}/`, { manager_id: managerId });
-      setSuccess("Manager assigned successfully!");
+      setSuccess("Manager assigned successfully.");
       await loadData();
     } catch (err) {
-      setError(err.response?.data?.detail || JSON.stringify(err.response?.data || "Failed to assign manager"));
+      setError(getErrorMessage(err, "Failed to assign manager."));
     }
   };
 
+  const assignedCount = useMemo(
+    () => properties.filter((property) => property.manager).length,
+    [properties]
+  );
+
   return (
-    <div className="dashboard-container">
-      {error && <p className="error">{error}</p>}
-      {success && <p className="success">{success}</p>}
+    <PageLayout
+      variant="executive"
+      kicker="Landlord Setup"
+      title="Properties"
+      chip={`${properties.length} properties / ${managers.length} managers`}
+    >
+      {error ? <p className="error">{error}</p> : null}
+      {success ? <p className="success">{success}</p> : null}
 
-      <div className="card">
-        <h3>Add New Property</h3>
-        <form onSubmit={createProperty}>
-          <div className="form-stack">
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Property name" required />
-            <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Location" required />
-            <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" rows="3" />
-            <button type="submit"><Save size={16} /> Create Property</button>
-          </div>
+      <section className="resident-hero-grid">
+        <StatCard variant="blue" title="Total Properties" subtitle="Your active portfolio" value={String(properties.length).padStart(2, "0")} />
+        <StatCard variant="purple" title="Manager Ready" subtitle="Available manager accounts" value={String(managers.length).padStart(2, "0")} />
+        <StatCard variant="mint" title="Assigned" subtitle="Properties with managers" value={String(assignedCount).padStart(2, "0")} />
+      </section>
+
+      <SectionCard icon={Building2} title="Create New Property">
+        <p className="resident-helper-text">Keep the entry short and structured so it is easy to scan from a phone later.</p>
+        <form className="resident-form-grid" onSubmit={createProperty}>
+          <label className="resident-field">
+            <span>Property name</span>
+            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="KRIB Heights" required />
+          </label>
+          <label className="resident-field">
+            <span>Location</span>
+            <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Westlands, Nairobi" required />
+          </label>
+          <label className="resident-field" style={{ gridColumn: "1 / -1" }}>
+            <span>Description</span>
+            <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Short summary of the property and its appeal." rows="4" />
+          </label>
+          <button className="resident-primary-btn" type="submit">
+            <Save size={16} />
+            <span>Create Property</span>
+          </button>
         </form>
-      </div>
+      </SectionCard>
 
-      <div className="card">
-        <h3>Existing Properties</h3>
+      <SectionCard title="Property Directory">
         {properties.length === 0 ? (
-          <p>No properties found.</p>
+          <p className="resident-helper-text">No properties have been added yet.</p>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Location</th>
-                <th>Manager</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {properties.map((p) => (
-                <tr key={p.id}>
-                  <td>{p.name}</td>
-                  <td>{p.location}</td>
-                  <td>{p.manager?.username || "Not assigned"}</td>
-                  <td>
-                    <div className="inline-actions">
-                      <select value={selection[p.id] || ""} onChange={(e) => setSelection({ ...selection, [p.id]: e.target.value })}>
-                        <option value="">Select manager</option>
-                        {managers.map((m) => <option key={m.id} value={m.id}>{m.username}</option>)}
-                      </select>
-                      <button type="button" onClick={() => assignManager(p.id)}><UserPlus size={16} /> Assign</button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="resident-card-grid">
+            {properties.map((property) => (
+              <article className="resident-section-card" key={property.id}>
+                <div className="resident-section-head">
+                  <div className="resident-title-row">
+                    <Building2 size={18} />
+                    <h3>{property.name}</h3>
+                  </div>
+                  <StatusBadge status={property.manager ? "assigned" : "pending"} />
+                </div>
+                <div className="resident-profile-columns">
+                  <div className="resident-profile-item">
+                    <span>Location</span>
+                    <strong>{property.location || "-"}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Manager</span>
+                    <strong>{property.manager?.username || "Not assigned"}</strong>
+                  </div>
+                </div>
+                {property.description ? <p className="resident-helper-text">{property.description}</p> : null}
+                <div className="resident-form-actions">
+                  <select value={selection[property.id] || ""} onChange={(e) => setSelection({ ...selection, [property.id]: e.target.value })}>
+                    <option value="">Assign manager</option>
+                    {managers.map((manager) => (
+                      <option key={manager.id} value={manager.id}>{manager.username}</option>
+                    ))}
+                  </select>
+                  <button className="btn btn-primary" type="button" onClick={() => assignManager(property.id)}>
+                    <UserPlus size={16} />
+                    <span>Assign</span>
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
         )}
-      </div>
-    </div>
+      </SectionCard>
+    </PageLayout>
   );
 }

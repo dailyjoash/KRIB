@@ -32,7 +32,7 @@ export default function LandlordRevenue() {
 
       <GlassCard title="Lifetime totals" actions={<span className="subtitle">All successful collections</span>}>
         <div className="table-scroll">
-          <table>
+          <table className="mobile-table">
             <thead>
               <tr>
                 <th>Total Collected</th>
@@ -41,8 +41,8 @@ export default function LandlordRevenue() {
             </thead>
             <tbody>
               <tr>
-                <td>{formatKES(data.lifetime?.gross_collected)}</td>
-                <td>{formatKES(data.lifetime?.net_amount)}</td>
+                <td data-label="Total Collected">{formatKES(data.lifetime?.gross_collected)}</td>
+                <td data-label="Net to Landlord">{formatKES(data.lifetime?.net_amount)}</td>
               </tr>
             </tbody>
           </table>

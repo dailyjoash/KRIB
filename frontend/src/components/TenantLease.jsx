@@ -1,10 +1,8 @@
-import React, { useEffect, useState } from "react";
-import { Building2, Home } from "lucide-react";
+import React, { useEffect, useMemo, useState } from "react";
+import { Building2, CalendarClock, Home, Wallet } from "lucide-react";
 import api from "../services/api";
-import GlassCard from "./GlassCard";
+import { formatDate, formatKES } from "../utils/format";
 import StatusBadge from "./StatusBadge";
-
-const formatCurrency = (amount) => Number(amount || 0).toFixed(2);
 
 export default function TenantLease() {
   const [summary, setSummary] = useState(null);
@@ -16,40 +14,92 @@ export default function TenantLease() {
         const res = await api.get("/api/dashboard/summary/");
         setSummary(res.data);
       } catch {
-        setError("Failed to load lease details");
+        setError("Failed to load current booking details.");
         setSummary({ active_lease: null, rent: {} });
       }
     };
     load();
   }, []);
 
+  const bookingRows = useMemo(() => {
+    const lease = summary?.active_lease;
+    if (!lease) return [];
+
+    return [
+      { label: "Property", value: lease.unit?.property?.name || "-" },
+      { label: "Room", value: lease.unit?.unit_number || "-" },
+      { label: "Lease Start", value: formatDate(lease.start_date) },
+      { label: "Monthly Rent", value: formatKES(lease.rent_amount) },
+      { label: "Due Day", value: lease.due_day || "-" },
+      { label: "Status", value: lease.status || "-" },
+    ];
+  }, [summary?.active_lease]);
+
   if (!summary) return <p className="loading">Loading...</p>;
 
+  const lease = summary.active_lease;
+
   return (
-    <div className="dashboard-container">
+    <div className="resident-page">
       {error ? <p className="error">{error}</p> : null}
-      <GlassCard title="Active Lease">
-        {!summary.active_lease ? (
-          <p>No active lease yet.</p>
+
+      <section className="resident-section-card">
+        <div className="resident-section-head">
+          <div className="resident-title-row">
+            <Building2 size={20} />
+            <h2>Current Booking</h2>
+          </div>
+          {lease ? <StatusBadge status={lease.status} /> : null}
+        </div>
+
+        {!lease ? (
+          <p className="subtitle">No active booking yet.</p>
         ) : (
-          <div className="detail-grid">
-            <p><Building2 size={18} /> Property: <strong>{summary.active_lease.unit?.property?.name || "-"}</strong></p>
-            <p><Home size={18} /> Unit: <strong>{summary.active_lease.unit?.unit_number || "-"}</strong></p>
-            <p>Monthly Rent: <strong>{formatCurrency(summary.active_lease.monthly_rent)}</strong></p>
-            <p>Start: <strong>{summary.active_lease.start_date || "-"}</strong></p>
-            <p>End: <strong>{summary.active_lease.end_date || "-"}</strong></p>
+          <div className="resident-profile-columns">
+            {bookingRows.map((row) => (
+              <div className="resident-profile-item" key={row.label}>
+                <span>{row.label}</span>
+                <strong>{row.value}</strong>
+              </div>
+            ))}
           </div>
         )}
-      </GlassCard>
+      </section>
 
-      <GlassCard title="Rent Status">
-        <div className="detail-grid">
-          <p>Status: <StatusBadge status={summary.rent?.status || "pending"} /></p>
-          <p>Rent Due: <strong>{formatCurrency(summary.rent?.rent_due)}</strong></p>
-          <p>Paid: <strong>{formatCurrency(summary.rent?.paid_sum)}</strong></p>
-          <p>Balance: <strong>{formatCurrency(summary.rent?.balance)}</strong></p>
+      <section className="resident-section-card">
+        <div className="resident-section-head">
+          <div className="resident-title-row">
+            <CalendarClock size={20} />
+            <h2>Stay Snapshot</h2>
+          </div>
         </div>
-      </GlassCard>
+
+        {!lease ? (
+          <p className="subtitle">Move-in details will appear here once a lease is active.</p>
+        ) : (
+          <div className="resident-card-grid">
+            <div className="resident-token-box">
+              <div className="resident-title-row">
+                <Home size={18} />
+                <h3>Assigned Unit</h3>
+              </div>
+              <p className="resident-helper-text">
+                {lease.unit?.property?.name || "KRIB Residence"} / Room {lease.unit?.unit_number || "-"}
+              </p>
+            </div>
+
+            <div className="resident-token-box">
+              <div className="resident-title-row">
+                <Wallet size={18} />
+                <h3>Rent Status</h3>
+              </div>
+              <p className="resident-helper-text">
+                {summary.rent?.status || "Pending"} / Balance {formatKES(summary.rent?.balance || 0)}
+              </p>
+            </div>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

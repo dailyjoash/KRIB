@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
-import { ArrowDownToLine } from "lucide-react";
+import { ArrowDownToLine, WalletCards } from "lucide-react";
 import api from "../services/api";
-import { formatKES } from "../utils/format";
+import { formatDateTime, formatKES } from "../utils/format";
 import GlassCard from "./GlassCard";
 import StatusBadge from "./StatusBadge";
 
@@ -16,7 +16,7 @@ export default function TenantWallet() {
       setWallet(res.data);
     } catch {
       setError("Failed to load wallet");
-      setWallet({ wallet_available: 0, wallet_locked: 0, recent: [] });
+      setWallet({ wallet_available: 0, wallet_locked: 0, recent: [], pending_withdrawals: [] });
     }
   };
 
@@ -40,15 +40,31 @@ export default function TenantWallet() {
   return (
     <div className="dashboard-container">
       {error ? <p className="error">{error}</p> : null}
-      <GlassCard title="Wallet Balances">
-        <div className="detail-grid">
-          <p>Available: <strong>{formatKES(wallet.wallet_available)}</strong></p>
-          <p>Locked: <strong>{formatKES(wallet.wallet_locked)}</strong></p>
+      <GlassCard title="Wallet Balances" actions={<WalletCards size={16} />}>
+        <div className="stack-list compact">
+          <article className="stack-item">
+            <div className="stack-item-main">
+              <div className="stack-item-icon"><WalletCards size={18} /></div>
+              <div>
+                <h4>Available</h4>
+                <p className="subtitle">{formatKES(wallet.wallet_available)}</p>
+              </div>
+            </div>
+          </article>
+          <article className="stack-item">
+            <div className="stack-item-main">
+              <div className="stack-item-icon"><ArrowDownToLine size={18} /></div>
+              <div>
+                <h4>Locked</h4>
+                <p className="subtitle">{formatKES(wallet.wallet_locked)}</p>
+              </div>
+            </div>
+          </article>
         </div>
-        <p className="subtitle">Available after 7 days before withdrawal is processed.</p>
+        <p className="subtitle">Wallet credits unlock after the configured hold period before withdrawal can be requested.</p>
       </GlassCard>
 
-      <GlassCard title="Request Withdrawal">
+      <GlassCard title="Request Withdrawal" actions={<span className="subtitle">Tenant wallet payout request</span>}>
         <div className="form-stack">
           <input placeholder="Withdraw amount (KES)" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
           <button className="btn btn-primary" type="button" onClick={requestWithdrawal}>
@@ -58,28 +74,27 @@ export default function TenantWallet() {
         </div>
       </GlassCard>
 
-      <GlassCard title="Recent Wallet Transactions">
+      <GlassCard title="Recent Wallet Activity" actions={<span className="subtitle">{wallet.pending_withdrawals?.length || 0} pending withdrawals</span>}>
         {wallet.recent?.length === 0 ? (
           <p>No wallet transactions yet.</p>
         ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Type</th>
-                <th>Amount</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {wallet.recent?.map((row) => (
-                <tr key={row.id}>
-                  <td>{row.kind}</td>
-                  <td>{formatKES(row.amount)}</td>
-                  <td><StatusBadge status={row.status} /></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="stack-list">
+            {wallet.recent?.map((row) => (
+              <article className="stack-item" key={row.id}>
+                <div className="stack-item-main">
+                  <div className="stack-item-icon"><WalletCards size={18} /></div>
+                  <div>
+                    <h4>{row.kind.replaceAll("_", " ")}</h4>
+                    <p className="subtitle">{formatKES(row.amount)}</p>
+                    <p className="subtitle">{formatDateTime(row.created_at)}</p>
+                  </div>
+                </div>
+                <div className="stack-item-side">
+                  <StatusBadge status={row.status} />
+                </div>
+              </article>
+            ))}
+          </div>
         )}
       </GlassCard>
     </div>

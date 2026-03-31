@@ -1,7 +1,9 @@
 import uuid
+from datetime import datetime
 from decimal import Decimal
 
 from django.contrib.auth.models import User
+from django.core.validators import FileExtensionValidator
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Sum
@@ -106,16 +108,28 @@ class Lease(models.Model):
     tenant = models.ForeignKey(User, on_delete=models.CASCADE, related_name="leases")
     rent_amount = models.DecimalField(max_digits=12, decimal_places=2)
     start_date = models.DateField()
+    end_date = models.DateField(blank=True, null=True)
     due_day = models.PositiveSmallIntegerField(default=15)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
 
     def clean(self):
+        if self.end_date and self.end_date < self.start_date:
+            raise ValidationError("Lease end date cannot be before the start date.")
         if self.status == self.STATUS_ACTIVE:
             existing = Lease.objects.filter(unit=self.unit, status=self.STATUS_ACTIVE)
             if self.pk:
                 existing = existing.exclude(pk=self.pk)
             if existing.exists():
                 raise ValidationError("Only one active lease is allowed per unit.")
+            tenant_existing = Lease.objects.filter(
+                tenant=self.tenant,
+                unit__property=self.unit.property,
+                status=self.STATUS_ACTIVE,
+            )
+            if self.pk:
+                tenant_existing = tenant_existing.exclude(pk=self.pk)
+            if tenant_existing.exists():
+                raise ValidationError("Only one active lease is allowed per tenant per property.")
 
     def save(self, *args, **kwargs):
         self.full_clean()
@@ -172,6 +186,15 @@ class ManagerInvite(models.Model):
 
 
 class PaymentTransaction(models.Model):
+    METHOD_MPESA = "mpesa"
+    METHOD_CARD = "card"
+    METHOD_PAYPAL = "paypal"
+    METHOD_CHOICES = [
+        (METHOD_MPESA, "M-Pesa"),
+        (METHOD_CARD, "Card"),
+        (METHOD_PAYPAL, "PayPal"),
+    ]
+
     STATUS_PENDING = "pending"
     STATUS_SUCCESS = "success"
     STATUS_FAILED = "failed"
@@ -184,14 +207,20 @@ class PaymentTransaction(models.Model):
     lease = models.ForeignKey(Lease, on_delete=models.CASCADE, related_name="payment_transactions")
     tenant = models.ForeignKey(User, on_delete=models.CASCADE, related_name="payment_transactions")
     period = models.CharField(max_length=7)
+    billing_period = models.DateField(blank=True, null=True)
     phone_number = models.CharField(max_length=20)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
+    payment_method = models.CharField(max_length=20, choices=METHOD_CHOICES, default=METHOD_MPESA)
+    transaction_code = models.CharField(max_length=100, unique=True, blank=True, null=True)
     merchant_request_id = models.CharField(max_length=100, blank=True, null=True)
     checkout_request_id = models.CharField(max_length=100, unique=True, blank=True, null=True)
+    paypal_order_id = models.CharField(max_length=100, blank=True, null=True)
+    stripe_payment_intent_id = models.CharField(max_length=100, blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
     mpesa_receipt = models.CharField(max_length=100, blank=True, null=True)
     result_code = models.IntegerField(blank=True, null=True)
     result_desc = models.CharField(max_length=255, blank=True, null=True)
+    receipt_file = models.FileField(upload_to="receipts/", blank=True, null=True)
     transaction_date = models.DateTimeField(blank=True, null=True)
     raw_callback = models.JSONField(blank=True, null=True)
     allocation_done = models.BooleanField(default=False)
@@ -268,6 +297,15 @@ class LandlordPayout(models.Model):
 
 
 class MaintenanceRequest(models.Model):
+    URGENCY_LOW = "low"
+    URGENCY_MEDIUM = "medium"
+    URGENCY_HIGH = "high"
+    URGENCY_CHOICES = [
+        (URGENCY_LOW, "Low"),
+        (URGENCY_MEDIUM, "Medium"),
+        (URGENCY_HIGH, "High"),
+    ]
+
     STATUS_OPEN = "open"
     STATUS_IN_PROGRESS = "in_progress"
     STATUS_RESOLVED = "resolved"
@@ -280,9 +318,46 @@ class MaintenanceRequest(models.Model):
     tenant = models.ForeignKey(User, on_delete=models.CASCADE, related_name="maintenance_requests")
     lease = models.ForeignKey(Lease, on_delete=models.CASCADE, related_name="maintenance_requests")
     issue = models.TextField()
+    urgency = models.CharField(max_length=20, choices=URGENCY_CHOICES, default=URGENCY_MEDIUM)
+    photo_path = models.FileField(
+        upload_to="maintenance/",
+        blank=True,
+        null=True,
+        validators=[FileExtensionValidator(allowed_extensions=["jpg", "jpeg", "png"])],
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_OPEN)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class Document(models.Model):
+    TYPE_LEASE = "lease"
+    TYPE_IDENTITY = "identity"
+    TYPE_RECEIPT = "receipt"
+    TYPE_OTHER = "other"
+    TYPE_CHOICES = [
+        (TYPE_LEASE, "Lease"),
+        (TYPE_IDENTITY, "ID / Passport"),
+        (TYPE_RECEIPT, "Receipt"),
+        (TYPE_OTHER, "Other"),
+    ]
+
+    property = models.ForeignKey(Property, on_delete=models.CASCADE, related_name="documents")
+    lease = models.ForeignKey(Lease, on_delete=models.SET_NULL, blank=True, null=True, related_name="documents")
+    tenant = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True, related_name="tenant_documents")
+    uploaded_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name="documents")
+    document_type = models.CharField(max_length=20, choices=TYPE_CHOICES, default=TYPE_OTHER)
+    file_path = models.FileField(
+        upload_to="documents/",
+        validators=[FileExtensionValidator(allowed_extensions=["pdf", "jpg", "jpeg", "png"])],
+    )
+    upload_date = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-upload_date"]
+
+    def __str__(self):
+        return f"{self.property.name} / {self.document_type}"
 
 
 class Notification(models.Model):
@@ -308,28 +383,95 @@ class Notification(models.Model):
         ]
 
 
+def _period_start(value):
+    if not value:
+        return None
+    if hasattr(value, "year") and hasattr(value, "month"):
+        return value.replace(day=1)
+    try:
+        return datetime.strptime(str(value), "%Y-%m").date().replace(day=1)
+    except ValueError:
+        return None
+
+
+def _month_count_inclusive(start_month, end_month):
+    if end_month < start_month:
+        return 0
+    return ((end_month.year - start_month.year) * 12) + (end_month.month - start_month.month) + 1
+
+
+def _payment_period_start(payment):
+    if payment.billing_period:
+        return payment.billing_period.replace(day=1)
+    if payment.period:
+        return _period_start(payment.period)
+    if payment.transaction_date:
+        return payment.transaction_date.date().replace(day=1)
+    if payment.created_at:
+        return payment.created_at.date().replace(day=1)
+    return None
+
+
 def compute_lease_rent_status(lease, period=None, today=None):
     today = today or timezone.localdate()
     period = period or today.strftime("%Y-%m")
-    paid_sum = (
-        PaymentTransaction.objects.filter(
-            lease=lease,
-            period=period,
-            status=PaymentTransaction.STATUS_SUCCESS,
-        ).aggregate(total=Coalesce(Sum("amount"), Decimal("0.00")))["total"]
+    target_month = _period_start(period) or today.replace(day=1)
+    lease_start_month = lease.start_date.replace(day=1)
+    lease_end_month = lease.end_date.replace(day=1) if lease.end_date else target_month
+    effective_end_month = min(target_month, lease_end_month)
+
+    billable_periods = _month_count_inclusive(lease_start_month, effective_end_month)
+    if billable_periods <= 0:
+        return {
+            "period": period,
+            "rent_due": Decimal("0.00"),
+            "paid_sum": Decimal("0.00"),
+            "balance": Decimal("0.00"),
+            "status": "PAID",
+            "current_period_paid_sum": Decimal("0.00"),
+            "current_period_balance": Decimal("0.00"),
+            "carried_forward_balance": Decimal("0.00"),
+            "cumulative_rent_due": Decimal("0.00"),
+            "cumulative_paid_sum": Decimal("0.00"),
+        }
+
+    current_period_paid_sum = Decimal("0.00")
+    cumulative_paid_sum = Decimal("0.00")
+    successful_payments = PaymentTransaction.objects.filter(
+        lease=lease,
+        status=PaymentTransaction.STATUS_SUCCESS,
     )
+
+    for payment in successful_payments:
+        payment_month = _payment_period_start(payment)
+        if not payment_month or payment_month > target_month:
+            continue
+        cumulative_paid_sum += payment.amount
+        if payment_month == target_month:
+            current_period_paid_sum += payment.amount
+
     rent_due = lease.rent_amount
-    balance = rent_due - paid_sum
+    cumulative_rent_due = rent_due * billable_periods
+    previous_periods_due = rent_due * max(billable_periods - 1, 0)
+    paid_applied_to_previous = min(cumulative_paid_sum, previous_periods_due)
+    carried_forward_balance = max(previous_periods_due - paid_applied_to_previous, Decimal("0.00"))
+    remaining_paid_for_current = max(cumulative_paid_sum - previous_periods_due, Decimal("0.00"))
+    current_period_balance = max(rent_due - min(remaining_paid_for_current, rent_due), Decimal("0.00"))
+    balance = carried_forward_balance + current_period_balance
 
     if balance <= 0:
         status = "PAID"
-    elif paid_sum > 0:
+    elif carried_forward_balance > 0:
+        status = "OVERDUE"
+    elif current_period_paid_sum > 0:
         status = "PARTIAL"
     else:
         status = "UNPAID"
 
-    if today.day > lease.due_day and balance > 0:
+    if current_period_balance > 0 and today.day > lease.due_day:
         status = "OVERDUE"
+
+    if status == "OVERDUE" and balance > 0:
         Notification.objects.get_or_create(
             user=lease.tenant,
             type=Notification.TYPE_OVERDUE,
@@ -337,16 +479,21 @@ def compute_lease_rent_status(lease, period=None, today=None):
             period=period,
             defaults={
                 "title": "Rent overdue",
-                "message": f"Your rent for {today.strftime('%B %Y')} is overdue. Please clear your balance to avoid eviction procedures.",
+                "message": f"Your outstanding rent balance of KES {balance} is overdue. Please clear it to avoid eviction procedures.",
             },
         )
 
     return {
         "period": period,
         "rent_due": rent_due,
-        "paid_sum": paid_sum,
+        "paid_sum": current_period_paid_sum,
         "balance": balance,
         "status": status,
+        "current_period_paid_sum": current_period_paid_sum,
+        "current_period_balance": current_period_balance,
+        "carried_forward_balance": carried_forward_balance,
+        "cumulative_rent_due": cumulative_rent_due,
+        "cumulative_paid_sum": cumulative_paid_sum,
     }
 
 
