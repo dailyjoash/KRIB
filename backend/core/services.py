@@ -12,6 +12,12 @@ from urllib import request as urllib_request
 
 from django.core.files.base import ContentFile
 from django.utils import timezone
+
+from .models import Lease, compute_lease_rent_status
+try:
+    from intasend import APIService
+except ImportError:  # pragma: no cover - optional dependency in lightweight builds
+    APIService = None
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.utils import ImageReader
@@ -22,6 +28,36 @@ except ImportError:  # pragma: no cover - optional dependency in lightweight bui
     canvas = None
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_invoice_email(reference):
+    slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(reference or "payment")).strip("-").lower()
+    return f"{slug or 'payment'}@payments.krib.local"
+
+
+def _intasend_error_message(payload, fallback):
+    if not isinstance(payload, dict):
+        return fallback
+
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        first = errors[0]
+        if isinstance(first, dict):
+            return first.get("message") or first.get("detail") or fallback
+        return str(first)
+
+    return (
+        payload.get("error")
+        or payload.get("message")
+        or payload.get("detail")
+        or fallback
+    )
 
 
 def _normalize_sms_phone_number(phone_number):
@@ -37,6 +73,19 @@ def _normalize_sms_phone_number(phone_number):
     return value
 
 
+def normalize_mpesa_phone_number(phone_number):
+    value = re.sub(r"\D", "", str(phone_number or "").strip())
+    if not value:
+        return ""
+    if len(value) == 9 and value[0] in {"1", "7"}:
+        return f"254{value}"
+    if len(value) == 10 and value.startswith("0") and value[1] in {"1", "7"}:
+        return f"254{value[1:]}"
+    if len(value) == 12 and value.startswith("254") and value[3] in {"1", "7"}:
+        return value
+    return ""
+
+
 def current_period_string(today=None):
     today = today or timezone.localdate()
     return today.strftime("%Y-%m")
@@ -45,6 +94,31 @@ def current_period_string(today=None):
 def current_billing_period(today=None):
     today = today or timezone.localdate()
     return date(today.year, today.month, 1)
+
+
+def can_withdraw_wallet(tenant_user, amount):
+    """
+    Returns (True, None) if withdrawal is allowed.
+    Returns (False, message) if blocked.
+
+    Wallet withdrawals are balance-based: available wallet credit is only
+    withdrawable when the tenant has no outstanding balance on any active lease.
+    """
+    active_leases = Lease.objects.filter(
+        tenant=tenant_user,
+        status=Lease.STATUS_ACTIVE,
+    ).select_related("unit", "unit__property")
+
+    for lease in active_leases:
+        status = compute_lease_rent_status(lease)
+        if status["balance"] > Decimal("0.00"):
+            return False, (
+                "You have outstanding rent of KES "
+                f"{status['balance']:,.2f}. Clear your "
+                "balance before withdrawing."
+            )
+
+    return True, None
 
 
 def period_string_to_date(period):
@@ -333,6 +407,146 @@ def send_sms(phone_number, message, *, include_detail=False):
         logger.warning("SMS delivery failed: %s", exc)
         result = {"ok": False, "detail": str(exc)}
         return result if include_detail else False
+
+
+def intasend_stk_push(phone_number, amount, reference):
+    token = os.getenv("INTASEND_API_TOKEN", "").strip()
+    publishable_key = os.getenv("INTASEND_PUBLISHABLE_KEY", "").strip()
+    test_mode = _env_flag(os.getenv("INTASEND_TEST_MODE"), default=True)
+
+    if not token or not publishable_key:
+        return {"success": False, "error": "IntaSend is not configured."}
+
+    if APIService is None:
+        return {"success": False, "error": "IntaSend SDK is not installed."}
+
+    try:
+        service = APIService(
+            token=token,
+            publishable_key=publishable_key,
+            test=test_mode,
+        )
+        response = service.collect.mpesa_stk_push(
+            phone_number=phone_number,
+            email=_safe_invoice_email(reference),
+            amount=float(Decimal(amount)),
+            narrative=str(reference or "KRIB rent payment"),
+        )
+    except Exception as exc:  # pragma: no cover - SDK/network path
+        logger.warning("IntaSend STK push failed: %s", exc)
+        return {"success": False, "error": str(exc) or "IntaSend STK push failed."}
+
+    invoice_id = None
+    if isinstance(response, dict):
+        invoice_id = response.get("invoice_id") or (response.get("invoice") or {}).get("invoice_id")
+
+    if invoice_id:
+        return {"success": True, "invoice_id": str(invoice_id)}
+
+    logger.warning("IntaSend STK push did not return an invoice id: %s", response)
+    return {
+        "success": False,
+        "error": _intasend_error_message(response, "IntaSend STK push failed."),
+    }
+
+
+def _intasend_service_kwargs():
+    token = os.getenv("INTASEND_API_TOKEN", "").strip()
+    publishable_key = os.getenv("INTASEND_PUBLISHABLE_KEY", "").strip()
+    kwargs = {
+        "token": token,
+        "test": _env_flag(os.getenv("INTASEND_TEST_MODE"), default=True),
+    }
+    if publishable_key:
+        kwargs["publishable_key"] = publishable_key
+    return kwargs
+
+
+def _payout_beneficiary_name(payout):
+    landlord = getattr(payout, "landlord", None)
+    if not landlord:
+        return "KRIB Landlord"
+    return landlord.get_full_name() or landlord.username or "KRIB Landlord"
+
+
+def _intasend_payout_error(response, fallback):
+    if isinstance(response, dict):
+        status = str(response.get("status") or response.get("state") or "").upper()
+        if status in {"FAILED", "ERROR", "REJECTED"}:
+            return _intasend_error_message(response, fallback)
+
+        for key in ("error", "detail", "message"):
+            value = response.get(key)
+            if value:
+                return str(value)
+    return fallback
+
+
+def _intasend_payout_accepted(response):
+    if not response:
+        return False
+    if isinstance(response, dict):
+        status = str(response.get("status") or response.get("state") or "").upper()
+        if status in {"FAILED", "ERROR", "REJECTED"}:
+            return False
+        if response.get("tracking_id") or response.get("id"):
+            return True
+        if response.get("invoice") or response.get("reference"):
+            return True
+        if isinstance(response.get("results"), list) and response.get("results"):
+            return True
+    return False
+
+
+def execute_intasend_payout(payout):
+    token = os.getenv("INTASEND_API_TOKEN", "").strip()
+    if not token:
+        return {"success": False, "error": "IntaSend is not configured."}
+
+    if APIService is None:
+        return {"success": False, "error": "IntaSend SDK is not installed."}
+
+    try:
+        service = APIService(**_intasend_service_kwargs())
+        transaction = {
+            "name": _payout_beneficiary_name(payout),
+            "account": str(payout.destination or "").strip(),
+            "amount": float(Decimal(payout.amount)),
+            "narrative": f"KRIB landlord payout #{payout.id}",
+        }
+
+        if payout.method == payout.METHOD_MPESA:
+            normalized_account = normalize_mpesa_phone_number(transaction["account"])
+            if not normalized_account:
+                return {"success": False, "error": "Use a valid Kenyan M-Pesa number for payouts."}
+            transaction["account"] = normalized_account
+            # Request immediate release so the request view can finalize the payout
+            # decision without a second approval step.
+            response = service.transfer.mpesa(
+                currency="KES",
+                transactions=[transaction],
+                requires_approval="NO",
+            )
+        elif payout.method == payout.METHOD_BANK:
+            if not getattr(payout, "bank_code", ""):
+                return {"success": False, "error": "Bank code is required for bank payouts."}
+            transaction["bank_code"] = str(payout.bank_code).strip()
+            response = service.transfer.bank(
+                currency="KES",
+                transactions=[transaction],
+                requires_approval="NO",
+            )
+        else:
+            return {"success": False, "error": "Unsupported payout method."}
+    except Exception as exc:  # pragma: no cover - SDK/network path
+        logger.warning("IntaSend payout failed: %s", exc)
+        return {"success": False, "error": str(exc) or "IntaSend payout failed."}
+
+    if _intasend_payout_accepted(response):
+        return {"success": True}
+
+    logger.warning("IntaSend payout was not accepted: %s", response)
+    return {"success": False, "error": _intasend_payout_error(response, "IntaSend payout failed.")}
 
 
 def _paypal_api_base():

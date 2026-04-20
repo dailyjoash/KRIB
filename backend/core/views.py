@@ -1,13 +1,11 @@
-import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
-from urllib import request as urllib_request
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
 
 try:
     import stripe
@@ -28,7 +26,7 @@ from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import mixins, status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import action, api_view, permission_classes, throttle_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -60,6 +58,7 @@ from .serializers import (
     DocumentSerializer,
     LoginSerializer,
     LandlordFollowupSerializer,
+    LandlordSettingsSerializer,
     LandlordReceiptSerializer,
     LandlordRevenueSerializer,
     LandlordSignupSerializer,
@@ -86,15 +85,32 @@ from .serializers import (
     UnitSerializer,
     WalletWithdrawSerializer,
 )
+from .permissions import (
+    IsLandlord,
+    IsPropertyOwner,
+    IsTenant,
+    IsTenantOfProperty,
+    get_role,
+    landlord_has_payout_setup,
+)
 from .services import (
     build_public_url,
+    can_withdraw_wallet,
     current_billing_period,
     current_period_string,
+    execute_intasend_payout,
+    intasend_stk_push,
     paypal_capture_order,
     paypal_create_order,
     period_string_to_date,
     save_payment_receipt,
     send_sms,
+)
+from .throttles import (
+    LoginRateThrottle,
+    PasswordResetRateThrottle,
+    RegisterRateThrottle,
+    STKInitiateRateThrottle,
 )
 
 logger = logging.getLogger(__name__)
@@ -133,7 +149,8 @@ def _display_name(user):
 
 
 def _generate_unique_username(full_name, email="", prefix="user"):
-    cleaned_name = "".join(char.lower() for char in (full_name or "") if char.isalnum())
+    cleaned_name = "".join(char.lower()
+                           for char in (full_name or "") if char.isalnum())
     email_base = (email or "").split("@")[0].strip().lower()
     email_base = "".join(char for char in email_base if char.isalnum())
     username_base = cleaned_name or email_base or f"{prefix}{random.randint(1000, 9999)}"
@@ -201,9 +218,11 @@ def _assert_active_lease(lease, user):
 def _validate_payment_amount(lease, amount, period):
     requested = Decimal(amount)
     if requested <= 0:
-        raise DRFValidationError({"detail": "Enter an amount greater than zero."})
+        raise DRFValidationError(
+            {"detail": "Enter an amount greater than zero."})
 
-    period_label = period.strftime("%Y-%m") if hasattr(period, "strftime") else str(period)
+    period_label = period.strftime(
+        "%Y-%m") if hasattr(period, "strftime") else str(period)
     remaining_balance = compute_lease_rent_status(
         lease,
         period=period_label,
@@ -211,7 +230,8 @@ def _validate_payment_amount(lease, amount, period):
     ).get("balance", Decimal("0.00"))
 
     if remaining_balance <= 0:
-        raise DRFValidationError({"detail": "Rent for this period is already fully paid."})
+        raise DRFValidationError(
+            {"detail": "Rent for this period is already fully paid."})
 
     if requested > remaining_balance:
         raise DRFValidationError(
@@ -263,7 +283,8 @@ def _scoped_properties(user):
 def _notification_recipients(user, audience, property_obj=None):
     role = _get_role(user)
     if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not user.is_staff:
-        raise PermissionDenied("Only landlord or manager can send notifications.")
+        raise PermissionDenied(
+            "Only landlord or manager can send notifications.")
 
     if user.is_staff:
         scoped_properties = Property.objects.all()
@@ -274,7 +295,8 @@ def _notification_recipients(user, audience, property_obj=None):
 
     if property_obj is not None:
         if not user.is_staff and not scoped_properties.filter(pk=property_obj.pk).exists():
-            raise PermissionDenied("You can only notify users in your own portfolio.")
+            raise PermissionDenied(
+                "You can only notify users in your own portfolio.")
         scoped_properties = Property.objects.filter(pk=property_obj.pk)
 
     tenants = User.objects.filter(profile__role=Profile.ROLE_TENANT)
@@ -321,9 +343,11 @@ def _unlock_wallet(profile):
     amount = sum((row.amount for row in rows), Decimal("0.00"))
     if amount > 0:
         rows.update(status=LedgerTransaction.STATUS_AVAILABLE)
-        profile.wallet_locked = max(profile.wallet_locked - amount, Decimal("0.00"))
+        profile.wallet_locked = max(
+            profile.wallet_locked - amount, Decimal("0.00"))
         profile.wallet_available += amount
-        profile.save(update_fields=["wallet_locked", "wallet_available", "updated_at"])
+        profile.save(update_fields=["wallet_locked",
+                     "wallet_available", "updated_at"])
 
 
 def _unlock_landlord(balance):
@@ -337,9 +361,11 @@ def _unlock_landlord(balance):
     amount = sum((row.amount for row in rows), Decimal("0.00"))
     if amount > 0:
         rows.update(status=LedgerTransaction.STATUS_AVAILABLE)
-        balance.locked_balance = max(balance.locked_balance - amount, Decimal("0.00"))
+        balance.locked_balance = max(
+            balance.locked_balance - amount, Decimal("0.00"))
         balance.available_balance += amount
-        balance.save(update_fields=["locked_balance", "available_balance", "updated_at"])
+        balance.save(update_fields=["locked_balance",
+                     "available_balance", "updated_at"])
 
 
 def _apply_wallet_to_current_rent(lease):
@@ -396,168 +422,173 @@ def _apply_wallet_to_current_rent(lease):
     return debit
 
 
+def _wallet_aware_rent_status(lease, rent_status, wallet_available, *, today=None):
+    # Dashboard reads should reflect the balance-based wallet model without
+    # creating payment rows or mutating ledger balances on a GET request.
+    today = today or timezone.localdate()
+    adjusted = dict(rent_status or {})
+    available_wallet = max(
+        Decimal(wallet_available or Decimal("0.00")), Decimal("0.00"))
+    raw_balance = max(Decimal(adjusted.get("balance")
+                      or Decimal("0.00")), Decimal("0.00"))
+
+    if available_wallet <= 0 or raw_balance <= 0:
+        return adjusted
+
+    carried_forward_balance = max(
+        Decimal(adjusted.get("carried_forward_balance") or Decimal("0.00")),
+        Decimal("0.00"),
+    )
+    current_period_balance = max(
+        Decimal(adjusted.get("current_period_balance") or Decimal("0.00")),
+        Decimal("0.00"),
+    )
+    wallet_applied = min(available_wallet, raw_balance)
+    wallet_applied_to_arrears = min(wallet_applied, carried_forward_balance)
+    wallet_applied_to_current = min(
+        wallet_applied - wallet_applied_to_arrears, current_period_balance)
+
+    adjusted["carried_forward_balance"] = carried_forward_balance - \
+        wallet_applied_to_arrears
+    adjusted["current_period_balance"] = current_period_balance - \
+        wallet_applied_to_current
+    adjusted["balance"] = raw_balance - wallet_applied
+
+    if adjusted["balance"] <= 0:
+        adjusted["status"] = "PAID"
+    elif adjusted["carried_forward_balance"] > 0:
+        adjusted["status"] = "OVERDUE"
+    elif adjusted["current_period_balance"] > 0 and today.day > lease.due_day:
+        adjusted["status"] = "OVERDUE"
+    elif adjusted.get("paid_sum", Decimal("0.00")) > 0 or wallet_applied > 0:
+        adjusted["status"] = "PARTIAL"
+    else:
+        adjusted["status"] = "UNPAID"
+
+    return adjusted
+
+
 def _allocate_success_payment(payment):
-    if payment.allocation_done or payment.status != PaymentTransaction.STATUS_SUCCESS:
+    payment_id = getattr(payment, "pk", None)
+    if not payment_id:
         return
 
-    lease = payment.lease
-    landlord = lease.unit.property.landlord
-    profile, _ = Profile.objects.get_or_create(user=payment.tenant)
-    landlord_balance, _ = LandlordBalance.objects.get_or_create(landlord=landlord)
+    notification_context = None
 
     with transaction.atomic():
-        rent_status = compute_lease_rent_status(lease, period=payment.period)
-        due_before = max(rent_status["balance"] + payment.amount, Decimal("0.00"))
-        rent_applied = min(payment.amount, due_before)
-        overpayment = payment.amount - rent_applied
+        locked_payment = (
+            PaymentTransaction.objects.select_for_update()
+            .select_related("lease", "lease__unit", "lease__unit__property", "tenant")
+            .get(pk=payment_id)
+        )
+        if locked_payment.allocation_done or locked_payment.status != PaymentTransaction.STATUS_SUCCESS:
+            return
+
+        lease = Lease.objects.select_for_update().select_related(
+            "unit", "unit__property").get(pk=locked_payment.lease_id)
+        landlord = lease.unit.property.landlord
+
+        profile, _ = Profile.objects.get_or_create(user=locked_payment.tenant)
+        profile = Profile.objects.select_for_update().get(pk=profile.pk)
+
+        landlord_balance, _ = LandlordBalance.objects.get_or_create(
+            landlord=landlord)
+        landlord_balance = LandlordBalance.objects.select_for_update().get(
+            pk=landlord_balance.pk)
+
+        # Serialize allocations per lease and compute the outstanding rent from
+        # already-applied landlord credits, not from potentially concurrent
+        # successful payments that have not been allocated yet.
+        target_month = (locked_payment.billing_period or period_string_to_date(
+            locked_payment.period)).replace(day=1)
+        lease_start_month = lease.start_date.replace(day=1)
+        lease_end_month = lease.end_date.replace(
+            day=1) if lease.end_date else target_month
+        effective_end_month = min(target_month, lease_end_month)
+
+        if effective_end_month < lease_start_month:
+            cumulative_rent_due = Decimal("0.00")
+        else:
+            billable_months = ((effective_end_month.year - lease_start_month.year) * 12) + (
+                effective_end_month.month - lease_start_month.month
+            ) + 1
+            cumulative_rent_due = lease.rent_amount * billable_months
+
+        already_applied = (
+            LedgerTransaction.objects.filter(
+                user=landlord,
+                kind=LedgerTransaction.KIND_LANDLORD_CREDIT_RENT,
+            )
+            .filter(
+                Q(reference_text__contains=f";lease:{lease.id}")
+                | Q(reference_text=f"wallet_debit_lease:{lease.id}")
+            )
+            .aggregate(total=Sum("amount"))["total"]
+            or Decimal("0.00")
+        )
+
+        remaining_due_before_payment = max(
+            cumulative_rent_due - already_applied, Decimal("0.00"))
+        rent_applied = min(locked_payment.amount, remaining_due_before_payment)
+        overpayment = locked_payment.amount - rent_applied
 
         if rent_applied > 0:
             landlord_balance.locked_balance += rent_applied
-            landlord_balance.save(update_fields=["locked_balance", "updated_at"])
+            landlord_balance.save(
+                update_fields=["locked_balance", "updated_at"])
             LedgerTransaction.objects.create(
                 user=landlord,
                 kind=LedgerTransaction.KIND_LANDLORD_CREDIT_RENT,
                 amount=rent_applied,
                 status=LedgerTransaction.STATUS_LOCKED,
                 available_at=timezone.now() + timedelta(days=LANDLORD_HOLD_DAYS),
-                reference_text=f"payment:{payment.id};lease:{lease.id}",
+                reference_text=f"payment:{locked_payment.id};lease:{lease.id}",
             )
 
         if overpayment > 0:
             profile.wallet_locked += overpayment
             profile.save(update_fields=["wallet_locked", "updated_at"])
             LedgerTransaction.objects.create(
-                user=payment.tenant,
+                user=locked_payment.tenant,
                 kind=LedgerTransaction.KIND_WALLET_CREDIT,
                 amount=overpayment,
                 status=LedgerTransaction.STATUS_LOCKED,
                 available_at=timezone.now() + timedelta(days=WALLET_CREDIT_HOLD_DAYS),
-                reference_text=f"payment:{payment.id};lease:{lease.id}",
+                reference_text=f"payment:{locked_payment.id};lease:{lease.id}",
             )
 
-        payment.allocation_done = True
-        payment.save(update_fields=["allocation_done"])
+        locked_payment.allocation_done = True
+        locked_payment.save(update_fields=["allocation_done"])
+        notification_context = (locked_payment.tenant, landlord,
+                                lease, locked_payment.amount, locked_payment.period)
 
+    tenant, landlord, lease, amount, period = notification_context
     _notify_users(
-        [payment.tenant, landlord],
+        [tenant, landlord],
         "Rent payment received",
-        f"Rent payment of KES {payment.amount} for {payment.period} was processed successfully for {lease.unit.property.name} / {lease.unit.unit_number}.",
+        f"Rent payment of KES {amount} for {period} was processed successfully for {lease.unit.property.name} / {lease.unit.unit_number}.",
         lease=lease,
-        period=payment.period,
+        period=period,
     )
 
 
-def _daraja_access_token():
-    key = os.getenv("MPESA_CONSUMER_KEY", "")
-    secret = os.getenv("MPESA_CONSUMER_SECRET", "")
-    if not key or not secret:
-        return None
-    auth = base64.b64encode(f"{key}:{secret}".encode()).decode()
-    req = urllib_request.Request(
-        os.getenv("MPESA_OAUTH_URL", "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"),
-        headers={"Authorization": f"Basic {auth}"},
-    )
-    try:
-        with urllib_request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode())
-            return payload.get("access_token")
-    except HTTPError as exc:
-        logger.warning("Daraja access token request failed: %s", exc.read().decode())
-        return None
-    except URLError as exc:
-        logger.warning("Daraja access token request failed: %s", exc)
-        return None
-
-
-def _missing_daraja_env_vars():
+def _missing_intasend_env_vars():
     required_vars = [
-        "MPESA_CONSUMER_KEY",
-        "MPESA_CONSUMER_SECRET",
-        "MPESA_SHORTCODE",
-        "MPESA_CALLBACK_URL",
+        "INTASEND_API_TOKEN",
+        "INTASEND_PUBLISHABLE_KEY",
+        "INTASEND_TEST_MODE",
     ]
     return [name for name in required_vars if not os.getenv(name)]
 
 
-def _daraja_callback_url_error():
-    callback_url = os.getenv("MPESA_CALLBACK_URL", "").strip()
-    if not callback_url:
-        return "MPESA_CALLBACK_URL is missing."
+def _verify_intasend_signature(raw_body, signature):
+    secret = os.getenv("INTASEND_WEBHOOK_SECRET", "").strip()
+    if not secret or not signature:
+        return False
 
-    parsed = urlparse(callback_url)
-    hostname = parsed.hostname or ""
-
-    if parsed.scheme != "https" or not parsed.netloc:
-        return "MPESA callback URL must be a public HTTPS URL."
-    if hostname in {"localhost", "127.0.0.1"}:
-        return "MPESA callback URL cannot point to localhost."
-    if "." not in hostname:
-        return "MPESA callback URL must use a valid public domain name."
-
-    return None
-
-
-def _daraja_passkey(shortcode):
-    configured = os.getenv("MPESA_PASSKEY", "").strip()
-    sandbox_passkey = "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919"
-    if shortcode == "174379" and configured and len(configured) < len(sandbox_passkey):
-        logger.warning(
-            "Ignoring truncated MPESA_PASSKEY for sandbox shortcode 174379 and using the shared test passkey."
-        )
-        return sandbox_passkey
-    if configured:
-        return configured
-    # Safaricom's shared sandbox shortcode 174379 uses the standard test passkey.
-    if shortcode == "174379":
-        return sandbox_passkey
-    return ""
-
-
-def _daraja_stk_push(phone_number, amount, reference):
-    shortcode = os.getenv("MPESA_SHORTCODE", "")
-    passkey = _daraja_passkey(shortcode)
-    callback_url = os.getenv("MPESA_CALLBACK_URL", "")
-    if not shortcode or not passkey or not callback_url:
-        return None
-
-    token = _daraja_access_token()
-    if not token:
-        return None
-
-    # Daraja password validation is sensitive to the request timestamp.
-    # Use local EAT time instead of Django's default UTC value here.
-    timestamp = timezone.localtime().strftime("%Y%m%d%H%M%S")
-    password = base64.b64encode(f"{shortcode}{passkey}{timestamp}".encode()).decode()
-
-    payload = {
-        "BusinessShortCode": shortcode,
-        "Password": password,
-        "Timestamp": timestamp,
-        "TransactionType": "CustomerPayBillOnline",
-        "Amount": int(Decimal(amount)),
-        "PartyA": phone_number,
-        "PartyB": shortcode,
-        "PhoneNumber": phone_number,
-        "CallBackURL": callback_url,
-        "AccountReference": reference,
-        "TransactionDesc": "KRIB rent payment",
-    }
-
-    req = urllib_request.Request(
-        os.getenv("MPESA_STK_PUSH_URL", "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest"),
-        data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib_request.urlopen(req, timeout=20) as resp:
-            return json.loads(resp.read().decode())
-    except HTTPError as exc:
-        logger.warning("Daraja STK push failed: %s", exc.read().decode())
-        return None
-    except URLError as exc:
-        logger.warning("Daraja STK push failed: %s", exc)
-        return None
+    expected_signature = hmac.new(
+        secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected_signature, signature.strip())
 
 
 @api_view(["GET", "PATCH"])
@@ -607,6 +638,7 @@ def get_me(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([RegisterRateThrottle])
 def register(request):
     serializer = RegisterSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -618,7 +650,8 @@ def register(request):
 
     with transaction.atomic():
         username = _generate_unique_username(name, email=email)
-        user = User.objects.create(username=username, email=email, first_name=name)
+        user = User.objects.create(
+            username=username, email=email, first_name=name)
         user.set_password(serializer.validated_data["password"])
         user.save(update_fields=["password"])
 
@@ -650,6 +683,7 @@ def register(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([LoginRateThrottle])
 def login(request):
     serializer = LoginSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -688,6 +722,7 @@ def login(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([RegisterRateThrottle])
 def signup_landlord(request):
     serializer = LandlordSignupSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -697,7 +732,8 @@ def signup_landlord(request):
         last_name = serializer.validated_data["last_name"].strip()
         full_name = f"{first_name} {last_name}".strip()
         user = User.objects.create(
-            username=_generate_unique_username(full_name, email=serializer.validated_data.get("email", "")),
+            username=_generate_unique_username(
+                full_name, email=serializer.validated_data.get("email", "")),
             email=serializer.validated_data.get("email", ""),
             first_name=first_name,
             last_name=last_name,
@@ -707,12 +743,14 @@ def signup_landlord(request):
 
         profile, _ = Profile.objects.get_or_create(user=user)
         profile.role = Profile.ROLE_LANDLORD
-        profile.phone_number = serializer.validated_data.get("phone_number") or ""
+        profile.phone_number = serializer.validated_data.get(
+            "phone_number") or ""
         profile.save(update_fields=["role", "phone_number"])
 
         LandlordSettings.objects.update_or_create(
             user=user,
-            defaults={"business_name": serializer.validated_data["business_name"]},
+            defaults={
+                "business_name": serializer.validated_data["business_name"]},
         )
 
     return Response({"detail": "Landlord account created successfully."}, status=201)
@@ -732,6 +770,7 @@ def change_password(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([PasswordResetRateThrottle])
 def password_reset_request(request):
     serializer = PasswordResetRequestSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -761,7 +800,8 @@ def password_reset_confirm(request):
     serializer.is_valid(raise_exception=True)
 
     try:
-        user_id = force_str(urlsafe_base64_decode(serializer.validated_data["uid"]))
+        user_id = force_str(urlsafe_base64_decode(
+            serializer.validated_data["uid"]))
         user = User.objects.get(pk=user_id)
     except (TypeError, ValueError, OverflowError, User.DoesNotExist):
         return Response({"detail": "Invalid reset link."}, status=400)
@@ -841,7 +881,8 @@ def send_tenant_invite(invite):
     invite_link = _tenant_invite_link(invite)
     unit_label = invite.unit.unit_number if invite.unit else ""
     property_name = invite.property.name if invite.property else ""
-    location_bits = " / ".join(bit for bit in [property_name, unit_label] if bit)
+    location_bits = " / ".join(
+        bit for bit in [property_name, unit_label] if bit)
     context = f" for {location_bits}" if location_bits else ""
     delivery = _send_invite_channels(
         subject="KRIB Tenant Invite",
@@ -864,9 +905,19 @@ class ManagerInviteCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        role = _get_role(request.user)
+        role = get_role(request.user)
         if role != Profile.ROLE_LANDLORD and not request.user.is_staff:
             return Response({"detail": "Only landlord/admin can create manager invites."}, status=403)
+        # The frontend disables the CTA for UX, but the backend must still enforce
+        # the rule so direct API calls cannot bypass payout setup requirements.
+        if not request.user.is_staff and not landlord_has_payout_setup(request.user):
+            return Response(
+                {
+                    "detail": "Set up your payment method before inviting a manager.",
+                    "code": "payout_not_configured",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         email = request.data.get("email")
         phone = request.data.get("phone")
         if not email and not phone:
@@ -896,7 +947,8 @@ class ManagerInviteAcceptView(APIView):
     def post(self, request):
         serializer = ManagerInviteAcceptSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        invite = ManagerInvite.objects.filter(token=serializer.validated_data["token"], is_active=True).first()
+        invite = ManagerInvite.objects.filter(
+            token=serializer.validated_data["token"], is_active=True).first()
         if not invite:
             return Response({"detail": "Invalid invite token."}, status=400)
         if invite.is_expired() or invite.accepted_at:
@@ -905,7 +957,8 @@ class ManagerInviteAcceptView(APIView):
         first_name = serializer.validated_data["first_name"].strip()
         last_name = serializer.validated_data["last_name"].strip()
         full_name = f"{first_name} {last_name}".strip()
-        username = _generate_unique_username(full_name, email=invite.email or "", prefix="manager")
+        username = _generate_unique_username(
+            full_name, email=invite.email or "", prefix="manager")
         user = User.objects.create(
             username=username,
             email=invite.email or "",
@@ -988,7 +1041,8 @@ class UnitViewSet(viewsets.ModelViewSet):
 
         unit_property = serializer.validated_data["property"]
         if unit_property not in _scoped_properties(self.request.user):
-            raise PermissionDenied("Cannot create units outside your assigned properties")
+            raise PermissionDenied(
+                "Cannot create units outside your assigned properties")
 
         serializer.save()
 
@@ -1012,10 +1066,12 @@ class LeaseViewSet(viewsets.ModelViewSet):
 
         lease_unit = serializer.validated_data["unit"]
         if lease_unit.property not in _scoped_properties(self.request.user):
-            raise PermissionDenied("Cannot create leases outside your assigned properties")
+            raise PermissionDenied(
+                "Cannot create leases outside your assigned properties")
 
         lease = serializer.save()
-        login_link = (settings.FRONTEND_URL or "http://localhost:5173").rstrip("/") + "/login"
+        login_link = (
+            settings.FRONTEND_URL or "http://localhost:5173").rstrip("/") + "/login"
         phone_number = _lease_tenant_phone_number(lease)
         tenant_name = lease.tenant.get_full_name() or lease.tenant.username
         property_label = f"{lease.unit.property.name} / {lease.unit.unit_number}"
@@ -1081,8 +1137,10 @@ class LeaseViewSet(viewsets.ModelViewSet):
             if not phone_number:
                 return Response({"detail": "This tenant does not have a phone number."}, status=400)
             sms_result = send_sms(phone_number, message, include_detail=True)
-            sms_ok = sms_result if isinstance(sms_result, bool) else sms_result.get("ok")
-            sms_detail = "" if isinstance(sms_result, bool) else sms_result.get("detail")
+            sms_ok = sms_result if isinstance(
+                sms_result, bool) else sms_result.get("ok")
+            sms_detail = "" if isinstance(
+                sms_result, bool) else sms_result.get("detail")
             if not sms_ok:
                 return Response(
                     {
@@ -1165,7 +1223,8 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         return TenantInvite.objects.none()
 
     def retrieve(self, request, *args, **kwargs):
-        invite = TenantInvite.objects.filter(token=kwargs.get("pk")).select_related("property", "unit__property", "invited_by").first()
+        invite = TenantInvite.objects.filter(token=kwargs.get("pk")).select_related(
+            "property", "unit__property", "invited_by").first()
         if not invite:
             return Response({"detail": "Tenant invite not found."}, status=404)
         if invite.is_expired() and invite.status == TenantInvite.STATUS_PENDING:
@@ -1174,9 +1233,19 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         return Response(TenantInviteSerializer(invite).data)
 
     def create(self, request, *args, **kwargs):
-        role = _get_role(request.user)
+        role = get_role(request.user)
         if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER]:
             return Response({"detail": "Only landlord/manager can invite."}, status=403)
+        # The client-side warning prevents a confusing dead-end, but security has
+        # to live here because API consumers can bypass the React app entirely.
+        if role == Profile.ROLE_LANDLORD and not landlord_has_payout_setup(request.user):
+            return Response(
+                {
+                    "detail": "Set up your payment method before inviting tenants.",
+                    "code": "payout_not_configured",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         invite = serializer.save(invited_by=request.user)
@@ -1254,7 +1323,8 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         first_name = serializer.validated_data["first_name"].strip()
         last_name = serializer.validated_data["last_name"].strip()
         full_name = f"{first_name} {last_name}".strip()
-        username = _generate_unique_username(full_name, email=invite.email or "", prefix="tenant")
+        username = _generate_unique_username(
+            full_name, email=invite.email or "", prefix="tenant")
 
         with transaction.atomic():
             user = User.objects.create(
@@ -1282,17 +1352,45 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         return Response({"detail": "Invite accepted.", "name": _display_name(user), "created": created})
 
 
+class LandlordSettingsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _get_settings(self, user):
+        defaults = {"business_name": user.get_full_name().strip()
+                    or user.username}
+        settings_obj, _ = LandlordSettings.objects.get_or_create(
+            user=user, defaults=defaults)
+        return settings_obj
+
+    def get(self, request):
+        if get_role(request.user) != Profile.ROLE_LANDLORD and not request.user.is_staff:
+            return Response({"detail": "Landlord only endpoint."}, status=403)
+        settings_obj = self._get_settings(request.user)
+        return Response(LandlordSettingsSerializer(settings_obj).data)
+
+    def patch(self, request):
+        if get_role(request.user) != Profile.ROLE_LANDLORD and not request.user.is_staff:
+            return Response({"detail": "Landlord only endpoint."}, status=403)
+        settings_obj = self._get_settings(request.user)
+        serializer = LandlordSettingsSerializer(
+            settings_obj, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
 class STKInitiateView(APIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [STKInitiateRateThrottle]
 
     def post(self, request):
         if _get_role(request.user) != Profile.ROLE_TENANT:
             return Response({"detail": "Unauthorized request."}, status=403)
 
-        missing_env_vars = _missing_daraja_env_vars()
+        missing_env_vars = _missing_intasend_env_vars()
         if missing_env_vars:
             logger.warning(
-                "M-Pesa initiate blocked: missing env vars %s",
+                "M-Pesa initiate blocked: missing IntaSend env vars %s",
                 missing_env_vars,
             )
             return Response(
@@ -1302,15 +1400,6 @@ class STKInitiateView(APIView):
                 },
                 status=503,
             )
-
-        callback_url_error = _daraja_callback_url_error()
-        if callback_url_error:
-            logger.warning(
-                "M-Pesa initiate blocked: %s (callback=%s)",
-                callback_url_error,
-                os.getenv("MPESA_CALLBACK_URL", "").strip(),
-            )
-            return Response({"detail": callback_url_error}, status=503)
 
         serializer = STKInitiateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1324,30 +1413,96 @@ class STKInitiateView(APIView):
 
         period = _current_period()
         billing_period = current_billing_period()
-        _validate_payment_amount(lease, serializer.validated_data["amount"], billing_period)
-        payment = PaymentTransaction.objects.create(
-            lease=lease,
-            tenant=request.user,
-            period=period,
-            billing_period=billing_period,
-            phone_number=serializer.validated_data["phone_number"],
-            amount=serializer.validated_data["amount"],
-            payment_method=PaymentTransaction.METHOD_MPESA,
-            status=PaymentTransaction.STATUS_PENDING,
-        )
+        requested_amount = serializer.validated_data["amount"]
+        wallet_applied = Decimal("0.00")
+        wallet_payment = None
+        payment = None
 
-        result = _daraja_stk_push(payment.phone_number, payment.amount, f"LEASE-{lease.id}")
-        if not result:
+        with transaction.atomic():
+            lease = (
+                Lease.objects.select_for_update()
+                .select_related("tenant", "unit", "unit__property")
+                .get(pk=lease.pk)
+            )
+            _validate_payment_amount(lease, requested_amount, billing_period)
+
+            tenant_profile, _ = Profile.objects.get_or_create(
+                user=request.user)
+            Profile.objects.select_for_update().get(pk=tenant_profile.pk)
+
+            landlord_balance, _ = LandlordBalance.objects.get_or_create(
+                landlord=lease.unit.property.landlord
+            )
+            LandlordBalance.objects.select_for_update().get(pk=landlord_balance.pk)
+
+            # Wallet credits are balance-based, so they reduce rent immediately
+            # before we decide whether an STK push is still needed.
+            wallet_applied = _apply_wallet_to_current_rent(lease)
+            remaining_balance = max(
+                compute_lease_rent_status(
+                    lease,
+                    period=period,
+                    today=timezone.localdate(),
+                ).get("balance", Decimal("0.00")),
+                Decimal("0.00"),
+            )
+
+            if remaining_balance <= 0:
+                wallet_payment = (
+                    PaymentTransaction.objects.filter(
+                        lease=lease,
+                        tenant=request.user,
+                        amount=wallet_applied,
+                        status=PaymentTransaction.STATUS_SUCCESS,
+                        allocation_done=True,
+                        result_desc="Auto wallet rent debit",
+                    )
+                    .order_by("-created_at")
+                    .first()
+                )
+            else:
+                payment = PaymentTransaction.objects.create(
+                    lease=lease,
+                    tenant=request.user,
+                    period=period,
+                    billing_period=billing_period,
+                    phone_number=serializer.validated_data["phone_number"],
+                    amount=min(requested_amount, remaining_balance),
+                    payment_method=PaymentTransaction.METHOD_MPESA,
+                    status=PaymentTransaction.STATUS_PENDING,
+                )
+
+        if wallet_payment is not None:
+            return Response(
+                {
+                    "detail": "Rent was fully covered by wallet credit.",
+                    "payment": PaymentTransactionSerializer(wallet_payment).data,
+                    "wallet_applied": wallet_applied,
+                },
+                status=200,
+            )
+
+        result = intasend_stk_push(
+            payment.phone_number, payment.amount, f"LEASE-{lease.id}")
+        if not result.get("success"):
             payment.status = PaymentTransaction.STATUS_FAILED
-            payment.result_desc = "Payment failed. Please try again."
+            payment.result_desc = result.get(
+                "error") or "Payment failed. Please try again."
             payment.save(update_fields=["status", "result_desc"])
-            return Response({"detail": "Payment failed. Please try again."}, status=502)
+            return Response({"detail": payment.result_desc}, status=502)
 
-        payment.merchant_request_id = result.get("MerchantRequestID")
-        payment.checkout_request_id = result.get("CheckoutRequestID")
-        payment.result_code = result.get("ResponseCode")
-        payment.result_desc = result.get("ResponseDescription")
-        payment.save(update_fields=["merchant_request_id", "checkout_request_id", "result_code", "result_desc"])
+        invoice_id = str(result.get("invoice_id") or "").strip()
+        if not invoice_id:
+            payment.status = PaymentTransaction.STATUS_FAILED
+            payment.result_desc = "IntaSend did not return an invoice id."
+            payment.save(update_fields=["status", "result_desc"])
+            return Response({"detail": payment.result_desc}, status=502)
+
+        payment.merchant_request_id = invoice_id
+        payment.checkout_request_id = invoice_id
+        payment.result_desc = "STK push initiated."
+        payment.save(update_fields=[
+                     "merchant_request_id", "checkout_request_id", "result_desc"])
 
         return Response({"detail": "STK push initiated.", "payment": PaymentTransactionSerializer(payment).data}, status=201)
 
@@ -1357,69 +1512,127 @@ class STKCallbackView(APIView):
     authentication_classes = []
 
     def post(self, request):
-        body = request.data.get("Body", {})
-        callback = body.get("stkCallback", {})
-        checkout_request_id = callback.get("CheckoutRequestID")
-        result_code = callback.get("ResultCode")
-        result_desc = callback.get("ResultDesc")
-        items = callback.get("CallbackMetadata", {}).get("Item", [])
+        raw_body = request.body or b""
+        signature = request.META.get("HTTP_X_INTASEND_SIGNATURE", "")
 
-        metadata = {item.get("Name"): item.get("Value") for item in items if "Name" in item}
-        mpesa_receipt = metadata.get("MpesaReceiptNumber")
-        transaction_date = metadata.get("TransactionDate")
+        # IntaSend signs the exact raw webhook body, so verify that before trusting
+        # any parsed fields from the callback payload.
+        if not _verify_intasend_signature(raw_body, signature):
+            logger.warning(
+                "Rejected IntaSend callback due to invalid signature.")
+            return Response({"detail": "Invalid signature."}, status=400)
 
-        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_request_id).first()
-        if not payment:
-            logger.warning("Unmatched STK callback received", extra={"checkout_request_id": checkout_request_id})
-            return Response({"detail": "No matching payment."}, status=404)
+        try:
+            payload = request.data if isinstance(request.data, dict) else {}
+        except Exception:
+            logger.warning(
+                "Rejected IntaSend callback because the JSON payload could not be parsed.")
+            return Response({"detail": "Invalid payload."})
 
-        if payment.status != PaymentTransaction.STATUS_PENDING:
-            logger.info(
-                "Duplicate STK callback ignored",
-                extra={
-                    "payment_id": payment.id,
-                    "checkout_request_id": checkout_request_id,
-                    "current_status": payment.status,
-                    "incoming_result_code": result_code,
-                },
+        try:
+            invoice = payload.get("invoice") or {}
+            invoice_id = payload.get("invoice_id") or invoice.get("invoice_id")
+            state = str(payload.get("state") or "").upper()
+
+            if not invoice_id:
+                logger.warning("IntaSend callback missing invoice id.", extra={
+                               "payload": payload})
+                return Response({"detail": "Missing invoice id."})
+
+            payment = PaymentTransaction.objects.filter(
+                checkout_request_id=invoice_id).first()
+            if not payment:
+                logger.warning("Unmatched IntaSend callback received", extra={
+                               "invoice_id": invoice_id})
+                return Response({"detail": "No matching payment."})
+
+            # Webhooks can be retried, so once a payment leaves pending we intentionally
+            # skip all state transitions and side effects.
+            if payment.status != PaymentTransaction.STATUS_PENDING:
+                logger.info(
+                    "Duplicate IntaSend callback ignored",
+                    extra={
+                        "payment_id": payment.id,
+                        "invoice_id": invoice_id,
+                        "current_status": payment.status,
+                        "incoming_state": state,
+                    },
+                )
+                return Response({"detail": "Duplicate callback ignored."})
+
+            if state not in {"COMPLETE", "FAILED"}:
+                logger.info(
+                    "IntaSend callback ignored because state is not terminal yet.",
+                    extra={"payment_id": payment.id,
+                           "invoice_id": invoice_id, "state": state},
+                )
+                return Response({"detail": "Callback ignored."})
+
+            payment.raw_callback = payload
+            payment.result_code = 0 if state == "COMPLETE" else 1
+            payment.result_desc = state
+            payment.mpesa_receipt = invoice.get(
+                "mpesa_receipt") or payment.mpesa_receipt
+            payment.transaction_code = payment.mpesa_receipt or payment.transaction_code
+            payment.status = (
+                PaymentTransaction.STATUS_SUCCESS
+                if state == "COMPLETE"
+                else PaymentTransaction.STATUS_FAILED
             )
-            return Response({"detail": "Duplicate callback ignored."})
-
-        payment.raw_callback = request.data
-        payment.result_code = result_code
-        payment.result_desc = result_desc
-        payment.mpesa_receipt = mpesa_receipt
-        payment.transaction_code = mpesa_receipt or payment.transaction_code
-        if transaction_date:
-            try:
-                parsed = datetime.strptime(str(transaction_date), "%Y%m%d%H%M%S")
-                payment.transaction_date = timezone.make_aware(parsed, timezone.get_current_timezone())
-            except ValueError:
+            if state == "COMPLETE" and not payment.transaction_date:
                 payment.transaction_date = timezone.now()
 
-        payment.status = PaymentTransaction.STATUS_SUCCESS if result_code == 0 else PaymentTransaction.STATUS_FAILED
-        payment.save(
-            update_fields=["raw_callback", "result_code", "result_desc", "mpesa_receipt", "transaction_code", "transaction_date", "status"]
-        )
-        logger.info(
-            "STK callback transition processed",
-            extra={
-                "payment_id": payment.id,
-                "checkout_request_id": checkout_request_id,
-                "status": payment.status,
-                "result_code": result_code,
-            },
-        )
-        if payment.status == PaymentTransaction.STATUS_SUCCESS:
-            _allocate_success_payment(payment)
-            save_payment_receipt(payment)
-            tenant_profile = getattr(payment.tenant, "profile", None)
-            phone_number = getattr(tenant_profile, "phone_number", "") or payment.phone_number
-            if phone_number:
-                send_sms(
-                    phone_number,
-                    f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code or payment.id}",
-                )
+            update_fields = [
+                "raw_callback",
+                "result_code",
+                "result_desc",
+                "mpesa_receipt",
+                "transaction_code",
+                "status",
+            ]
+            if state == "COMPLETE" and payment.transaction_date:
+                update_fields.append("transaction_date")
+            payment.save(update_fields=update_fields)
+
+            logger.info(
+                "IntaSend callback transition processed",
+                extra={
+                    "payment_id": payment.id,
+                    "invoice_id": invoice_id,
+                    "status": payment.status,
+                    "state": state,
+                },
+            )
+
+            if payment.status == PaymentTransaction.STATUS_SUCCESS:
+                try:
+                    _allocate_success_payment(payment)
+                except Exception:
+                    logger.exception("Payment allocation failed after IntaSend success callback.", extra={
+                                     "payment_id": payment.id})
+
+                try:
+                    save_payment_receipt(payment)
+                except Exception:
+                    logger.exception("Receipt generation failed after IntaSend success callback.", extra={
+                                     "payment_id": payment.id})
+
+                tenant_profile = getattr(payment.tenant, "profile", None)
+                phone_number = getattr(
+                    tenant_profile, "phone_number", "") or payment.phone_number
+                if phone_number:
+                    try:
+                        send_sms(
+                            phone_number,
+                            f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code or payment.id}",
+                        )
+                    except Exception:
+                        logger.exception("SMS notification failed after IntaSend success callback.", extra={
+                                         "payment_id": payment.id})
+        except Exception:
+            logger.exception(
+                "Unexpected error while processing IntaSend callback.")
+
         return Response({"detail": "Callback processed."})
 
 
@@ -1427,7 +1640,8 @@ class MPesaPaymentStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, checkout_id):
-        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).select_related("lease", "lease__unit", "lease__unit__property", "tenant").first()
+        payment = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).select_related(
+            "lease", "lease__unit", "lease__unit__property", "tenant").first()
         if not payment:
             return Response({"detail": "Payment not found."}, status=404)
         if payment.tenant_id != request.user.id:
@@ -1450,7 +1664,8 @@ class PayPalCreateOrderView(APIView):
 
         lease_id = request.data.get("lease_id")
         amount = request.data.get("amount")
-        lease = Lease.objects.filter(pk=lease_id).select_related("unit", "unit__property", "tenant").first()
+        lease = Lease.objects.filter(pk=lease_id).select_related(
+            "unit", "unit__property", "tenant").first()
         try:
             _assert_active_lease(lease, request.user)
         except PermissionDenied:
@@ -1461,10 +1676,13 @@ class PayPalCreateOrderView(APIView):
         billing_period = current_billing_period()
         _validate_payment_amount(lease, amount, billing_period)
 
-        order = paypal_create_order(amount, f"lease-{lease.id}-{_current_period()}")
+        order = paypal_create_order(
+            amount, f"lease-{lease.id}-{_current_period()}")
         if not order or order.get("error") or not order.get("id"):
-            detail = order.get("detail") if isinstance(order, dict) else "Payment failed. Please try again."
-            error_status = order.get("status", 502) if isinstance(order, dict) else 502
+            detail = order.get("detail") if isinstance(
+                order, dict) else "Payment failed. Please try again."
+            error_status = order.get(
+                "status", 502) if isinstance(order, dict) else 502
             return Response({"detail": detail}, status=error_status)
 
         payment = PaymentTransaction.objects.create(
@@ -1472,7 +1690,8 @@ class PayPalCreateOrderView(APIView):
             tenant=request.user,
             period=_current_period(),
             billing_period=billing_period,
-            phone_number=getattr(getattr(request.user, "profile", None), "phone_number", ""),
+            phone_number=getattr(
+                getattr(request.user, "profile", None), "phone_number", ""),
             amount=amount,
             payment_method=PaymentTransaction.METHOD_PAYPAL,
             paypal_order_id=order["id"],
@@ -1491,7 +1710,8 @@ class PayPalCaptureView(APIView):
             return Response({"detail": "Unauthorized request."}, status=403)
 
         order_id = request.data.get("order_id")
-        payment = PaymentTransaction.objects.filter(paypal_order_id=order_id, tenant=request.user).select_related("lease", "lease__unit", "lease__unit__property", "tenant").first()
+        payment = PaymentTransaction.objects.filter(paypal_order_id=order_id, tenant=request.user).select_related(
+            "lease", "lease__unit", "lease__unit__property", "tenant").first()
         if not payment:
             return Response({"detail": "Payment not found."}, status=404)
 
@@ -1504,24 +1724,28 @@ class PayPalCaptureView(APIView):
                 if isinstance(capture, dict) and capture.get("detail")
                 else "Payment failed. Please try again."
             )
-            payment.save(update_fields=["status", "raw_callback", "result_desc"])
+            payment.save(update_fields=[
+                         "status", "raw_callback", "result_desc"])
             return Response({"detail": payment.result_desc}, status=capture.get("status", 502) if isinstance(capture, dict) else 502)
 
         purchase_units = capture.get("purchase_units", [])
-        capture_rows = purchase_units[0].get("payments", {}).get("captures", []) if purchase_units else []
+        capture_rows = purchase_units[0].get("payments", {}).get(
+            "captures", []) if purchase_units else []
         capture_row = capture_rows[0] if capture_rows else {}
         payment.status = PaymentTransaction.STATUS_SUCCESS
         payment.transaction_code = capture_row.get("id") or order_id
         payment.result_desc = capture.get("status")
         payment.transaction_date = timezone.now()
         payment.raw_callback = capture
-        payment.save(update_fields=["status", "transaction_code", "result_desc", "transaction_date", "raw_callback"])
+        payment.save(update_fields=[
+                     "status", "transaction_code", "result_desc", "transaction_date", "raw_callback"])
         _allocate_success_payment(payment)
         save_payment_receipt(payment)
         profile = getattr(request.user, "profile", None)
         phone_number = getattr(profile, "phone_number", "")
         if phone_number:
-            send_sms(phone_number, f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code}")
+            send_sms(
+                phone_number, f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code}")
         return Response({"payment": PaymentTransactionSerializer(payment).data})
 
 
@@ -1538,7 +1762,8 @@ class StripeCreateIntentView(APIView):
 
         lease_id = request.data.get("lease_id")
         amount = request.data.get("amount")
-        lease = Lease.objects.filter(pk=lease_id).select_related("unit", "unit__property", "tenant").first()
+        lease = Lease.objects.filter(pk=lease_id).select_related(
+            "unit", "unit__property", "tenant").first()
         try:
             _assert_active_lease(lease, request.user)
         except PermissionDenied:
@@ -1574,7 +1799,8 @@ class StripeCreateIntentView(APIView):
             tenant=request.user,
             period=_current_period(),
             billing_period=billing_period,
-            phone_number=getattr(getattr(request.user, "profile", None), "phone_number", "") or "CARD",
+            phone_number=getattr(
+                getattr(request.user, "profile", None), "phone_number", "") or "CARD",
             amount=amount,
             payment_method=PaymentTransaction.METHOD_CARD,
             stripe_payment_intent_id=intent["id"],
@@ -1610,7 +1836,8 @@ class StripeWebhookView(APIView):
 
         try:
             if webhook_secret:
-                event = stripe.Webhook.construct_event(payload=payload, sig_header=signature, secret=webhook_secret)
+                event = stripe.Webhook.construct_event(
+                    payload=payload, sig_header=signature, secret=webhook_secret)
             else:
                 event = json.loads(payload.decode() or "{}")
         except (ValueError, stripe.error.SignatureVerificationError) as exc:
@@ -1638,12 +1865,14 @@ class StripeWebhookView(APIView):
             payment.transaction_date = timezone.now()
             payment.raw_callback = event
             payment.save(
-                update_fields=["status", "transaction_code", "result_desc", "transaction_date", "raw_callback"]
+                update_fields=["status", "transaction_code",
+                               "result_desc", "transaction_date", "raw_callback"]
             )
             _allocate_success_payment(payment)
             save_payment_receipt(payment)
             tenant_profile = getattr(payment.tenant, "profile", None)
-            phone_number = getattr(tenant_profile, "phone_number", "") or payment.phone_number
+            phone_number = getattr(
+                tenant_profile, "phone_number", "") or payment.phone_number
             if phone_number:
                 send_sms(
                     phone_number,
@@ -1655,7 +1884,8 @@ class StripeWebhookView(APIView):
                 intent.get("last_payment_error", {}) or {}
             ).get("message") or "Payment failed. Please try again."
             payment.raw_callback = event
-            payment.save(update_fields=["status", "result_desc", "raw_callback"])
+            payment.save(update_fields=[
+                         "status", "result_desc", "raw_callback"])
 
         return Response({"detail": "Webhook processed."})
 
@@ -1666,7 +1896,8 @@ class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         role = _get_role(self.request.user)
-        qs = PaymentTransaction.objects.select_related("lease", "lease__unit", "lease__unit__property", "tenant")
+        qs = PaymentTransaction.objects.select_related(
+            "lease", "lease__unit", "lease__unit__property", "tenant")
         if role == Profile.ROLE_TENANT:
             qs = qs.filter(tenant=self.request.user)
         elif role == Profile.ROLE_MANAGER:
@@ -1696,7 +1927,8 @@ def payments_arrears(request):
     period = request.query_params.get("period") or _current_period()
     today = timezone.localdate()
     rows = []
-    leases = Lease.objects.filter(status=Lease.STATUS_ACTIVE, unit__property__landlord=request.user).select_related("tenant", "unit", "unit__property")
+    leases = Lease.objects.filter(status=Lease.STATUS_ACTIVE, unit__property__landlord=request.user).select_related(
+        "tenant", "unit", "unit__property")
     for lease in leases:
         rent = compute_lease_rent_status(lease, period=period, today=today)
         if rent["status"] != "OVERDUE":
@@ -1723,7 +1955,8 @@ class PaymentReceiptView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
-        payment = PaymentTransaction.objects.filter(pk=pk).select_related("lease", "lease__unit", "lease__unit__property", "tenant").first()
+        payment = PaymentTransaction.objects.filter(pk=pk).select_related(
+            "lease", "lease__unit", "lease__unit__property", "tenant").first()
         if not payment:
             raise Http404("Payment not found.")
         if not _user_can_access_payment_receipt(request.user, payment):
@@ -1743,11 +1976,14 @@ class DocumentListView(APIView):
     def get(self, request):
         role = _get_role(request.user)
         if role == Profile.ROLE_LANDLORD:
-            docs = Document.objects.filter(property__landlord=request.user).select_related("property", "lease", "lease__unit", "uploaded_by", "tenant")
+            docs = Document.objects.filter(property__landlord=request.user).select_related(
+                "property", "lease", "lease__unit", "uploaded_by", "tenant")
         elif role == Profile.ROLE_MANAGER:
-            docs = Document.objects.filter(property__manager=request.user).select_related("property", "lease", "lease__unit", "uploaded_by", "tenant")
+            docs = Document.objects.filter(property__manager=request.user).select_related(
+                "property", "lease", "lease__unit", "uploaded_by", "tenant")
         elif role == Profile.ROLE_TENANT:
-            active_leases = Lease.objects.filter(tenant=request.user, status=Lease.STATUS_ACTIVE)
+            active_leases = Lease.objects.filter(
+                tenant=request.user, status=Lease.STATUS_ACTIVE)
             docs = Document.objects.filter(
                 Q(tenant=request.user)
                 | Q(lease__in=active_leases)
@@ -1802,7 +2038,8 @@ class DocumentDownloadView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
-        document = Document.objects.filter(pk=pk).select_related("property", "lease", "uploaded_by").first()
+        document = Document.objects.filter(pk=pk).select_related(
+            "property", "lease", "uploaded_by").first()
         if not document:
             raise Http404("Document not found.")
         if not _user_can_access_document(request.user, document):
@@ -1816,7 +2053,8 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         role = _get_role(self.request.user)
-        qs = MaintenanceRequest.objects.select_related("tenant", "lease", "lease__unit", "lease__unit__property")
+        qs = MaintenanceRequest.objects.select_related(
+            "tenant", "lease", "lease__unit", "lease__unit__property")
         if role == Profile.ROLE_TENANT:
             return qs.filter(tenant=self.request.user).order_by("-updated_at")
         if role == Profile.ROLE_MANAGER:
@@ -1828,7 +2066,8 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         role = _get_role(self.request.user)
         if role != Profile.ROLE_TENANT:
-            raise PermissionDenied("Only tenants can create maintenance requests")
+            raise PermissionDenied(
+                "Only tenants can create maintenance requests")
         lease = serializer.validated_data["lease"]
         if lease.tenant != self.request.user:
             raise PermissionDenied("Can only report for your lease")
@@ -1843,10 +2082,12 @@ class MaintenanceViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         role = _get_role(self.request.user)
         if role == Profile.ROLE_TENANT:
-            raise PermissionDenied("Tenants cannot update maintenance requests.")
+            raise PermissionDenied(
+                "Tenants cannot update maintenance requests.")
         changed_fields = set(self.request.data.keys())
         if changed_fields - {"status"}:
-            raise PermissionDenied("Only maintenance status updates are allowed.")
+            raise PermissionDenied(
+                "Only maintenance status updates are allowed.")
 
         previous_status = self.get_object().status
         updated = serializer.save()
@@ -1866,9 +2107,11 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         role = _get_role(self.request.user)
         if role == Profile.ROLE_LANDLORD:
-            scoped_properties = Property.objects.filter(landlord=self.request.user)
+            scoped_properties = Property.objects.filter(
+                landlord=self.request.user)
         elif role == Profile.ROLE_MANAGER:
-            scoped_properties = Property.objects.filter(manager=self.request.user)
+            scoped_properties = Property.objects.filter(
+                manager=self.request.user)
         else:
             return Tenant.objects.filter(user=self.request.user)
 
@@ -1876,14 +2119,17 @@ class TenantViewSet(viewsets.ReadOnlyModelViewSet):
             property__in=scoped_properties,
             status=TenantInvite.STATUS_ACCEPTED,
         )
-        invite_emails = [email for email in accepted_invites.values_list("email", flat=True) if email]
-        invite_phones = [phone for phone in accepted_invites.values_list("phone", flat=True) if phone]
+        invite_emails = [email for email in accepted_invites.values_list(
+            "email", flat=True) if email]
+        invite_phones = [phone for phone in accepted_invites.values_list(
+            "phone", flat=True) if phone]
 
         filters = Q(user__leases__unit__property__in=scoped_properties)
         if invite_emails:
             filters |= Q(user__email__in=invite_emails)
         if invite_phones:
-            filters |= Q(phone__in=invite_phones) | Q(user__profile__phone_number__in=invite_phones)
+            filters |= Q(phone__in=invite_phones) | Q(
+                user__profile__phone_number__in=invite_phones)
 
         return Tenant.objects.filter(filters).select_related("user").distinct().order_by("user__username")
 
@@ -1953,7 +2199,8 @@ class NotificationViewSet(mixins.ListModelMixin, mixins.UpdateModelMixin, mixins
 
         if send_email:
             if not _can_send_email():
-                warnings.append("Email skipped because SMTP is not configured.")
+                warnings.append(
+                    "Email skipped because SMTP is not configured.")
             else:
                 missing_email = 0
                 for recipient in recipients:
@@ -1964,15 +2211,18 @@ class NotificationViewSet(mixins.ListModelMixin, mixins.UpdateModelMixin, mixins
                         send_mail(
                             subject=title,
                             message=message,
-                            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                            from_email=getattr(
+                                settings, "DEFAULT_FROM_EMAIL", None),
                             recipient_list=[recipient.email],
                             fail_silently=False,
                         )
                         delivered["email"] += 1
                     except Exception as exc:  # pragma: no cover - env dependent
-                        logger.warning("Notification email delivery failed: %s", exc)
+                        logger.warning(
+                            "Notification email delivery failed: %s", exc)
                 if missing_email:
-                    warnings.append(f"Email skipped for {missing_email} recipient{'' if missing_email == 1 else 's'} without an email address.")
+                    warnings.append(
+                        f"Email skipped for {missing_email} recipient{'' if missing_email == 1 else 's'} without an email address.")
 
         if send_sms_selected:
             missing_phone = 0
@@ -1982,17 +2232,22 @@ class NotificationViewSet(mixins.ListModelMixin, mixins.UpdateModelMixin, mixins
                 if not phone_number:
                     missing_phone += 1
                     continue
-                sms_result = send_sms(phone_number, message, include_detail=True)
-                sms_ok = sms_result if isinstance(sms_result, bool) else sms_result.get("ok")
-                sms_detail = "" if isinstance(sms_result, bool) else sms_result.get("detail")
+                sms_result = send_sms(
+                    phone_number, message, include_detail=True)
+                sms_ok = sms_result if isinstance(
+                    sms_result, bool) else sms_result.get("ok")
+                sms_detail = "" if isinstance(
+                    sms_result, bool) else sms_result.get("detail")
                 if sms_ok:
                     delivered["sms"] += 1
                 else:
                     sms_failures.append(sms_detail or "SMS delivery failed.")
             if missing_phone:
-                warnings.append(f"SMS skipped for {missing_phone} recipient{'' if missing_phone == 1 else 's'} without a phone number.")
+                warnings.append(
+                    f"SMS skipped for {missing_phone} recipient{'' if missing_phone == 1 else 's'} without a phone number.")
             if sms_failures:
-                warnings.append(f"SMS failed for {len(sms_failures)} recipient{'' if len(sms_failures) == 1 else 's'}: {sms_failures[0]}")
+                warnings.append(
+                    f"SMS failed for {len(sms_failures)} recipient{'' if len(sms_failures) == 1 else 's'}: {sms_failures[0]}")
 
         any_delivery = delivered["in_app"] or delivered["email"] or delivered["sms"]
         if not any_delivery:
@@ -2011,7 +2266,8 @@ class NotificationViewSet(mixins.ListModelMixin, mixins.UpdateModelMixin, mixins
             detail_parts.append(" ".join(warnings))
 
         return Response(
-            {"detail": " ".join(detail_parts), "count": count, "delivery": delivered},
+            {"detail": " ".join(detail_parts), "count": count,
+             "delivery": delivered},
             status=status.HTTP_201_CREATED,
         )
 
@@ -2019,7 +2275,8 @@ class NotificationViewSet(mixins.ListModelMixin, mixins.UpdateModelMixin, mixins
 @api_view(["PATCH", "POST"])
 @permission_classes([IsAuthenticated])
 def notifications_read_all(request):
-    Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+    Notification.objects.filter(
+        user=request.user, is_read=False).update(is_read=True)
     return Response({"detail": "Notifications marked as read."})
 
 
@@ -2044,8 +2301,10 @@ def tenant_dashboard(request):
 
     period = _current_period()
     rent = compute_lease_rent_status(lease, period=period)
-    recent_payments = PaymentTransaction.objects.filter(tenant=request.user).order_by("-created_at")[:5]
-    open_maintenance = MaintenanceRequest.objects.filter(tenant=request.user).exclude(status=MaintenanceRequest.STATUS_RESOLVED).order_by("-updated_at")
+    recent_payments = PaymentTransaction.objects.filter(
+        tenant=request.user).order_by("-created_at")[:5]
+    open_maintenance = MaintenanceRequest.objects.filter(tenant=request.user).exclude(
+        status=MaintenanceRequest.STATUS_RESOLVED).order_by("-updated_at")
     return Response(
         {
             "rent_status": rent["status"],
@@ -2068,7 +2327,8 @@ def landlord_dashboard(request):
     today = timezone.localdate()
     properties = Property.objects.filter(landlord=request.user)
     units = Unit.objects.filter(property__landlord=request.user)
-    leases = Lease.objects.filter(status=Lease.STATUS_ACTIVE, unit__property__landlord=request.user).select_related("tenant", "unit", "unit__property")
+    leases = Lease.objects.filter(status=Lease.STATUS_ACTIVE, unit__property__landlord=request.user).select_related(
+        "tenant", "unit", "unit__property")
     payments = PaymentTransaction.objects.filter(
         lease__unit__property__landlord=request.user,
         status=PaymentTransaction.STATUS_SUCCESS,
@@ -2117,23 +2377,36 @@ def landlord_dashboard(request):
 @permission_classes([IsAuthenticated])
 def dashboard_summary(request):
     role = _get_role(request.user)
-    period = request.query_params.get("period") or timezone.localdate().strftime("%Y-%m")
+    period = request.query_params.get(
+        "period") or timezone.localdate().strftime("%Y-%m")
 
     if role == Profile.ROLE_TENANT:
         lease = (
-            Lease.objects.filter(tenant=request.user, status=Lease.STATUS_ACTIVE)
+            Lease.objects.filter(tenant=request.user,
+                                 status=Lease.STATUS_ACTIVE)
             .select_related("unit", "unit__property")
             .first()
         )
         if not lease:
             return Response({"active_lease": None, "rent": {}, "payments": [], "maintenance": [], "show_overdue_banner": False})
         rent = compute_lease_rent_status(lease, period=period)
-        payments = PaymentTransaction.objects.filter(tenant=request.user).order_by("-created_at")[:10]
-        maintenance = MaintenanceRequest.objects.filter(tenant=request.user).order_by("-updated_at")[:10]
+        profile = Profile.objects.filter(
+            user=request.user).only("wallet_available").first()
+        rent = _wallet_aware_rent_status(
+            lease,
+            rent,
+            getattr(profile, "wallet_available", Decimal("0.00")),
+        )
+        payments = PaymentTransaction.objects.filter(
+            tenant=request.user).order_by("-created_at")[:10]
+        maintenance = MaintenanceRequest.objects.filter(
+            tenant=request.user).order_by("-updated_at")[:10]
+        active_lease = LeaseSerializer(lease, context={"period": period}).data
+        active_lease["rent_status"] = rent
         return Response(
             {
                 "period": period,
-                "active_lease": LeaseSerializer(lease, context={"period": period}).data,
+                "active_lease": active_lease,
                 "rent": rent,
                 "payments": PaymentTransactionSerializer(payments, many=True).data,
                 "maintenance": MaintenanceRequestSerializer(maintenance, many=True).data,
@@ -2173,11 +2446,14 @@ def dashboard_summary(request):
             }
         )
 
-    maintenance_qs = MaintenanceRequest.objects.select_related("tenant", "lease", "lease__unit", "lease__unit__property")
+    maintenance_qs = MaintenanceRequest.objects.select_related(
+        "tenant", "lease", "lease__unit", "lease__unit__property")
     if role == Profile.ROLE_MANAGER:
-        maintenance_qs = maintenance_qs.filter(lease__unit__property__manager=request.user)
+        maintenance_qs = maintenance_qs.filter(
+            lease__unit__property__manager=request.user)
     elif role == Profile.ROLE_LANDLORD:
-        maintenance_qs = maintenance_qs.filter(lease__unit__property__landlord=request.user)
+        maintenance_qs = maintenance_qs.filter(
+            lease__unit__property__landlord=request.user)
 
     return Response(
         {
@@ -2197,7 +2473,8 @@ class WalletView(APIView):
             return Response({"detail": "Tenant only endpoint"}, status=403)
         profile, _ = Profile.objects.get_or_create(user=request.user)
         _unlock_wallet(profile)
-        recent = LedgerTransaction.objects.filter(user=request.user, kind__startswith="WALLET").order_by("-created_at")[:20]
+        recent = LedgerTransaction.objects.filter(
+            user=request.user, kind__startswith="WALLET").order_by("-created_at")[:20]
         pending_withdrawals = LedgerTransaction.objects.filter(
             user=request.user,
             kind=LedgerTransaction.KIND_WALLET_WITHDRAW_REQUEST,
@@ -2224,21 +2501,28 @@ class WalletWithdrawView(APIView):
         amount = serializer.validated_data["amount"]
         if amount <= 0:
             return Response({"detail": "Amount must be greater than zero"}, status=400)
-        profile, _ = Profile.objects.get_or_create(user=request.user)
-        _unlock_wallet(profile)
-        if amount > profile.wallet_available:
-            return Response({"detail": "Insufficient wallet balance"}, status=400)
 
-        profile.wallet_available -= amount
-        profile.save(update_fields=["wallet_available", "updated_at"])
-        row = LedgerTransaction.objects.create(
-            user=request.user,
-            kind=LedgerTransaction.KIND_WALLET_WITHDRAW_REQUEST,
-            amount=amount,
-            status=LedgerTransaction.STATUS_PENDING,
-            available_at=timezone.now() + timedelta(days=WALLET_WITHDRAW_HOLD_DAYS),
-            reference_text="Withdrawals are processed after 7 days",
-        )
+        allowed, message = can_withdraw_wallet(request.user, amount)
+        if not allowed:
+            return Response({"detail": message}, status=400)
+
+        with transaction.atomic():
+            profile, _ = Profile.objects.get_or_create(user=request.user)
+            profile = Profile.objects.select_for_update().get(pk=profile.pk)
+            _unlock_wallet(profile)
+            if amount > profile.wallet_available:
+                return Response({"detail": "Insufficient wallet balance"}, status=400)
+
+            profile.wallet_available -= amount
+            profile.save(update_fields=["wallet_available", "updated_at"])
+            row = LedgerTransaction.objects.create(
+                user=request.user,
+                kind=LedgerTransaction.KIND_WALLET_WITHDRAW_REQUEST,
+                amount=amount,
+                status=LedgerTransaction.STATUS_PENDING,
+                available_at=timezone.now() + timedelta(days=WALLET_WITHDRAW_HOLD_DAYS),
+                reference_text="Withdrawals are processed after 7 days",
+            )
         return Response(LedgerTransactionSerializer(row).data, status=201)
 
 
@@ -2272,9 +2556,11 @@ class LandlordPayoutsView(APIView):
     def get(self, request):
         if _get_role(request.user) != Profile.ROLE_LANDLORD:
             return Response({"detail": "Landlord only endpoint"}, status=403)
-        balance, _ = LandlordBalance.objects.get_or_create(landlord=request.user)
+        balance, _ = LandlordBalance.objects.get_or_create(
+            landlord=request.user)
         _unlock_landlord(balance)
-        payouts = LandlordPayout.objects.filter(landlord=request.user).order_by("-created_at")
+        payouts = LandlordPayout.objects.filter(
+            landlord=request.user).order_by("-created_at")
         return Response(
             {
                 "available_balance": balance.available_balance,
@@ -2287,6 +2573,7 @@ class LandlordPayoutsView(APIView):
 class LandlordPayoutRequestView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request):
         if _get_role(request.user) != Profile.ROLE_LANDLORD:
             return Response({"detail": "Landlord only endpoint"}, status=403)
@@ -2296,11 +2583,15 @@ class LandlordPayoutRequestView(APIView):
         if amount <= 0:
             return Response({"detail": "Amount must be greater than zero"}, status=400)
 
-        balance, _ = LandlordBalance.objects.get_or_create(landlord=request.user)
+        balance, _ = LandlordBalance.objects.get_or_create(
+            landlord=request.user)
+        balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
         _unlock_landlord(balance)
         if amount > balance.available_balance:
             return Response({"detail": "Insufficient available balance"}, status=400)
 
+        # Deduct while holding the balance row lock so concurrent payout requests
+        # cannot overspend the available landlord balance.
         balance.available_balance -= amount
         balance.save(update_fields=["available_balance", "updated_at"])
         payout = LandlordPayout.objects.create(
@@ -2308,16 +2599,43 @@ class LandlordPayoutRequestView(APIView):
             amount=amount,
             method=serializer.validated_data["method"],
             destination=serializer.validated_data["destination"],
+            bank_code=serializer.validated_data.get("bank_code"),
             status=LandlordPayout.STATUS_PENDING,
         )
-        LedgerTransaction.objects.create(
+        ledger_row = LedgerTransaction.objects.create(
             user=request.user,
             kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
             amount=amount,
             status=LedgerTransaction.STATUS_PENDING,
             reference_text=f"payout:{payout.id}",
         )
-        return Response(LandlordPayoutSerializer(payout).data, status=201)
+
+        result = execute_intasend_payout(payout)
+        if result.get("success"):
+            payout.status = LandlordPayout.STATUS_PAID
+            payout.paid_at = timezone.now()
+            payout.save(update_fields=["status", "paid_at"])
+
+            ledger_row.status = LedgerTransaction.STATUS_PAID
+            ledger_row.save(update_fields=["status"])
+            LedgerTransaction.objects.create(
+                user=request.user,
+                kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_PAID,
+                amount=amount,
+                status=LedgerTransaction.STATUS_PAID,
+                reference_text=f"payout:{payout.id}",
+            )
+            return Response(LandlordPayoutSerializer(payout).data, status=201)
+
+        balance.available_balance += amount
+        balance.save(update_fields=["available_balance", "updated_at"])
+        payout.status = LandlordPayout.STATUS_FAILED
+        payout.save(update_fields=["status"])
+        ledger_row.status = LedgerTransaction.STATUS_REJECTED
+        error_note = str(result.get("error") or "failed")[:200]
+        ledger_row.reference_text = f"payout:{payout.id};error:{error_note}"
+        ledger_row.save(update_fields=["status", "reference_text"])
+        return Response({"detail": result.get("error") or "Payout failed."}, status=502)
 
 
 class LandlordPayoutMarkPaidView(APIView):
@@ -2329,12 +2647,17 @@ class LandlordPayoutMarkPaidView(APIView):
         payout = LandlordPayout.objects.filter(pk=pk).first()
         if not payout:
             return Response({"detail": "Payout not found"}, status=404)
+        if payout.status == LandlordPayout.STATUS_PAID:
+            return Response({"detail": "Payout already marked paid."})
+        if payout.status != LandlordPayout.STATUS_PENDING:
+            return Response({"detail": "Only pending payouts can be marked paid."}, status=400)
         payout.status = LandlordPayout.STATUS_PAID
         payout.paid_at = timezone.now()
         payout.save(update_fields=["status", "paid_at"])
         logger.info(
             "Landlord payout marked as paid",
-            extra={"payout_id": payout.id, "landlord_id": payout.landlord_id, "amount": str(payout.amount)},
+            extra={"payout_id": payout.id, "landlord_id": payout.landlord_id,
+                   "amount": str(payout.amount)},
         )
         LedgerTransaction.objects.create(
             user=payout.landlord,
@@ -2371,7 +2694,8 @@ def landlord_revenue(request):
         lease__unit__property__landlord=request.user,
         status=PaymentTransaction.STATUS_SUCCESS,
     )
-    lifetime_gross = all_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    lifetime_gross = all_payments.aggregate(total=Sum("amount"))[
+        "total"] or Decimal("0.00")
     payload["lifetime"] = {
         "gross_collected": lifetime_gross,
         "net_amount": lifetime_gross,
@@ -2402,7 +2726,8 @@ def landlord_followups(request):
     if _get_role(request.user) != Profile.ROLE_LANDLORD:
         return Response({"detail": "Landlord only endpoint"}, status=403)
 
-    period = request.GET.get("period") or timezone.localdate().strftime("%Y-%m")
+    period = request.GET.get(
+        "period") or timezone.localdate().strftime("%Y-%m")
     leases = Lease.objects.filter(
         status=Lease.STATUS_ACTIVE,
         unit__property__landlord=request.user,

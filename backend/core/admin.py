@@ -108,9 +108,9 @@ class LedgerTransactionAdmin(admin.ModelAdmin):
 
 @admin.register(LandlordPayout)
 class LandlordPayoutAdmin(admin.ModelAdmin):
-    list_display = ("landlord", "amount", "method", "destination", "status", "created_at", "paid_at")
+    list_display = ("landlord", "amount", "method", "destination", "bank_code", "status", "created_at", "paid_at")
     list_filter = ("status", "method", "created_at")
-    search_fields = ("landlord__username", "landlord__email", "destination")
+    search_fields = ("landlord__username", "landlord__email", "destination", "bank_code")
 
 
 @admin.register(MaintenanceRequest)

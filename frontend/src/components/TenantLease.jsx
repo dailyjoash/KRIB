@@ -14,7 +14,7 @@ export default function TenantLease() {
         const res = await api.get("/api/dashboard/summary/");
         setSummary(res.data);
       } catch {
-        setError("Failed to load current booking details.");
+        setError("Failed to load current lease details.");
         setSummary({ active_lease: null, rent: {} });
       }
     };
@@ -47,13 +47,13 @@ export default function TenantLease() {
         <div className="resident-section-head">
           <div className="resident-title-row">
             <Building2 size={20} />
-            <h2>Current Booking</h2>
+            <h2>Current Lease</h2>
           </div>
           {lease ? <StatusBadge status={lease.status} /> : null}
         </div>
 
         {!lease ? (
-          <p className="subtitle">No active booking yet.</p>
+          <p className="subtitle">No active lease yet.</p>
         ) : (
           <div className="resident-profile-columns">
             {bookingRows.map((row) => (

@@ -139,7 +139,7 @@ export default function TenantPayRent() {
         <div className="payment-panel">
           <label className="resident-field">
             <span>M-Pesa phone number</span>
-            <input value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="2547..." />
+            <input value={phone} onChange={(e) => setPhone(e.target.value)} />
           </label>
           <label className="resident-field">
             <span>Amount to pay</span>
@@ -149,7 +149,6 @@ export default function TenantPayRent() {
               step="0.01"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
-              placeholder="Enter amount"
             />
           </label>
           <button className="resident-primary-btn" type="button" onClick={handleMpesaPay} disabled={loading}>

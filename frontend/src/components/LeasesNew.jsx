@@ -28,7 +28,7 @@ export default function LeasesNew() {
     tenant_id: "",
     start_date: "",
     end_date: "",
-    due_day: 5,
+    due_day: "",
   });
   const [identityDocument, setIdentityDocument] = useState(null);
   const [identityPreviewUrl, setIdentityPreviewUrl] = useState("");
@@ -78,7 +78,7 @@ export default function LeasesNew() {
     if (identityPreviewUrl) {
       window.URL.revokeObjectURL(identityPreviewUrl);
     }
-    setForm({ unit_id: "", tenant_id: "", start_date: "", end_date: "", due_day: 5 });
+    setForm({ unit_id: "", tenant_id: "", start_date: "", end_date: "", due_day: "" });
     setIdentityDocument(null);
     setIdentityPreviewUrl("");
     setTenantSignature("");
@@ -187,7 +187,7 @@ export default function LeasesNew() {
           <label className="resident-field">
             <span>Available unit</span>
             <select name="unit_id" value={form.unit_id} onChange={(e) => setForm({ ...form, unit_id: e.target.value })} required disabled={loading}>
-              <option value="">Select unit</option>
+              <option value="" hidden></option>
               {availableUnits.map((unit) => (
                 <option key={unit.id} value={unit.id}>
                   {unit.property?.name} / Unit {unit.unit_number} / {formatKES(unit.rent_amount)}
@@ -199,7 +199,7 @@ export default function LeasesNew() {
             <label className="resident-field">
               <span>Tenant</span>
               <select name="tenant_id" value={form.tenant_id} onChange={(e) => setForm({ ...form, tenant_id: e.target.value })} required disabled={loading}>
-                <option value="">Select tenant</option>
+                <option value="" hidden></option>
                 {tenants.map((tenant) => (
                 <option key={tenant.id} value={tenant.user?.id}>
                   {tenant.user?.username} {tenant.user?.email ? `(${tenant.user.email})` : ""}
@@ -270,11 +270,11 @@ export default function LeasesNew() {
               <div className="lease-preview-grid">
                 <div>
                   <span>Tenant</span>
-                  <strong>{selectedTenant?.user?.username || "Select tenant"}</strong>
+                  <strong>{selectedTenant?.user?.username || "-"}</strong>
                 </div>
                 <div>
                   <span>Property / Unit</span>
-                  <strong>{selectedUnit ? `${selectedUnit.property?.name} / ${selectedUnit.unit_number}` : "Select unit"}</strong>
+                  <strong>{selectedUnit ? `${selectedUnit.property?.name} / ${selectedUnit.unit_number}` : "-"}</strong>
                 </div>
                 <div>
                   <span>Monthly Rent</span>

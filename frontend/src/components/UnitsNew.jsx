@@ -9,7 +9,7 @@ import { PageLayout, SectionCard, StatCard } from "./ui";
 export default function UnitsNew() {
   const [properties, setProperties] = useState([]);
   const [units, setUnits] = useState([]);
-  const [form, setForm] = useState({ property_id: "", unit_number: "", unit_type: "single", rent_amount: "", deposit: "" });
+  const [form, setForm] = useState({ property_id: "", unit_number: "", unit_type: "", rent_amount: "", deposit: "" });
   const [error, setError] = useState("");
 
   const load = async () => {
@@ -31,7 +31,7 @@ export default function UnitsNew() {
     setError("");
     try {
       await api.post("/api/units/", form);
-      setForm({ property_id: "", unit_number: "", unit_type: "single", rent_amount: "", deposit: "" });
+      setForm({ property_id: "", unit_number: "", unit_type: "", rent_amount: "", deposit: "" });
       await load();
     } catch (err) {
       setError(getErrorMessage(err, "Failed to add unit."));
@@ -60,17 +60,18 @@ export default function UnitsNew() {
           <label className="resident-field">
             <span>Property</span>
             <select value={form.property_id} onChange={(e) => setForm({ ...form, property_id: e.target.value })} required>
-              <option value="">Select property</option>
+              <option value="" hidden></option>
               {properties.map((property) => <option key={property.id} value={property.id}>{property.name}</option>)}
             </select>
           </label>
           <label className="resident-field">
             <span>Unit number</span>
-            <input value={form.unit_number} onChange={(e) => setForm({ ...form, unit_number: e.target.value })} placeholder="A-01" required />
+            <input value={form.unit_number} onChange={(e) => setForm({ ...form, unit_number: e.target.value })} required />
           </label>
           <label className="resident-field">
             <span>Unit type</span>
-            <select value={form.unit_type} onChange={(e) => setForm({ ...form, unit_type: e.target.value })}>
+            <select value={form.unit_type} onChange={(e) => setForm({ ...form, unit_type: e.target.value })} required>
+              <option value="" hidden></option>
               <option value="single">Single</option>
               <option value="bedsitter">Bedsitter</option>
               <option value="1br">1BR</option>

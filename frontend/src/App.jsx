@@ -136,7 +136,7 @@ export default function App() {
       <Route
         path="/tenant/lease"
         element={(
-          <ProtectedPage allowedRoles={["tenant"]} title="Current Booking" subtitle="Tenant view">
+          <ProtectedPage allowedRoles={["tenant"]} title="Current Lease" subtitle="Tenant view">
             <TenantLease />
           </ProtectedPage>
         )}
@@ -255,6 +255,14 @@ export default function App() {
 
       <Route
         path="/landlord/setup"
+        element={(
+          <ProtectedPage allowedRoles={["landlord"]} title="Properties" subtitle="Create properties, units, and assignments">
+            <LandlordSetup />
+          </ProtectedPage>
+        )}
+      />
+      <Route
+        path="/setup"
         element={(
           <ProtectedPage allowedRoles={["landlord"]} title="Properties" subtitle="Create properties, units, and assignments">
             <LandlordSetup />

@@ -10,6 +10,21 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: krib_db
+          MYSQL_USER: krib_user
+          MYSQL_PASSWORD: krib_password
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout
@@ -32,11 +47,14 @@ jobs:
 
       - name: Run backend tests
         working-directory: backend
+        env:
+          DATABASE_URL: mysql://krib_user:krib_password@127.0.0.1:3306/krib_db
         run: python manage.py test
 
       - name: Run Django deploy checks
         working-directory: backend
         env:
+          DATABASE_URL: mysql://krib_user:krib_password@127.0.0.1:3306/krib_db
           DJANGO_DEBUG: "0"
           DJANGO_SECRET_KEY: "12345678901234567890123456789012345678901234567890"
           DJANGO_ALLOWED_HOSTS: "example.com"

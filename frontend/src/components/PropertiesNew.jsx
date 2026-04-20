@@ -23,9 +23,9 @@ export default function PropertiesNew(){
     <div className='card'>
       <h3>Add Property</h3>
       <form onSubmit={submit}>
-        <input placeholder='Title' value={title} onChange={e=>setTitle(e.target.value)} />
-        <input placeholder='Address' value={address} onChange={e=>setAddress(e.target.value)} />
-        <textarea placeholder='Description' value={description} onChange={e=>setDescription(e.target.value)} />
+        <input aria-label='Title' value={title} onChange={e=>setTitle(e.target.value)} />
+        <input aria-label='Address' value={address} onChange={e=>setAddress(e.target.value)} />
+        <textarea aria-label='Description' value={description} onChange={e=>setDescription(e.target.value)} />
         <button type='submit'>Create</button>
       </form>
     </div>

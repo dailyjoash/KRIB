@@ -12,19 +12,13 @@ const buildInviteUrl = (invite) => {
   return token ? `${window.location.origin}/invite/tenant/${token}` : "";
 };
 
-const createDefaultExpiry = () => {
-  const next = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-  const shifted = new Date(next.getTime() - next.getTimezoneOffset() * 60 * 1000);
-  return shifted.toISOString().slice(0, 16);
-};
-
 const createDefaultForm = () => ({
   full_name: "",
   email: "",
   phone: "",
   property: "",
   unit: "",
-  expires_at: createDefaultExpiry(),
+  expires_at: "",
 });
 
 const resolveInviteStatus = (invite) => {
@@ -77,8 +71,8 @@ export default function InvitesNew() {
     setSuccess("");
     try {
       const payload = { ...form };
-      if (!payload.property) delete payload.property;
-      if (!payload.unit) delete payload.unit;
+      if (!payload.property || payload.property === "__none") delete payload.property;
+      if (!payload.unit || payload.unit === "__none") delete payload.unit;
       if (!payload.expires_at) delete payload.expires_at;
       const res = await api.post("/api/invites/", payload);
       setCreatedLink(buildInviteUrl(res.data));
@@ -143,7 +137,7 @@ export default function InvitesNew() {
     [units]
   );
   const filteredUnits = useMemo(
-    () => (!form.property ? units : units.filter((unit) => String(unit.property?.id || unit.property) === String(form.property))),
+    () => (!(form.property && form.property !== "__none") ? units : units.filter((unit) => String(unit.property?.id || unit.property) === String(form.property))),
     [form.property, units]
   );
 
@@ -182,15 +176,15 @@ export default function InvitesNew() {
         <form className="resident-form-grid" onSubmit={submit}>
           <label className="resident-field">
             <span>Tenant name</span>
-            <input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} placeholder="Full name" required />
+            <input value={form.full_name} onChange={(e) => setForm({ ...form, full_name: e.target.value })} required />
           </label>
           <label className="resident-field">
             <span>Email</span>
-            <input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Email address" />
+            <input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
           </label>
           <label className="resident-field">
             <span>Phone</span>
-            <input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="+2547..." />
+            <input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
           </label>
             <label className="resident-field">
               <span>Property</span>
@@ -198,14 +192,16 @@ export default function InvitesNew() {
                 value={form.property}
                 onChange={(e) => setForm({ ...form, property: e.target.value, unit: "" })}
               >
-                <option value="">Optional property</option>
+                <option value="" hidden></option>
+                <option value="__none">No specific property</option>
                 {properties.map((property) => <option key={property.id} value={property.id}>{property.name}</option>)}
               </select>
             </label>
             <label className="resident-field">
               <span>Unit</span>
               <select value={form.unit} onChange={(e) => setForm({ ...form, unit: e.target.value })}>
-                <option value="">Optional unit</option>
+                <option value="" hidden></option>
+                <option value="__none">No specific unit</option>
                 {filteredUnits.map((unit) => <option key={unit.id} value={unit.id}>{unit.property?.name} / {unit.unit_number}</option>)}
               </select>
             </label>

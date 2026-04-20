@@ -216,7 +216,7 @@ export default function LandlordPayments() {
       >
         <div className="resident-toolbar">
           <label className="resident-search">
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={`Search ${activeTab}`} />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} aria-label={`Search ${activeTab}`} />
           </label>
           <label className="resident-inline-control">
             <CalendarDays size={16} />

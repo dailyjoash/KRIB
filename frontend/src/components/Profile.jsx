@@ -4,6 +4,7 @@ import { MoonStar, ShieldCheck, UserRound } from "lucide-react";
 import api from "../services/api";
 import { AuthContext } from "../context/AuthContext";
 import { getErrorMessage } from "../utils/errors";
+import LandlordPayoutSettingsCard from "./LandlordPayoutSettingsCard";
 import { PageLayout, SectionCard } from "./ui";
 
 const getStoredTheme = () => (localStorage.getItem("theme") === "dark" ? "dark" : "light");
@@ -173,15 +174,15 @@ export default function Profile() {
             </p>
             <label className="resident-field">
               <span>Current password</span>
-              <input ref={passwordCurrentRef} type="password" value={passwordForm.old_password} onChange={(e) => setPasswordForm({ ...passwordForm, old_password: e.target.value })} placeholder="Current password" required />
+              <input ref={passwordCurrentRef} type="password" value={passwordForm.old_password} onChange={(e) => setPasswordForm({ ...passwordForm, old_password: e.target.value })} required />
             </label>
             <label className="resident-field">
               <span>New password</span>
-              <input type="password" value={passwordForm.new_password} onChange={(e) => setPasswordForm({ ...passwordForm, new_password: e.target.value })} placeholder="New password" required />
+              <input type="password" value={passwordForm.new_password} onChange={(e) => setPasswordForm({ ...passwordForm, new_password: e.target.value })} required />
             </label>
             <label className="resident-field">
               <span>Confirm new password</span>
-              <input type="password" value={passwordForm.confirm_password} onChange={(e) => setPasswordForm({ ...passwordForm, confirm_password: e.target.value })} placeholder="Confirm new password" required />
+              <input type="password" value={passwordForm.confirm_password} onChange={(e) => setPasswordForm({ ...passwordForm, confirm_password: e.target.value })} required />
             </label>
             {passwordMismatch ? <p className="resident-inline-error">New passwords do not match yet.</p> : null}
             <div className="resident-form-actions resident-profile-form-actions">
@@ -227,6 +228,8 @@ export default function Profile() {
         <ProfileList rows={landlordRows} />
       </SectionCard>
 
+      <LandlordPayoutSettingsCard />
+
       <SectionCard
         icon={ShieldCheck}
         title="Security"
@@ -237,11 +240,11 @@ export default function Profile() {
           </p>
           <label className="resident-field">
             <span>Current password</span>
-            <input ref={passwordCurrentRef} type="password" value={passwordForm.old_password} onChange={(e) => setPasswordForm({ ...passwordForm, old_password: e.target.value })} placeholder="Current password" required />
+            <input ref={passwordCurrentRef} type="password" value={passwordForm.old_password} onChange={(e) => setPasswordForm({ ...passwordForm, old_password: e.target.value })} required />
           </label>
           <label className="resident-field">
             <span>New password</span>
-            <input type="password" value={passwordForm.new_password} onChange={(e) => setPasswordForm({ ...passwordForm, new_password: e.target.value })} placeholder="New password" required />
+            <input type="password" value={passwordForm.new_password} onChange={(e) => setPasswordForm({ ...passwordForm, new_password: e.target.value })} required />
           </label>
           <label className="resident-field">
             <span>Confirm password</span>
@@ -249,7 +252,6 @@ export default function Profile() {
               type="password"
               value={passwordForm.confirm_password}
               onChange={(e) => setPasswordForm({ ...passwordForm, confirm_password: e.target.value })}
-              placeholder="Confirm new password"
               required
             />
           </label>

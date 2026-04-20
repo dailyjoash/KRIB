@@ -1,11 +1,17 @@
+import re
 from datetime import timedelta
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import RegexValidator
 from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers
+try:
+    import magic
+except ImportError:  # pragma: no cover - optional dependency in lightweight builds
+    magic = None
 
 from .models import (
     Document,
@@ -24,7 +30,39 @@ from .models import (
     ManagerInvite,
     compute_lease_rent_status,
 )
-from .services import build_lease_agreement_pdf
+from .services import build_lease_agreement_pdf, normalize_mpesa_phone_number
+
+
+def validate_uploaded_file(upload, *, allowed_mime_types, max_size=None):
+    if not upload:
+        return upload
+
+    max_size = max_size or settings.MAX_UPLOAD_SIZE_BYTES
+    if getattr(upload, "size", 0) > max_size:
+        raise serializers.ValidationError("File size cannot exceed 5MB.")
+
+    if magic is None:
+        raise serializers.ValidationError("File validation is unavailable. Contact support.")
+
+    try:
+        position = upload.tell()
+    except Exception:  # pragma: no cover - defensive for unusual file wrappers
+        position = 0
+
+    try:
+        if hasattr(upload, "seek"):
+            upload.seek(0)
+        sample = upload.read(4096)
+    finally:
+        if hasattr(upload, "seek"):
+            upload.seek(position)
+
+    mime_type = magic.from_buffer(sample or b"", mime=True)
+    if mime_type not in allowed_mime_types:
+        allowed_labels = ", ".join(sorted(allowed_mime_types))
+        raise serializers.ValidationError(f"Unsupported file type '{mime_type}'. Allowed types: {allowed_labels}.")
+
+    return upload
 
 
 class LandlordSignupSerializer(serializers.Serializer):
@@ -124,6 +162,36 @@ class ProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = Profile
         fields = ["id", "user", "role", "phone_number", "wallet_available", "wallet_locked"]
+
+
+class LandlordSettingsSerializer(serializers.ModelSerializer):
+    payout_method = serializers.ChoiceField(
+        choices=[("MPESA", "M-Pesa"), ("BANK", "Bank")],
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = LandlordSettings
+        fields = ["business_name", "payout_method", "payout_destination", "payout_bank_code"]
+        extra_kwargs = {
+            "business_name": {"required": False, "allow_blank": True},
+            "payout_destination": {"required": False, "allow_blank": True, "allow_null": True},
+            "payout_bank_code": {"required": False, "allow_blank": True, "allow_null": True},
+        }
+
+    def validate(self, attrs):
+        payout_method = attrs.get("payout_method", getattr(self.instance, "payout_method", "")) or ""
+        payout_destination = attrs.get("payout_destination", getattr(self.instance, "payout_destination", "")) or ""
+        payout_bank_code = attrs.get("payout_bank_code", getattr(self.instance, "payout_bank_code", "")) or ""
+
+        if payout_method and not payout_destination:
+            raise serializers.ValidationError({"payout_destination": "Payout destination is required."})
+        if payout_method == "BANK" and not payout_bank_code:
+            raise serializers.ValidationError({"payout_bank_code": "Bank code is required for bank payouts."})
+
+        return attrs
 
 
 class MeSerializer(serializers.Serializer):
@@ -247,6 +315,9 @@ class LeaseSerializer(serializers.ModelSerializer):
         period = self.context.get("period") if self.context else None
         return compute_lease_rent_status(obj, period=period)
 
+    def validate_identity_document(self, value):
+        return validate_uploaded_file(value, allowed_mime_types=settings.ALLOWED_DOCUMENT_MIME_TYPES)
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
         if self.instance is None:
@@ -351,6 +422,9 @@ class InviteAcceptSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True, min_length=6)
     identity_document = serializers.FileField(required=False, allow_null=True)
 
+    def validate_identity_document(self, value):
+        return validate_uploaded_file(value, allowed_mime_types=settings.ALLOWED_DOCUMENT_MIME_TYPES)
+
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     lease = LeaseSerializer(read_only=True)
@@ -384,10 +458,7 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             "status",
             "mpesa_receipt",
             "receipt_file",
-            "result_code",
-            "result_desc",
             "transaction_date",
-            "raw_callback",
             "created_at",
             "remaining_balance",
         ]
@@ -398,10 +469,7 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             "mpesa_receipt",
             "transaction_code",
             "receipt_file",
-            "result_code",
-            "result_desc",
             "transaction_date",
-            "raw_callback",
             "created_at",
             "remaining_balance",
         ]
@@ -412,6 +480,16 @@ class STKInitiateSerializer(serializers.Serializer):
     phone_number = serializers.CharField()
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
 
+    def validate_phone_number(self, value):
+        normalized = normalize_mpesa_phone_number(value)
+        if normalized:
+            return normalized
+
+        compact = re.sub(r"\s+", "", str(value or ""))
+        raise serializers.ValidationError(
+            f"Use a valid Kenyan M-Pesa number like 0712345678, 0112345678, or +254712345678. Received: {compact or '-'}."
+        )
+
 
 class MaintenanceRequestSerializer(serializers.ModelSerializer):
     tenant = UserLiteSerializer(read_only=True)
@@ -421,6 +499,9 @@ class MaintenanceRequestSerializer(serializers.ModelSerializer):
     class Meta:
         model = MaintenanceRequest
         fields = ["id", "tenant", "lease", "lease_id", "issue", "urgency", "photo_path", "status", "created_at", "updated_at"]
+
+    def validate_photo_path(self, value):
+        return validate_uploaded_file(value, allowed_mime_types=settings.ALLOWED_IMAGE_MIME_TYPES)
 
 
 class DocumentSerializer(serializers.ModelSerializer):
@@ -458,6 +539,9 @@ class DocumentSerializer(serializers.ModelSerializer):
         if tenant and lease and lease.tenant_id != tenant.id:
             raise serializers.ValidationError({"tenant": "Selected tenant does not match the chosen lease."})
         return attrs
+
+    def validate_file_path(self, value):
+        return validate_uploaded_file(value, allowed_mime_types=settings.ALLOWED_DOCUMENT_MIME_TYPES)
 
     def get_unit_label(self, obj):
         if not obj.lease or not getattr(obj.lease, "unit", None):
@@ -554,10 +638,25 @@ class WalletWithdrawSerializer(serializers.Serializer):
 class LandlordPayoutSerializer(serializers.ModelSerializer):
     class Meta:
         model = LandlordPayout
-        fields = ["id", "amount", "method", "destination", "status", "created_at", "paid_at"]
+        fields = ["id", "amount", "method", "destination", "bank_code", "status", "created_at", "paid_at"]
 
 
 class LandlordPayoutRequestSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     method = serializers.ChoiceField(choices=[LandlordPayout.METHOD_MPESA, LandlordPayout.METHOD_BANK])
     destination = serializers.CharField(max_length=255)
+    bank_code = serializers.CharField(max_length=20, required=False, allow_blank=True, allow_null=True)
+
+    def validate(self, attrs):
+        method = attrs.get("method")
+        bank_code = (attrs.get("bank_code") or "").strip()
+
+        if method == LandlordPayout.METHOD_BANK and not bank_code:
+            raise serializers.ValidationError({"bank_code": "Bank code is required for bank payouts."})
+
+        if method == LandlordPayout.METHOD_MPESA:
+            attrs["bank_code"] = None
+        else:
+            attrs["bank_code"] = bank_code
+
+        return attrs

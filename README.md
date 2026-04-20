@@ -26,13 +26,24 @@ Production-focused rental workflow for landlords, managers, and tenants.
 python -m venv .venv
 source .venv/bin/activate
 pip install -r backend/requirements.txt
+
+# Make sure MySQL is running locally, or point DATABASE_URL at a managed instance.
 cd backend
 python manage.py migrate
 python manage.py seed_krib
 python manage.py runserver 0.0.0.0:8000
 ```
 
-If `DATABASE_URL` is left blank locally, KRIB falls back to SQLite using [db.sqlite3](/C:/Users/hstre/Downloads/KRIB_project_enhanced/backend/db.sqlite3). For hosted deployment, use PostgreSQL.
+KRIB now uses MySQL by default for both local and hosted environments. When `DATABASE_URL` is blank, Django builds the connection from `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD`.
+
+### SQLite to MySQL cutover
+If you already have local data in the legacy SQLite file [db.sqlite3](/C:/Users/hstre/Documents/KRIB_project_enhanced/backend/db.sqlite3), migrate it into an empty MySQL database with:
+
+```powershell
+./scripts/migrate_sqlite_to_mysql.ps1
+```
+
+Add `-PersistEnv` if you want the script to write the successful MySQL `DATABASE_URL` back into `.env`.
 
 ### Frontend
 ```bash
@@ -55,6 +66,17 @@ Use `.env.example` as baseline.
 - `DJANGO_COLLECTSTATIC`
 - `SCHEDULER_INTERVAL_SECONDS`
 - `KRIB_LOAD_DEMO_DATA` (`0` for production)
+- `DATABASE_URL` (preferred for managed MySQL)
+- `MYSQL_DATABASE`
+- `MYSQL_USER`
+- `MYSQL_PASSWORD`
+- `MYSQL_HOST`
+- `MYSQL_PORT`
+- `MYSQL_CHARSET`
+- `MYSQL_USE_SSL`
+- `MYSQL_SSL_CA`
+- `MYSQL_SSL_CERT`
+- `MYSQL_SSL_KEY`
 - SMTP email settings:
   - `DEFAULT_FROM_EMAIL`
   - `EMAIL_BACKEND`
@@ -145,7 +167,8 @@ docker compose up --build
 ```
 
 This starts:
-- PostgreSQL on `localhost:5432`
+- MySQL on `localhost:3306`
+- phpMyAdmin on `http://localhost:8080`
 - Django backend on `http://localhost:8000`
 - Vite frontend on `http://localhost:5173`
 
@@ -158,7 +181,7 @@ docker compose --env-file .env -f docker-compose.prod.yml up --build -d
 ```
 
 This starts:
-- PostgreSQL
+- MySQL
 - Django via `gunicorn`
 - A lightweight scheduler process via `python manage.py run_periodic_tasks`
 - Nginx serving the built frontend on port `80`
@@ -192,6 +215,7 @@ Fastest reliable path:
 1. Host the Django API on Render, Railway, or DigitalOcean App Platform.
 2. Host the React frontend on Netlify, Vercel, or Cloudflare Pages.
 3. Point `VITE_API_URL` at the live API domain if frontend and backend are split across domains.
+4. Use an external managed MySQL database for `DATABASE_URL`.
 
 Backend deploy essentials:
 ```bash
@@ -213,7 +237,8 @@ Backend env essentials:
 - `DJANGO_ALLOWED_HOSTS=<your-api-domain>`
 - `DJANGO_CORS_ALLOWED_ORIGINS=<your-frontend-domain>`
 - `DJANGO_CSRF_TRUSTED_ORIGINS=<your-frontend-domain>`
-- `DATABASE_URL=<managed-postgres-url>` if using Postgres
+- `DATABASE_URL=<managed-mysql-url>`
+- `MYSQL_USE_SSL=1` when your provider requires TLS
 - `DEFAULT_FROM_EMAIL` plus SMTP env if email flows are required
 - Daraja variables if live M-Pesa is required
 

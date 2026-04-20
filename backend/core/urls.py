@@ -51,6 +51,7 @@ urlpatterns = [
     path("landlord/revenue/", views.landlord_revenue, name="landlord-revenue"),
     path("landlord/receipts/", views.landlord_receipts, name="landlord-receipts"),
     path("landlord/followups/", views.landlord_followups, name="landlord-followups"),
+    path("landlord/settings/", views.LandlordSettingsView.as_view(), name="landlord-settings"),
     path("landlord/payouts/", views.LandlordPayoutsView.as_view(), name="landlord-payouts"),
     path("landlord/payouts/request/", views.LandlordPayoutRequestView.as_view(), name="landlord-payout-request"),
     path("landlord/payouts/<int:pk>/mark-paid/", views.LandlordPayoutMarkPaidView.as_view(), name="landlord-payout-mark-paid"),

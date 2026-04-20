@@ -10,9 +10,9 @@ import { PageLayout, SectionCard } from "./ui";
 const createDefaultForm = () => ({
   title: "",
   message: "",
-  audience: "everyone",
+  audience: "",
   property_id: "",
-  send_in_app: true,
+  send_in_app: false,
   send_email: false,
   send_sms: false,
 });
@@ -85,6 +85,7 @@ export default function NotificationsCenter() {
   const canSendNotification = Boolean(
     form.title.trim() &&
     form.message.trim() &&
+    form.audience &&
     (form.send_in_app || form.send_email || form.send_sms)
   );
 
@@ -209,7 +210,7 @@ export default function NotificationsCenter() {
 
     try {
       const payload = { ...form };
-      if (!payload.property_id) delete payload.property_id;
+      if (!payload.property_id || payload.property_id === "__all") delete payload.property_id;
       const response = await api.post("/api/notifications/send/", payload);
       setSuccess(response.data?.detail || "Notification sent successfully.");
       setForm(createDefaultForm());
@@ -225,7 +226,7 @@ export default function NotificationsCenter() {
     <div className="resident-toolbar">
       <label className="resident-search">
         <Search size={16} />
-        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search notifications" />
+        <input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search notifications" />
       </label>
       <label className="resident-inline-control">
         <BellRing size={16} />
@@ -326,14 +327,14 @@ export default function NotificationsCenter() {
               <input
                 value={form.title}
                 onChange={(event) => setForm((prev) => ({ ...prev, title: event.target.value }))}
-                placeholder="Planned water outage"
                 required
               />
             </label>
 
             <label className="resident-field">
               <span>Audience</span>
-              <select value={form.audience} onChange={(event) => setForm((prev) => ({ ...prev, audience: event.target.value }))}>
+              <select value={form.audience} onChange={(event) => setForm((prev) => ({ ...prev, audience: event.target.value }))} required>
+                <option value="" hidden></option>
                 {audienceOptions.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
@@ -345,7 +346,8 @@ export default function NotificationsCenter() {
             <label className="resident-field">
               <span>Property</span>
               <select value={form.property_id} onChange={(event) => setForm((prev) => ({ ...prev, property_id: event.target.value }))}>
-                <option value="">All properties</option>
+                <option value="" hidden></option>
+                <option value="__all">All properties</option>
                 {properties.map((property) => (
                   <option key={property.id} value={property.id}>
                     {property.name}
@@ -359,7 +361,6 @@ export default function NotificationsCenter() {
               <textarea
                 value={form.message}
                 onChange={(event) => setForm((prev) => ({ ...prev, message: event.target.value }))}
-                placeholder="Share the update your tenants or managers need to see."
                 rows="5"
                 required
               />
@@ -397,7 +398,7 @@ export default function NotificationsCenter() {
             </p>
 
             <div className="resident-form-actions resident-profile-form-actions">
-              <button className="resident-link-btn" type="button" onClick={resetForm} disabled={sending || (!form.title && !form.message && !form.property_id && form.audience === "everyone" && form.send_in_app && !form.send_email && !form.send_sms)}>
+              <button className="resident-link-btn" type="button" onClick={resetForm} disabled={sending || (!form.title && !form.message && !form.property_id && !form.audience && !form.send_in_app && !form.send_email && !form.send_sms)}>
                 Reset
               </button>
               <button className="resident-primary-btn" type="submit" disabled={sending || !canSendNotification}>

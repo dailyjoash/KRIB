@@ -93,15 +93,15 @@ export default function AddProperty() {
         <form className="resident-form-grid" onSubmit={createProperty}>
           <label className="resident-field">
             <span>Property name</span>
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="KRIB Heights" required />
+            <input value={name} onChange={(e) => setName(e.target.value)} required />
           </label>
           <label className="resident-field">
             <span>Location</span>
-            <input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Westlands, Nairobi" required />
+            <input value={location} onChange={(e) => setLocation(e.target.value)} required />
           </label>
           <label className="resident-field" style={{ gridColumn: "1 / -1" }}>
             <span>Description</span>
-            <textarea value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Short summary of the property and its appeal." rows="4" />
+            <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows="4" />
           </label>
           <button className="resident-primary-btn" type="submit">
             <Save size={16} />
@@ -136,8 +136,8 @@ export default function AddProperty() {
                 </div>
                 {property.description ? <p className="resident-helper-text">{property.description}</p> : null}
                 <div className="resident-form-actions">
-                  <select value={selection[property.id] || ""} onChange={(e) => setSelection({ ...selection, [property.id]: e.target.value })}>
-                    <option value="">Assign manager</option>
+                  <select value={selection[property.id] || ""} onChange={(e) => setSelection({ ...selection, [property.id]: e.target.value })} aria-label={`Assign manager for ${property.name}`}>
+                    <option value="" hidden></option>
                     {managers.map((manager) => (
                       <option key={manager.id} value={manager.id}>{manager.username}</option>
                     ))}

@@ -413,7 +413,7 @@ export default function DocumentsCenter() {
         <div className="resident-toolbar">
           <label className="resident-search">
             <Search size={16} />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search units, tenants, or documents" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search units, tenants, or documents" />
           </label>
           <label className="resident-inline-control">
             <FileText size={16} />

@@ -1,16 +1,41 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: krib-postgres
+  mysql:
+    image: mysql:8.4
+    container_name: krib-mysql
     restart: unless-stopped
     environment:
-      POSTGRES_DB: krib_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      MYSQL_DATABASE: krib_db
+      MYSQL_USER: krib_user
+      MYSQL_PASSWORD: krib_password
+      MYSQL_ROOT_PASSWORD: root
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
     ports:
-      - "5432:5432"
+      - "3306:3306"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  phpmyadmin:
+    image: phpmyadmin:5-apache
+    container_name: krib-phpmyadmin
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: root
+      PMA_PASSWORD: root
+      UPLOAD_LIMIT: 64M
+    ports:
+      - "8080:80"
 
   backend:
     build:
@@ -20,7 +45,8 @@ services:
     container_name: krib-backend
     restart: unless-stopped
     depends_on:
-      - postgres
+      mysql:
+        condition: service_healthy
     environment:
       DJANGO_SECRET_KEY: replace-me
       DJANGO_DEBUG: "1"
@@ -31,8 +57,8 @@ services:
       DJANGO_LOG_LEVEL: INFO
       JWT_ACCESS_MINUTES: "60"
       JWT_REFRESH_DAYS: "7"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/krib_db
-      DATABASE_SSLMODE: disable
+      DATABASE_URL: mysql://krib_user:krib_password@mysql:3306/krib_db
+      MYSQL_CHARSET: utf8mb4
       DJANGO_CONN_MAX_AGE: "60"
       PUBLIC_BASE_URL: http://localhost:8000
       FRONTEND_URL: http://localhost:5173
@@ -47,6 +73,11 @@ services:
       MPESA_SHORTCODE: ${MPESA_SHORTCODE:-174379}
       MPESA_PASSKEY: ${MPESA_PASSKEY:-}
       MPESA_CALLBACK_URL: ${MPESA_CALLBACK_URL:-http://localhost:8000/api/mpesa/callback/}
+      INTASEND_API_TOKEN: ${INTASEND_API_TOKEN:-}
+      INTASEND_PUBLISHABLE_KEY: ${INTASEND_PUBLISHABLE_KEY:-}
+      INTASEND_TEST_MODE: ${INTASEND_TEST_MODE:-1}
+      INTASEND_WEBHOOK_SECRET: ${INTASEND_WEBHOOK_SECRET:-}
+      CALLBACK_PATH_SECRET: ${CALLBACK_PATH_SECRET:-krib-cb}
       MPESA_BUSINESS_NAME: ${MPESA_BUSINESS_NAME:-KRIB}
       PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:-}
       PAYPAL_SECRET: ${PAYPAL_SECRET:-}
@@ -89,4 +120,4 @@ services:
       - /app/node_modules
 
 volumes:
-  postgres_data:
+  mysql_data:

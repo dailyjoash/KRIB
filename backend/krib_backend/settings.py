@@ -2,7 +2,7 @@ import os
 import importlib.util
 from pathlib import Path
 from datetime import timedelta
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from dotenv import load_dotenv
 
@@ -46,47 +46,93 @@ def _env_url_origin(name):
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def _mysql_options(query_options=None):
+    query_options = query_options or {}
+    options = {
+        "charset": query_options.get("charset", os.getenv("MYSQL_CHARSET", "utf8mb4")).strip() or "utf8mb4",
+    }
+
+    ssl_enabled = query_options.get("ssl", "").strip().lower() in {
+        "1", "true", "yes", "require", "required"}
+    ssl_enabled = ssl_enabled or os.getenv("MYSQL_USE_SSL", "0") == "1"
+
+    ssl = {}
+    for env_name, key in (
+        ("MYSQL_SSL_CA", "ca"),
+        ("MYSQL_SSL_CERT", "cert"),
+        ("MYSQL_SSL_KEY", "key"),
+    ):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            ssl[key] = value
+            ssl_enabled = True
+
+    if ssl_enabled:
+        options["ssl"] = ssl
+
+    return options
+
+
+def _default_mysql_config():
+    host = os.getenv("MYSQL_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    return {
+        "default": {
+            "ENGINE": "django.db.backends.mysql",
+            "NAME": os.getenv("MYSQL_DATABASE", "krib_db").strip() or "krib_db",
+            "USER": os.getenv("MYSQL_USER", "krib_user").strip() or "krib_user",
+            "PASSWORD": os.getenv("MYSQL_PASSWORD", "krib_password"),
+            "HOST": host,
+            "PORT": os.getenv("MYSQL_PORT", "3307").strip() or "3307",
+            "CONN_MAX_AGE": int(os.getenv("DJANGO_CONN_MAX_AGE", "60")),
+            "OPTIONS": _mysql_options(),
+        }
+    }
+
+
 def _database_config_from_env():
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
-        return {
-            "default": {
-                "ENGINE": "django.db.backends.sqlite3",
-                "NAME": BASE_DIR / "db.sqlite3",
-            }
-        }
+        return _default_mysql_config()
 
     parsed = urlparse(database_url)
+    query_options = dict(parse_qsl(parsed.query, keep_blank_values=True))
     engines = {
-        "postgres": "django.db.backends.postgresql",
-        "postgresql": "django.db.backends.postgresql",
-        "pgsql": "django.db.backends.postgresql",
+        "mysql": "django.db.backends.mysql",
+        "mysql2": "django.db.backends.mysql",
+        "mariadb": "django.db.backends.mysql",
         "sqlite": "django.db.backends.sqlite3",
     }
     engine = engines.get(parsed.scheme)
     if engine == "django.db.backends.sqlite3":
-        sqlite_name = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
+        sqlite_name = parsed.path[1:] if parsed.path.startswith(
+            "/") else parsed.path
         return {"default": {"ENGINE": engine, "NAME": sqlite_name or BASE_DIR / "db.sqlite3"}}
-    if not engine:
-        raise ValueError("Unsupported DATABASE_URL scheme. Use postgres://, postgresql://, or sqlite:///")
-
-    return {
-        "default": {
-            "ENGINE": engine,
-            "NAME": parsed.path.lstrip("/"),
-            "USER": parsed.username or "",
-            "PASSWORD": parsed.password or "",
-            "HOST": parsed.hostname or "",
-            "PORT": str(parsed.port or ""),
-            "CONN_MAX_AGE": int(os.getenv("DJANGO_CONN_MAX_AGE", "60")),
-            "OPTIONS": {
-                "sslmode": os.getenv("DATABASE_SSLMODE", "require"),
-            },
+    if engine == "django.db.backends.mysql":
+        return {
+            "default": {
+                "ENGINE": engine,
+                "NAME": parsed.path.lstrip("/"),
+                "USER": parsed.username or "",
+                "PASSWORD": parsed.password or "",
+                "HOST": parsed.hostname or "",
+                "PORT": str(parsed.port or "3307"),
+                "CONN_MAX_AGE": int(os.getenv("DJANGO_CONN_MAX_AGE", "60")),
+                "OPTIONS": _mysql_options(query_options),
+            }
         }
-    }
+    if not engine:
+        raise ValueError(
+            "Unsupported DATABASE_URL scheme. Use mysql://, mariadb://, or sqlite:///")
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-key")
+
 DEBUG = os.getenv("DJANGO_DEBUG", "1") == "1"
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = "dev-secret-key"
+    else:
+        raise RuntimeError("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0.")
+
 ALLOWED_HOSTS = _csv_env("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 for env_name in ("PUBLIC_BASE_URL", "FRONTEND_URL", "BACKEND_URL", "MPESA_CALLBACK_URL"):
     _append_unique(ALLOWED_HOSTS, _env_url_host(env_name))
@@ -171,6 +217,12 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "5/min",
+        "register": "5/min",
+        "password_reset": "3/min",
+        "stk_initiate": "10/min",
+    },
 }
 
 SIMPLE_JWT = {
@@ -182,15 +234,32 @@ SIMPLE_JWT = {
 # Media files (uploads)
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+MAX_UPLOAD_SIZE_BYTES = 5 * 1024 * 1024
+ALLOWED_DOCUMENT_MIME_TYPES = (
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+)
+ALLOWED_IMAGE_MIME_TYPES = (
+    "image/jpeg",
+    "image/png",
+)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
+CALLBACK_PATH_SECRET = os.getenv("CALLBACK_PATH_SECRET", "krib-cb").strip().strip("/")
+_callback_base_url = (PUBLIC_BASE_URL or BACKEND_URL or "http://localhost:8000").rstrip("/")
+MPESA_CALLBACK_URL = os.getenv(
+    "MPESA_CALLBACK_URL",
+    f"{_callback_base_url}/api/payments/mpesa/callback/{CALLBACK_PATH_SECRET}/",
+).rstrip("/")
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "KRIB")
 SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "")
 SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "")
 BUSINESS_ADDRESS = os.getenv("BUSINESS_ADDRESS", "")
 
-EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
+EMAIL_BACKEND = os.getenv(
+    "EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend")
 EMAIL_HOST = os.getenv("EMAIL_HOST", "")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
@@ -209,7 +278,8 @@ for env_name in ("PUBLIC_BASE_URL", "FRONTEND_URL", "BACKEND_URL", "MPESA_CALLBA
     _append_unique(CSRF_TRUSTED_ORIGINS, origin)
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-SECURE_SSL_REDIRECT = not DEBUG and os.getenv("DJANGO_SECURE_SSL_REDIRECT", "0") == "1"
+SECURE_SSL_REDIRECT = not DEBUG and os.getenv(
+    "DJANGO_SECURE_SSL_REDIRECT", "0") == "1"
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
@@ -235,5 +305,8 @@ LOGGING = {
 
 if HAS_DJANGO_CRONTAB:
     CRONJOBS = [
-        ("0 6 * * *", "django.core.management.call_command", ["check_arrears"]),
+        ("0 * * * *", "django.core.management.call_command",
+         ["unlock_balances"]),
+        ("0 6 * * *", "django.core.management.call_command",
+         ["check_arrears"]),
     ]

@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Building2, DoorClosed, PlusSquare, Save, Trash2, UserMinus, UserPlus } from "lucide-react";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import api from "../services/api";
 import { getErrorMessage } from "../utils/errors";
 import { formatKES } from "../utils/format";
@@ -9,6 +9,7 @@ import { PageLayout, SectionCard } from "./ui";
 
 export default function LandlordSetup() {
   const location = useLocation();
+  const navigate = useNavigate();
   const propertySectionRef = useRef(null);
   const unitSectionRef = useRef(null);
 
@@ -19,7 +20,7 @@ export default function LandlordSetup() {
   const [units, setUnits] = useState([]);
   const [managers, setManagers] = useState([]);
   const [selection, setSelection] = useState({});
-  const [unitForm, setUnitForm] = useState({ property_id: "", unit_number: "", unit_type: "single", rent_amount: "", deposit: "" });
+  const [unitForm, setUnitForm] = useState({ property_id: "", unit_number: "", unit_type: "", rent_amount: "", deposit: "" });
   const [propertyToDelete, setPropertyToDelete] = useState(null);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -47,10 +48,17 @@ export default function LandlordSetup() {
 
   useEffect(() => {
     const section = new URLSearchParams(location.search).get("section");
-    const target = section === "unit" ? unitSectionRef.current : propertySectionRef.current;
+    if (section === "payout") {
+      navigate("/profile", { replace: true });
+      return;
+    }
+    const target = (
+      section === "unit" ? unitSectionRef.current
+      : propertySectionRef.current
+    );
     if (!target) return;
     target.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [location.search]);
+  }, [location.search, navigate]);
 
   const createProperty = async (event) => {
     event.preventDefault();
@@ -77,7 +85,7 @@ export default function LandlordSetup() {
     try {
       await api.post("/api/units/", unitForm);
       setSuccess("Unit created successfully.");
-      setUnitForm({ property_id: "", unit_number: "", unit_type: "single", rent_amount: "", deposit: "" });
+      setUnitForm({ property_id: "", unit_number: "", unit_type: "", rent_amount: "", deposit: "" });
       await loadData();
     } catch (err) {
       setError(getErrorMessage(err, "Failed to add unit."));
@@ -153,15 +161,15 @@ export default function LandlordSetup() {
         <form className="resident-form-grid" onSubmit={createProperty}>
           <label className="resident-field">
             <span>Property name</span>
-            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="KRIB Heights" required />
+            <input value={name} onChange={(event) => setName(event.target.value)} required />
           </label>
           <label className="resident-field">
             <span>Location</span>
-            <input value={locationName} onChange={(event) => setLocationName(event.target.value)} placeholder="Westlands, Nairobi" required />
+            <input value={locationName} onChange={(event) => setLocationName(event.target.value)} required />
           </label>
           <label className="resident-field" style={{ gridColumn: "1 / -1" }}>
             <span>Description</span>
-            <textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Short summary of the property and its appeal." rows="4" />
+            <textarea value={description} onChange={(event) => setDescription(event.target.value)} rows="4" />
           </label>
           <button className="resident-primary-btn" type="submit">
             <Save size={16} />
@@ -176,7 +184,7 @@ export default function LandlordSetup() {
           <label className="resident-field">
             <span>Property</span>
             <select value={unitForm.property_id} onChange={(event) => setUnitForm({ ...unitForm, property_id: event.target.value })} required>
-              <option value="">Select property</option>
+              <option value="" hidden></option>
               {properties.map((property) => (
                 <option key={property.id} value={property.id}>
                   {property.name}
@@ -186,11 +194,12 @@ export default function LandlordSetup() {
           </label>
           <label className="resident-field">
             <span>Unit number</span>
-            <input value={unitForm.unit_number} onChange={(event) => setUnitForm({ ...unitForm, unit_number: event.target.value })} placeholder="A-01" required />
+            <input value={unitForm.unit_number} onChange={(event) => setUnitForm({ ...unitForm, unit_number: event.target.value })} required />
           </label>
           <label className="resident-field">
             <span>Unit type</span>
-            <select value={unitForm.unit_type} onChange={(event) => setUnitForm({ ...unitForm, unit_type: event.target.value })}>
+            <select value={unitForm.unit_type} onChange={(event) => setUnitForm({ ...unitForm, unit_type: event.target.value })} required>
+              <option value="" hidden></option>
               <option value="single">Single</option>
               <option value="bedsitter">Bedsitter</option>
               <option value="1br">1BR</option>
@@ -241,7 +250,7 @@ export default function LandlordSetup() {
                   <label className="resident-field resident-property-select">
                     <span>Assign manager</span>
                     <select value={selection[property.id] || ""} onChange={(event) => setSelection({ ...selection, [property.id]: event.target.value })}>
-                      <option value="">Select manager</option>
+                      <option value="" hidden></option>
                       {managers.map((manager) => (
                         <option key={manager.id} value={manager.id}>
                           {manager.username}

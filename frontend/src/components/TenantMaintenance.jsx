@@ -7,7 +7,7 @@ import StatusBadge from "./StatusBadge";
 export default function TenantMaintenance() {
   const [leaseId, setLeaseId] = useState(null);
   const [issue, setIssue] = useState("");
-  const [urgency, setUrgency] = useState("medium");
+  const [urgency, setUrgency] = useState("");
   const [photo, setPhoto] = useState(null);
   const [search, setSearch] = useState("");
   const [month, setMonth] = useState("");
@@ -59,13 +59,13 @@ export default function TenantMaintenance() {
       const payload = new FormData();
       payload.append("lease_id", leaseId);
       payload.append("issue", issue);
-      payload.append("urgency", urgency);
+      payload.append("urgency", urgency || "medium");
       if (photo) payload.append("photo_path", photo);
       await api.post("/api/maintenance/", payload, {
         headers: { "Content-Type": "multipart/form-data" },
       });
       setIssue("");
-      setUrgency("medium");
+      setUrgency("");
       setPhoto(null);
       setShowComposer(false);
       setSuccess("Maintenance ticket submitted.");
@@ -106,7 +106,7 @@ export default function TenantMaintenance() {
         <div className="resident-toolbar">
           <label className="resident-search">
             <Search size={16} />
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by maintenance tickets" />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search maintenance tickets" />
           </label>
           <div className="resident-calendar-wrap">
             <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
@@ -126,8 +126,9 @@ export default function TenantMaintenance() {
 
         {showComposer ? (
           <div className="resident-composer">
-            <textarea value={issue} onChange={(e) => setIssue(e.target.value)} placeholder="Describe the issue..." rows={4} />
-            <select value={urgency} onChange={(e) => setUrgency(e.target.value)}>
+            <textarea value={issue} onChange={(e) => setIssue(e.target.value)} rows={4} aria-label="Issue description" />
+            <select value={urgency} onChange={(e) => setUrgency(e.target.value)} aria-label="Urgency">
+              <option value="" hidden></option>
               <option value="low">Low</option>
               <option value="medium">Medium</option>
               <option value="high">High</option>

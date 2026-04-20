@@ -37,6 +37,9 @@ class Profile(models.Model):
 class LandlordSettings(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="landlord_settings")
     business_name = models.CharField(max_length=200)
+    payout_method = models.CharField(max_length=20, blank=True, null=True)
+    payout_destination = models.CharField(max_length=255, blank=True, null=True)
+    payout_bank_code = models.CharField(max_length=50, blank=True, null=True)
 
     def __str__(self):
         return f"{self.business_name} ({self.user.username})"
@@ -291,6 +294,7 @@ class LandlordPayout(models.Model):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     method = models.CharField(max_length=20, choices=METHOD_CHOICES)
     destination = models.CharField(max_length=255)
+    bank_code = models.CharField(max_length=20, blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(blank=True, null=True)
@@ -499,6 +503,8 @@ def compute_lease_rent_status(lease, period=None, today=None):
 
 @receiver(post_save, sender=User)
 def ensure_user_profiles(sender, instance, created, **kwargs):
+    if kwargs.get("raw"):
+        return
     if created:
         Profile.objects.get_or_create(user=instance)
         Tenant.objects.get_or_create(user=instance)

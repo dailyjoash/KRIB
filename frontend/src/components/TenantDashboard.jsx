@@ -54,8 +54,8 @@ export default function TenantDashboard() {
       <section className="resident-hero-grid">
         <button className="resident-gradient-card blue" type="button" onClick={() => navigate("/tenant/lease")}>
           <div>
-            <h3>Current Booking</h3>
-            <p>{lease ? `${formatDate(lease.start_date)} - Active` : "No active booking"}</p>
+            <h3>Current Lease</h3>
+            <p>{lease ? `${formatDate(lease.start_date)} - Active` : "No active lease"}</p>
           </div>
           <span className="resident-ghost-btn">View</span>
         </button>
@@ -71,8 +71,8 @@ export default function TenantDashboard() {
 
         <button className="resident-gradient-card mint" type="button" onClick={() => navigate("/tenant/finance?tab=wallet")}>
           <div>
-            <h3>Wallet</h3>
-            <p>Available balance</p>
+            <h3>Rent Credit</h3>
+            <p>Available credit</p>
             <strong>{formatKES(wallet.wallet_available || 0)}</strong>
           </div>
           <span className="resident-ghost-btn">Open</span>

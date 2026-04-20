@@ -1,6 +1,6 @@
 from rest_framework.permissions import BasePermission
 
-from .models import Document, Lease, MaintenanceRequest, PaymentTransaction, Profile, Property
+from .models import Document, Lease, LandlordSettings, MaintenanceRequest, PaymentTransaction, Profile, Property
 
 
 def get_role(user):
@@ -62,3 +62,21 @@ class IsTenantOfProperty(BasePermission):
             unit__property=prop,
             status=Lease.STATUS_ACTIVE,
         ).exists()
+
+
+def landlord_has_payout_setup(user):
+    """
+    Returns True if the landlord has a payout method configured.
+    Returns False if LandlordSettings does not exist or
+    payout_method / payout_destination are empty.
+    """
+    try:
+        settings = user.landlord_settings
+        return bool(
+            settings.payout_method and
+            settings.payout_destination
+        )
+    except LandlordSettings.DoesNotExist:
+        return False
+    except AttributeError:
+        return False

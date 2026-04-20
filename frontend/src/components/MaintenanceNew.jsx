@@ -49,14 +49,14 @@ export default function MaintenanceNew() {
         <input
           value={leaseId}
           onChange={(e) => setLeaseId(e.target.value)}
-          placeholder="Active lease ID"
+          aria-label="Active lease ID"
           required
         />
 
         <textarea
           value={issue}
           onChange={(e) => setIssue(e.target.value)}
-          placeholder="Describe the issue"
+          aria-label="Describe the issue"
           required
         />
 

@@ -1,9 +1,14 @@
+import hashlib
+import hmac
+import json
+from io import StringIO
 from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth.tokens import default_token_generator
 from django.contrib.auth.models import User
+from django.core.management import call_command
 from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
@@ -13,7 +18,8 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
-from core.models import Document, Lease, MaintenanceRequest, Notification, PaymentTransaction, Profile, Property, Tenant, TenantInvite, Unit, compute_lease_rent_status
+from core.models import Document, LandlordBalance, LandlordPayout, LandlordSettings, Lease, LedgerTransaction, MaintenanceRequest, Notification, PaymentTransaction, Profile, Property, Tenant, TenantInvite, Unit, compute_lease_rent_status
+from core.services import can_withdraw_wallet
 
 
 class BaseAPITestCase(APITestCase):
@@ -235,8 +241,10 @@ class LeaseOnboardingDocumentTests(BaseAPITestCase):
             deposit=Decimal("8000.00"),
         )
 
+    @patch("core.serializers.magic")
     @patch("core.serializers.build_lease_agreement_pdf")
-    def test_lease_create_captures_identity_and_generates_lease_document(self, mock_build_lease_agreement_pdf):
+    def test_lease_create_captures_identity_and_generates_lease_document(self, mock_build_lease_agreement_pdf, mock_magic):
+        mock_magic.from_buffer.return_value = "image/jpeg"
         mock_build_lease_agreement_pdf.return_value = (
             "lease-agreement.pdf",
             SimpleUploadedFile("lease-agreement.pdf", b"%PDF-1.4 test", content_type="application/pdf"),
@@ -252,7 +260,11 @@ class LeaseOnboardingDocumentTests(BaseAPITestCase):
                 "due_day": 5,
                 "status": Lease.STATUS_ACTIVE,
                 "rent_amount": "8000.00",
-                "identity_document": SimpleUploadedFile("passport.jpg", b"image-bytes", content_type="image/jpeg"),
+                "identity_document": SimpleUploadedFile(
+                    "passport.jpg",
+                    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9",
+                    content_type="image/jpeg",
+                ),
                 "tenant_signature": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9VEWil8AAAAASUVORK5CYII=",
             },
             format="multipart",
@@ -344,6 +356,14 @@ class InviteDeliveryTests(BaseAPITestCase):
     def setUp(self):
         self.landlord = self.create_user("landlord_invites", Profile.ROLE_LANDLORD)
         self.manager = self.create_user("manager_invites", Profile.ROLE_MANAGER)
+        LandlordSettings.objects.update_or_create(
+            user=self.landlord,
+            defaults={
+                "business_name": "Test Properties",
+                "payout_method": "MPESA",
+                "payout_destination": "+254700000001",
+            },
+        )
         self.property = Property.objects.create(
             landlord=self.landlord,
             manager=self.manager,
@@ -465,17 +485,21 @@ class InviteDeliveryTests(BaseAPITestCase):
         self.assertEqual(invite.status, TenantInvite.STATUS_CANCELLED)
 
 
-@override_settings(
-    MPESA_CONSUMER_KEY="key",
-    MPESA_CONSUMER_SECRET="secret",
-    MPESA_SHORTCODE="174379",
-    MPESA_PASSKEY="passkey",
-    MPESA_CALLBACK_URL="https://example.com/callback",
+@patch.dict(
+    "os.environ",
+    {
+        "INTASEND_API_TOKEN": "token",
+        "INTASEND_PUBLISHABLE_KEY": "publishable",
+        "INTASEND_TEST_MODE": "true",
+        "INTASEND_WEBHOOK_SECRET": "test-secret",
+    },
+    clear=False,
 )
 class PaymentCallbackTests(BaseAPITestCase):
     def setUp(self):
         self.landlord = self.create_user("landlord_pay", Profile.ROLE_LANDLORD)
         self.tenant = self.create_user("tenant_pay", Profile.ROLE_TENANT)
+        self.webhook_secret = "test-secret"
         prop = Property.objects.create(landlord=self.landlord, name="P", location="NBO")
         unit = Unit.objects.create(
             property=prop,
@@ -493,27 +517,27 @@ class PaymentCallbackTests(BaseAPITestCase):
             status=Lease.STATUS_ACTIVE,
         )
 
-    def _callback_payload(self, checkout_id, result_code=0):
+    def _callback_payload(self, checkout_id, state="COMPLETE"):
         return {
-            "Body": {
-                "stkCallback": {
-                    "CheckoutRequestID": checkout_id,
-                    "ResultCode": result_code,
-                    "ResultDesc": "OK" if result_code == 0 else "Failed",
-                    "CallbackMetadata": {
-                        "Item": [
-                            {"Name": "MpesaReceiptNumber", "Value": "RCP123"},
-                            {"Name": "TransactionDate", "Value": "20240101120000"},
-                        ]
-                    },
-                }
-            }
+            "invoice_id": checkout_id,
+            "state": state,
+            "invoice": {
+                "invoice_id": checkout_id,
+                "mpesa_receipt": "RCP123",
+                "value": "10000.00",
+                "account": f"LEASE-{self.lease.id}",
+            },
         }
 
-    @patch("core.views._daraja_stk_push")
-    @patch("core.views._missing_daraja_env_vars", return_value=[])
-    def test_initiate_and_callback_success_is_idempotent(self, _missing, mock_push):
-        mock_push.return_value = {"CheckoutRequestID": "checkout-1", "MerchantRequestID": "merchant-1", "ResponseCode": "0"}
+    def _signed_callback(self, checkout_id, state="COMPLETE"):
+        payload = self._callback_payload(checkout_id, state=state)
+        body = json.dumps(payload)
+        signature = hmac.new(self.webhook_secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+        return body, signature
+
+    @patch("core.views.intasend_stk_push")
+    def test_initiate_and_callback_success_is_idempotent(self, mock_push):
+        mock_push.return_value = {"success": True, "invoice_id": "checkout-1"}
         self.auth(self.tenant)
         initiate = self.client.post(
             reverse("stk-initiate"),
@@ -523,10 +547,12 @@ class PaymentCallbackTests(BaseAPITestCase):
         self.assertEqual(initiate.status_code, 201)
 
         callback_url = reverse("stk-callback")
-        first = self.client.post(callback_url, self._callback_payload("checkout-1", result_code=0), format="json")
+        first_body, first_signature = self._signed_callback("checkout-1", state="COMPLETE")
+        first = self.client.post(callback_url, data=first_body, content_type="application/json", HTTP_X_INTASEND_SIGNATURE=first_signature)
         self.assertEqual(first.status_code, 200)
 
-        second = self.client.post(callback_url, self._callback_payload("checkout-1", result_code=0), format="json")
+        second_body, second_signature = self._signed_callback("checkout-1", state="COMPLETE")
+        second = self.client.post(callback_url, data=second_body, content_type="application/json", HTTP_X_INTASEND_SIGNATURE=second_signature)
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.data["detail"], "Duplicate callback ignored.")
 
@@ -534,25 +560,24 @@ class PaymentCallbackTests(BaseAPITestCase):
         self.assertEqual(payment.status, PaymentTransaction.STATUS_SUCCESS)
         self.assertTrue(payment.allocation_done)
 
-    @patch("core.views._daraja_stk_push")
-    @patch("core.views._missing_daraja_env_vars", return_value=[])
-    def test_callback_failure_marks_failed(self, _missing, mock_push):
-        mock_push.return_value = {"CheckoutRequestID": "checkout-2", "MerchantRequestID": "merchant-2", "ResponseCode": "0"}
+    @patch("core.views.intasend_stk_push")
+    def test_callback_failure_marks_failed(self, mock_push):
+        mock_push.return_value = {"success": True, "invoice_id": "checkout-2"}
         self.auth(self.tenant)
         self.client.post(
             reverse("stk-initiate"),
             {"lease_id": self.lease.id, "phone_number": "254700000001", "amount": "10000.00"},
             format="json",
         )
-        response = self.client.post(reverse("stk-callback"), self._callback_payload("checkout-2", result_code=1), format="json")
+        body, signature = self._signed_callback("checkout-2", state="FAILED")
+        response = self.client.post(reverse("stk-callback"), data=body, content_type="application/json", HTTP_X_INTASEND_SIGNATURE=signature)
         self.assertEqual(response.status_code, 200)
         payment = PaymentTransaction.objects.get(checkout_request_id="checkout-2")
         self.assertEqual(payment.status, PaymentTransaction.STATUS_FAILED)
 
-    @patch("core.views._daraja_stk_push")
-    @patch("core.views._missing_daraja_env_vars", return_value=[])
-    def test_initiate_allows_partial_payment_amount(self, _missing, mock_push):
-        mock_push.return_value = {"CheckoutRequestID": "checkout-3", "MerchantRequestID": "merchant-3", "ResponseCode": "0"}
+    @patch("core.views.intasend_stk_push")
+    def test_initiate_allows_partial_payment_amount(self, mock_push):
+        mock_push.return_value = {"success": True, "invoice_id": "checkout-3"}
         self.auth(self.tenant)
         response = self.client.post(
             reverse("stk-initiate"),
@@ -564,9 +589,32 @@ class PaymentCallbackTests(BaseAPITestCase):
         self.assertEqual(payment.amount, Decimal("2500.00"))
         self.assertEqual(payment.status, PaymentTransaction.STATUS_PENDING)
 
-    @patch("core.views._daraja_stk_push")
-    @patch("core.views._missing_daraja_env_vars", return_value=[])
-    def test_initiate_rejects_amount_above_remaining_balance(self, _missing, mock_push):
+    @patch("core.views.intasend_stk_push")
+    def test_initiate_normalizes_local_phone_number(self, mock_push):
+        mock_push.return_value = {"success": True, "invoice_id": "checkout-local"}
+        self.auth(self.tenant)
+        response = self.client.post(
+            reverse("stk-initiate"),
+            {"lease_id": self.lease.id, "phone_number": "0712 345 678", "amount": "2500.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        payment = PaymentTransaction.objects.get(checkout_request_id="checkout-local")
+        self.assertEqual(payment.phone_number, "254712345678")
+        mock_push.assert_called_once_with("254712345678", payment.amount, f"LEASE-{self.lease.id}")
+
+    def test_initiate_rejects_invalid_phone_number(self):
+        self.auth(self.tenant)
+        response = self.client.post(
+            reverse("stk-initiate"),
+            {"lease_id": self.lease.id, "phone_number": "12345", "amount": "2500.00"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("valid Kenyan M-Pesa number", response.data["phone_number"][0])
+
+    @patch("core.views.intasend_stk_push")
+    def test_initiate_rejects_amount_above_remaining_balance(self, mock_push):
         PaymentTransaction.objects.create(
             lease=self.lease,
             tenant=self.tenant,
@@ -589,9 +637,8 @@ class PaymentCallbackTests(BaseAPITestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("remaining balance", response.data["detail"])
 
-    @patch("core.views._daraja_stk_push")
-    @patch("core.views._missing_daraja_env_vars", return_value=[])
-    def test_initiate_allows_same_partial_amount_more_than_once(self, _missing, mock_push):
+    @patch("core.views.intasend_stk_push")
+    def test_initiate_allows_same_partial_amount_more_than_once(self, mock_push):
         PaymentTransaction.objects.create(
             lease=self.lease,
             tenant=self.tenant,
@@ -604,7 +651,7 @@ class PaymentCallbackTests(BaseAPITestCase):
             status=PaymentTransaction.STATUS_SUCCESS,
             allocation_done=True,
         )
-        mock_push.return_value = {"CheckoutRequestID": "checkout-4", "MerchantRequestID": "merchant-4", "ResponseCode": "0"}
+        mock_push.return_value = {"success": True, "invoice_id": "checkout-4"}
         self.auth(self.tenant)
         response = self.client.post(
             reverse("stk-initiate"),
@@ -612,6 +659,185 @@ class PaymentCallbackTests(BaseAPITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 201)
+
+    @patch("core.views.intasend_stk_push")
+    def test_initiate_applies_wallet_credit_before_partial_stk_push(self, mock_push):
+        self.tenant.profile.wallet_available = Decimal("5000.00")
+        self.tenant.profile.save(update_fields=["wallet_available"])
+        mock_push.return_value = {"success": True, "invoice_id": "checkout-wallet-partial"}
+
+        self.auth(self.tenant)
+        response = self.client.post(
+            reverse("stk-initiate"),
+            {"lease_id": self.lease.id, "phone_number": "254700000001", "amount": "10000.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payment = PaymentTransaction.objects.get(checkout_request_id="checkout-wallet-partial")
+        self.assertEqual(payment.amount, Decimal("5000.00"))
+        mock_push.assert_called_once_with("254700000001", Decimal("5000.00"), f"LEASE-{self.lease.id}")
+        self.tenant.profile.refresh_from_db()
+        self.assertEqual(self.tenant.profile.wallet_available, Decimal("0.00"))
+        self.assertTrue(
+            PaymentTransaction.objects.filter(
+                lease=self.lease,
+                tenant=self.tenant,
+                amount=Decimal("5000.00"),
+                status=PaymentTransaction.STATUS_SUCCESS,
+                result_desc="Auto wallet rent debit",
+            ).exists()
+        )
+
+    @patch("core.views.intasend_stk_push")
+    def test_initiate_skips_stk_when_wallet_fully_covers_rent(self, mock_push):
+        self.tenant.profile.wallet_available = Decimal("10000.00")
+        self.tenant.profile.save(update_fields=["wallet_available"])
+
+        self.auth(self.tenant)
+        response = self.client.post(
+            reverse("stk-initiate"),
+            {"lease_id": self.lease.id, "phone_number": "254700000001", "amount": "10000.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["detail"], "Rent was fully covered by wallet credit.")
+        mock_push.assert_not_called()
+        self.assertFalse(
+            PaymentTransaction.objects.filter(
+                lease=self.lease,
+                tenant=self.tenant,
+                payment_method=PaymentTransaction.METHOD_MPESA,
+                status=PaymentTransaction.STATUS_PENDING,
+            ).exists()
+        )
+        self.assertTrue(
+            PaymentTransaction.objects.filter(
+                lease=self.lease,
+                tenant=self.tenant,
+                amount=Decimal("10000.00"),
+                status=PaymentTransaction.STATUS_SUCCESS,
+                allocation_done=True,
+                result_desc="Auto wallet rent debit",
+            ).exists()
+        )
+
+    def test_callback_invalid_signature_does_not_process_payment(self):
+        payment = PaymentTransaction.objects.create(
+            lease=self.lease,
+            tenant=self.tenant,
+            period=timezone.localdate().strftime("%Y-%m"),
+            billing_period=timezone.localdate().replace(day=1),
+            phone_number="254700000001",
+            amount=Decimal("10000.00"),
+            payment_method=PaymentTransaction.METHOD_MPESA,
+            checkout_request_id="checkout-invalid-signature",
+            status=PaymentTransaction.STATUS_PENDING,
+        )
+
+        body = json.dumps(self._callback_payload("checkout-invalid-signature", state="COMPLETE"))
+        response = self.client.post(
+            reverse("stk-callback"),
+            data=body,
+            content_type="application/json",
+            HTTP_X_INTASEND_SIGNATURE="bad-signature",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["detail"], "Invalid signature.")
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, PaymentTransaction.STATUS_PENDING)
+
+
+class LandlordPayoutRequestTests(BaseAPITestCase):
+    def setUp(self):
+        self.landlord = self.create_user("landlord_payout", Profile.ROLE_LANDLORD)
+        self.tenant = self.create_user("tenant_payout", Profile.ROLE_TENANT)
+        self.balance = LandlordBalance.objects.create(
+            landlord=self.landlord,
+            available_balance=Decimal("15000.00"),
+            locked_balance=Decimal("0.00"),
+        )
+        self.property = Property.objects.create(
+            landlord=self.landlord,
+            name="Test Property",
+            location="Nairobi",
+        )
+        self.unit = Unit.objects.create(
+            property=self.property,
+            unit_number="A1",
+            rent_amount=Decimal("10000.00"),
+            deposit=Decimal("10000.00"),
+        )
+        self.lease = Lease.objects.create(
+            unit=self.unit,
+            tenant=self.tenant,
+            rent_amount=Decimal("10000.00"),
+            start_date=timezone.localdate().replace(day=1),
+            status=Lease.STATUS_ACTIVE,
+            due_day=1,
+        )
+
+    @patch("core.views.execute_intasend_payout")
+    def test_payout_success_marks_paid_and_reduces_balance(self, mock_execute):
+        mock_execute.return_value = {"success": True}
+        self.auth(self.landlord)
+
+        response = self.client.post(
+            reverse("landlord-payout-request"),
+            {"amount": "5000.00", "method": LandlordPayout.METHOD_MPESA, "destination": "0712345678"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payout = LandlordPayout.objects.get(landlord=self.landlord)
+        self.assertEqual(payout.status, LandlordPayout.STATUS_PAID)
+        self.assertIsNotNone(payout.paid_at)
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.available_balance, Decimal("10000.00"))
+        self.assertEqual(
+            LedgerTransaction.objects.filter(
+                user=self.landlord,
+                kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_PAID,
+                status=LedgerTransaction.STATUS_PAID,
+            ).count(),
+            1,
+        )
+
+    @patch("core.views.execute_intasend_payout")
+    def test_payout_failure_restores_balance_and_marks_failed(self, mock_execute):
+        mock_execute.return_value = {"success": False, "error": "Provider unavailable"}
+        self.auth(self.landlord)
+
+        response = self.client.post(
+            reverse("landlord-payout-request"),
+            {"amount": "5000.00", "method": LandlordPayout.METHOD_MPESA, "destination": "0712345678"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 502)
+        payout = LandlordPayout.objects.get(landlord=self.landlord)
+        self.assertEqual(payout.status, LandlordPayout.STATUS_FAILED)
+        self.balance.refresh_from_db()
+        self.assertEqual(self.balance.available_balance, Decimal("15000.00"))
+        request_ledger = LedgerTransaction.objects.get(
+            user=self.landlord,
+            kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+        )
+        self.assertEqual(request_ledger.status, LedgerTransaction.STATUS_REJECTED)
+
+    def test_bank_payout_requires_bank_code(self):
+        self.auth(self.landlord)
+
+        response = self.client.post(
+            reverse("landlord-payout-request"),
+            {"amount": "5000.00", "method": LandlordPayout.METHOD_BANK, "destination": "0123456789"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("bank_code", response.data)
 
     def test_dashboard_summary_carries_forward_previous_month_arrears(self):
         previous_month = (timezone.localdate().replace(day=1) - timedelta(days=1)).replace(day=1)
@@ -721,9 +947,247 @@ class DashboardSummaryTests(BaseAPITestCase):
         self.auth(self.tenant)
         response = self.client.get(reverse("dashboard-summary"))
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(Decimal(response.data["rent"]["balance"]), Decimal("5000.00"))
+        self.assertEqual(Decimal(response.data["active_lease"]["rent_status"]["balance"]), Decimal("5000.00"))
         self.assertFalse(PaymentTransaction.objects.filter(tenant=self.tenant).exists())
         self.tenant.profile.refresh_from_db()
         self.assertEqual(self.tenant.profile.wallet_available, Decimal("5000.00"))
+
+
+class WalletWithdrawalTests(BaseAPITestCase):
+    def setUp(self):
+        self.landlord = self.create_user("landlord_wallet", Profile.ROLE_LANDLORD)
+        self.tenant = self.create_user("tenant_wallet", Profile.ROLE_TENANT)
+        self.tenant.profile.wallet_available = Decimal("5000.00")
+        self.tenant.profile.save(update_fields=["wallet_available"])
+
+    def test_can_withdraw_wallet_allows_tenant_with_no_active_leases(self):
+        allowed, message = can_withdraw_wallet(self.tenant, Decimal("1000.00"))
+        self.assertTrue(allowed)
+        self.assertIsNone(message)
+
+    def test_can_withdraw_wallet_blocks_if_any_active_lease_has_arrears(self):
+        property_one = Property.objects.create(landlord=self.landlord, name="One", location="NBO")
+        property_two = Property.objects.create(landlord=self.landlord, name="Two", location="KSM")
+        unit_one = Unit.objects.create(
+            property=property_one,
+            unit_number="A1",
+            unit_type=Unit.TYPE_SINGLE,
+            rent_amount=Decimal("6000.00"),
+            deposit=Decimal("6000.00"),
+        )
+        unit_two = Unit.objects.create(
+            property=property_two,
+            unit_number="B1",
+            unit_type=Unit.TYPE_SINGLE,
+            rent_amount=Decimal("4000.00"),
+            deposit=Decimal("4000.00"),
+        )
+        Lease.objects.create(
+            unit=unit_one,
+            tenant=self.tenant,
+            rent_amount=Decimal("6000.00"),
+            start_date=timezone.localdate(),
+            due_day=15,
+            status=Lease.STATUS_ACTIVE,
+        )
+        paid_lease = Lease.objects.create(
+            unit=unit_two,
+            tenant=self.tenant,
+            rent_amount=Decimal("4000.00"),
+            start_date=timezone.localdate(),
+            due_day=15,
+            status=Lease.STATUS_ACTIVE,
+        )
+        PaymentTransaction.objects.create(
+            lease=paid_lease,
+            tenant=self.tenant,
+            period=timezone.localdate().strftime("%Y-%m"),
+            billing_period=timezone.localdate().replace(day=1),
+            phone_number="254700000001",
+            amount=Decimal("4000.00"),
+            payment_method=PaymentTransaction.METHOD_MPESA,
+            checkout_request_id="paid-lease",
+            status=PaymentTransaction.STATUS_SUCCESS,
+            allocation_done=True,
+        )
+
+        allowed, message = can_withdraw_wallet(self.tenant, Decimal("1000.00"))
+
+        self.assertFalse(allowed)
+        self.assertIn("outstanding rent", message)
+
+    def test_wallet_withdraw_blocks_before_deducting_balance_when_rent_is_outstanding(self):
+        property_obj = Property.objects.create(landlord=self.landlord, name="P", location="NBO")
+        unit = Unit.objects.create(
+            property=property_obj,
+            unit_number="U1",
+            unit_type=Unit.TYPE_SINGLE,
+            rent_amount=Decimal("10000.00"),
+            deposit=Decimal("10000.00"),
+        )
+        Lease.objects.create(
+            unit=unit,
+            tenant=self.tenant,
+            rent_amount=Decimal("10000.00"),
+            start_date=timezone.localdate(),
+            due_day=15,
+            status=Lease.STATUS_ACTIVE,
+        )
+
+        self.auth(self.tenant)
+        response = self.client.post(
+            reverse("wallet-withdraw"),
+            {"amount": "1000.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("outstanding rent", response.data["detail"])
+        self.tenant.profile.refresh_from_db()
+        self.assertEqual(self.tenant.profile.wallet_available, Decimal("5000.00"))
+        self.assertFalse(
+            LedgerTransaction.objects.filter(
+                user=self.tenant,
+                kind=LedgerTransaction.KIND_WALLET_WITHDRAW_REQUEST,
+            ).exists()
+        )
+
+    def test_wallet_withdraw_allows_tenant_without_active_lease(self):
+        self.auth(self.tenant)
+        response = self.client.post(
+            reverse("wallet-withdraw"),
+            {"amount": "1000.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.tenant.profile.refresh_from_db()
+        self.assertEqual(self.tenant.profile.wallet_available, Decimal("4000.00"))
+        self.assertTrue(
+            LedgerTransaction.objects.filter(
+                user=self.tenant,
+                kind=LedgerTransaction.KIND_WALLET_WITHDRAW_REQUEST,
+                amount=Decimal("1000.00"),
+                status=LedgerTransaction.STATUS_PENDING,
+            ).exists()
+        )
+
+
+class UnlockBalancesCommandTests(BaseAPITestCase):
+    def test_command_unlocks_due_landlord_credit(self):
+        landlord = self.create_user("landlord_unlock", Profile.ROLE_LANDLORD)
+        balance = LandlordBalance.objects.create(
+            landlord=landlord,
+            available_balance=Decimal("1000.00"),
+            locked_balance=Decimal("2500.00"),
+        )
+        row = LedgerTransaction.objects.create(
+            user=landlord,
+            kind=LedgerTransaction.KIND_LANDLORD_CREDIT_RENT,
+            amount=Decimal("2500.00"),
+            status=LedgerTransaction.STATUS_LOCKED,
+            available_at=timezone.now() - timedelta(minutes=5),
+            reference_text="rent credit ready",
+        )
+
+        stdout = StringIO()
+        call_command("unlock_balances", stdout=stdout)
+
+        row.refresh_from_db()
+        balance.refresh_from_db()
+        self.assertEqual(row.status, LedgerTransaction.STATUS_AVAILABLE)
+        self.assertEqual(balance.locked_balance, Decimal("0.00"))
+        self.assertEqual(balance.available_balance, Decimal("3500.00"))
+        self.assertIn("Unlocked: 1", stdout.getvalue())
+
+    def test_command_unlocks_due_wallet_credit_only(self):
+        tenant = self.create_user("tenant_unlock", Profile.ROLE_TENANT)
+        profile = tenant.profile
+        profile.wallet_available = Decimal("100.00")
+        profile.wallet_locked = Decimal("1300.00")
+        profile.save(update_fields=["wallet_available", "wallet_locked"])
+        due_row = LedgerTransaction.objects.create(
+            user=tenant,
+            kind=LedgerTransaction.KIND_WALLET_CREDIT,
+            amount=Decimal("900.00"),
+            status=LedgerTransaction.STATUS_LOCKED,
+            available_at=timezone.now() - timedelta(minutes=5),
+            reference_text="due wallet credit",
+        )
+        future_row = LedgerTransaction.objects.create(
+            user=tenant,
+            kind=LedgerTransaction.KIND_WALLET_CREDIT,
+            amount=Decimal("400.00"),
+            status=LedgerTransaction.STATUS_LOCKED,
+            available_at=timezone.now() + timedelta(hours=2),
+            reference_text="future wallet credit",
+        )
+
+        call_command("unlock_balances")
+
+        profile.refresh_from_db()
+        due_row.refresh_from_db()
+        future_row.refresh_from_db()
+        self.assertEqual(due_row.status, LedgerTransaction.STATUS_AVAILABLE)
+        self.assertEqual(future_row.status, LedgerTransaction.STATUS_LOCKED)
+        self.assertEqual(profile.wallet_available, Decimal("1000.00"))
+        self.assertEqual(profile.wallet_locked, Decimal("400.00"))
+
+    def test_command_continues_when_one_unlock_fails(self):
+        bad_tenant = self.create_user("tenant_unlock_bad", Profile.ROLE_TENANT)
+        good_tenant = self.create_user("tenant_unlock_good", Profile.ROLE_TENANT)
+
+        bad_profile = bad_tenant.profile
+        bad_profile.wallet_available = Decimal("0.00")
+        bad_profile.wallet_locked = Decimal("500.00")
+        bad_profile.save(update_fields=["wallet_available", "wallet_locked"])
+        good_profile = good_tenant.profile
+        good_profile.wallet_available = Decimal("200.00")
+        good_profile.wallet_locked = Decimal("700.00")
+        good_profile.save(update_fields=["wallet_available", "wallet_locked"])
+
+        bad_row = LedgerTransaction.objects.create(
+            user=bad_tenant,
+            kind=LedgerTransaction.KIND_WALLET_CREDIT,
+            amount=Decimal("500.00"),
+            status=LedgerTransaction.STATUS_LOCKED,
+            available_at=timezone.now() - timedelta(minutes=5),
+            reference_text="bad wallet credit",
+        )
+        good_row = LedgerTransaction.objects.create(
+            user=good_tenant,
+            kind=LedgerTransaction.KIND_WALLET_CREDIT,
+            amount=Decimal("700.00"),
+            status=LedgerTransaction.STATUS_LOCKED,
+            available_at=timezone.now() - timedelta(minutes=5),
+            reference_text="good wallet credit",
+        )
+
+        original_save = Profile.save
+
+        def flaky_save(profile_self, *args, **kwargs):
+            if profile_self.pk == bad_profile.pk:
+                raise RuntimeError("simulated unlock failure")
+            return original_save(profile_self, *args, **kwargs)
+
+        stdout = StringIO()
+        with patch("core.management.commands.unlock_balances.Profile.save", new=flaky_save):
+            call_command("unlock_balances", stdout=stdout)
+
+        bad_profile.refresh_from_db()
+        good_profile.refresh_from_db()
+        bad_row.refresh_from_db()
+        good_row.refresh_from_db()
+
+        self.assertEqual(bad_row.status, LedgerTransaction.STATUS_LOCKED)
+        self.assertEqual(bad_profile.wallet_available, Decimal("0.00"))
+        self.assertEqual(bad_profile.wallet_locked, Decimal("500.00"))
+        self.assertEqual(good_row.status, LedgerTransaction.STATUS_AVAILABLE)
+        self.assertEqual(good_profile.wallet_available, Decimal("900.00"))
+        self.assertEqual(good_profile.wallet_locked, Decimal("0.00"))
+        self.assertIn("Unlocked: 1", stdout.getvalue())
+        self.assertIn("Failed: 1", stdout.getvalue())
 
 
 class DocumentAccessTests(BaseAPITestCase):

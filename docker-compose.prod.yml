@@ -1,13 +1,22 @@
 services:
-  postgres:
-    image: postgres:16-alpine
+  mysql:
+    image: mysql:8.4
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-krib_db}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-krib_db}
+      MYSQL_USER: ${MYSQL_USER:-krib_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-krib_password}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   backend:
     build:
@@ -16,7 +25,8 @@ services:
       target: prod
     restart: unless-stopped
     depends_on:
-      - postgres
+      mysql:
+        condition: service_healthy
     environment:
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
       DJANGO_DEBUG: "0"
@@ -28,8 +38,12 @@ services:
       DJANGO_GUNICORN_WORKERS: ${DJANGO_GUNICORN_WORKERS:-3}
       DJANGO_GUNICORN_TIMEOUT: ${DJANGO_GUNICORN_TIMEOUT:-120}
       DJANGO_COLLECTSTATIC: ${DJANGO_COLLECTSTATIC:-1}
-      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@postgres:5432/krib_db}
-      DATABASE_SSLMODE: ${DATABASE_SSLMODE:-disable}
+      DATABASE_URL: ${DATABASE_URL:-mysql://krib_user:krib_password@mysql:3306/krib_db}
+      MYSQL_CHARSET: ${MYSQL_CHARSET:-utf8mb4}
+      MYSQL_USE_SSL: ${MYSQL_USE_SSL:-0}
+      MYSQL_SSL_CA: ${MYSQL_SSL_CA:-}
+      MYSQL_SSL_CERT: ${MYSQL_SSL_CERT:-}
+      MYSQL_SSL_KEY: ${MYSQL_SSL_KEY:-}
       DJANGO_CONN_MAX_AGE: ${DJANGO_CONN_MAX_AGE:-60}
       JWT_ACCESS_MINUTES: ${JWT_ACCESS_MINUTES:-60}
       JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-7}
@@ -94,7 +108,8 @@ services:
       target: prod
     restart: unless-stopped
     depends_on:
-      - postgres
+      mysql:
+        condition: service_healthy
     command: ["sh", "-c", "python manage.py migrate --noinput && python manage.py run_periodic_tasks"]
     environment:
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
@@ -104,8 +119,12 @@ services:
       DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS}
       DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-1}
       DJANGO_LOG_LEVEL: ${DJANGO_LOG_LEVEL:-INFO}
-      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:postgres@postgres:5432/krib_db}
-      DATABASE_SSLMODE: ${DATABASE_SSLMODE:-disable}
+      DATABASE_URL: ${DATABASE_URL:-mysql://krib_user:krib_password@mysql:3306/krib_db}
+      MYSQL_CHARSET: ${MYSQL_CHARSET:-utf8mb4}
+      MYSQL_USE_SSL: ${MYSQL_USE_SSL:-0}
+      MYSQL_SSL_CA: ${MYSQL_SSL_CA:-}
+      MYSQL_SSL_CERT: ${MYSQL_SSL_CERT:-}
+      MYSQL_SSL_KEY: ${MYSQL_SSL_KEY:-}
       DJANGO_CONN_MAX_AGE: ${DJANGO_CONN_MAX_AGE:-60}
       JWT_ACCESS_MINUTES: ${JWT_ACCESS_MINUTES:-60}
       JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-7}
@@ -144,6 +163,6 @@ services:
       - media_data:/usr/share/nginx/media:ro
 
 volumes:
-  postgres_data:
+  mysql_data:
   media_data:
   static_data:

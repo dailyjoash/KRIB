@@ -15,7 +15,7 @@ export default function TenantWallet() {
       const res = await api.get("/api/wallet/");
       setWallet(res.data);
     } catch {
-      setError("Failed to load wallet");
+      setError("Failed to load rent credit");
       setWallet({ wallet_available: 0, wallet_locked: 0, recent: [], pending_withdrawals: [] });
     }
   };
@@ -40,7 +40,7 @@ export default function TenantWallet() {
   return (
     <div className="dashboard-container">
       {error ? <p className="error">{error}</p> : null}
-      <GlassCard title="Wallet Balances" actions={<WalletCards size={16} />}>
+      <GlassCard title="Rent Credit Balances" actions={<WalletCards size={16} />}>
         <div className="stack-list compact">
           <article className="stack-item">
             <div className="stack-item-main">
@@ -61,12 +61,11 @@ export default function TenantWallet() {
             </div>
           </article>
         </div>
-        <p className="subtitle">Wallet credits unlock after the configured hold period before withdrawal can be requested.</p>
       </GlassCard>
 
-      <GlassCard title="Request Withdrawal" actions={<span className="subtitle">Tenant wallet payout request</span>}>
+      <GlassCard title="Request Withdrawal" actions={<span className="subtitle">Tenant rent credit payout request</span>}>
         <div className="form-stack">
-          <input placeholder="Withdraw amount (KES)" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <input aria-label="Withdrawal amount" type="number" value={amount} onChange={(e) => setAmount(e.target.value)} />
           <button className="btn btn-primary" type="button" onClick={requestWithdrawal}>
             <ArrowDownToLine size={18} />
             <span>Request Withdrawal</span>
@@ -74,9 +73,9 @@ export default function TenantWallet() {
         </div>
       </GlassCard>
 
-      <GlassCard title="Recent Wallet Activity" actions={<span className="subtitle">{wallet.pending_withdrawals?.length || 0} pending withdrawals</span>}>
+      <GlassCard title="Recent Rent Credit Activity" actions={<span className="subtitle">{wallet.pending_withdrawals?.length || 0} pending withdrawals</span>}>
         {wallet.recent?.length === 0 ? (
-          <p>No wallet transactions yet.</p>
+          <p>No rent credit transactions yet.</p>
         ) : (
           <div className="stack-list">
             {wallet.recent?.map((row) => (

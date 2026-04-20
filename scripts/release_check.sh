@@ -15,9 +15,11 @@ fi
 
 echo "==> Backend tests"
 cd "$ROOT_DIR/backend"
+DATABASE_URL=sqlite:///:memory: \
 "$PYTHON_BIN" manage.py test
 
 echo "==> Django deploy checks"
+DATABASE_URL=sqlite:///:memory: \
 DJANGO_DEBUG=0 \
 DJANGO_SECRET_KEY=12345678901234567890123456789012345678901234567890 \
 DJANGO_ALLOWED_HOSTS=example.com \
@@ -27,6 +29,7 @@ DJANGO_SECURE_SSL_REDIRECT=1 \
 "$PYTHON_BIN" manage.py check --deploy
 
 echo "==> Static asset collection"
+DATABASE_URL=sqlite:///:memory: \
 DJANGO_DEBUG=0 \
 DJANGO_SECRET_KEY=12345678901234567890123456789012345678901234567890 \
 DJANGO_ALLOWED_HOSTS=example.com \

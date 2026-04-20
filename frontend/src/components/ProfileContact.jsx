@@ -112,11 +112,11 @@ export default function ProfileContact() {
           </p>
           <label className="resident-field">
             <span>Phone number</span>
-            <input ref={phoneInputRef} type="tel" value={form.phone_number} onChange={(e) => setForm({ ...form, phone_number: e.target.value })} placeholder="Phone number" />
+            <input ref={phoneInputRef} type="tel" value={form.phone_number} onChange={(e) => setForm({ ...form, phone_number: e.target.value })} />
           </label>
           <label className="resident-field">
             <span>Email address</span>
-            <input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="Email address" />
+            <input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
           </label>
           <div className="resident-form-actions resident-profile-form-actions">
             <button className="resident-link-btn" type="button" onClick={resetForm} disabled={!contactChanged}>Reset</button>

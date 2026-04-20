@@ -10,6 +10,7 @@ if (-not (Test-Path $python)) {
 Write-Host "==> Backend tests"
 Push-Location (Join-Path $root "backend")
 try {
+    $env:DATABASE_URL = "sqlite:///:memory:"
     & $python manage.py test
 
     Write-Host "==> Django deploy checks"

@@ -9,13 +9,17 @@ __pycache__/
 
 # Django
 db.sqlite3
+test_db.sqlite3
+backend/test_db.sqlite3
 backend/media/
 backend/staticfiles/
 *.log
 
 # Env files
 .env
+.env.local
 .env.*
+*.env
 !.env.example
 
 # Node / React

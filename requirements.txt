@@ -7,6 +7,8 @@ python-dotenv
 
 django-cors-headers
 django-crontab
+intasend-python
+python-magic
 reportlab
 stripe
 whitenoise

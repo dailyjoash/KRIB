@@ -10,7 +10,7 @@ import StatusBadge from "./StatusBadge";
 const tabs = [
   { id: "invoices", label: "Invoices" },
   { id: "payments", label: "Payments" },
-  { id: "wallet", label: "Wallet" },
+  { id: "wallet", label: "Rent Credit" },
 ];
 
 const resolveTab = (tab) => {
@@ -178,7 +178,7 @@ export default function TenantFinance() {
           <div className="resident-toolbar">
             <label className="resident-search">
               <Search size={16} />
-              <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder={`Search ${activeTab}`} />
+              <input value={search} onChange={(e) => setSearch(e.target.value)} aria-label={`Search ${activeTab}`} />
             </label>
             <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
             <button className="resident-primary-btn" type="button" onClick={downloadStatement}>
@@ -244,7 +244,7 @@ export default function TenantFinance() {
           <div className="resident-table-list">
             <div className="resident-profile-columns">
               <div className="resident-profile-item">
-                <span>Available Balance</span>
+                <span>Available Credit</span>
                 <strong>{formatKES(wallet?.wallet_available || 0)}</strong>
               </div>
               <div className="resident-profile-item">
@@ -257,10 +257,6 @@ export default function TenantFinance() {
               </div>
             </div>
 
-            <p className="resident-helper-text">
-              Wallet credits unlock after the configured hold period before a withdrawal can be requested.
-            </p>
-
             <div className="resident-composer">
               <div className="resident-title-row">
                 <WalletCards size={18} />
@@ -268,11 +264,11 @@ export default function TenantFinance() {
               </div>
               <div className="resident-form-grid">
                 <input
-                  placeholder="Withdraw amount (KES)"
                   type="number"
                   min="0"
                   value={withdrawAmount}
                   onChange={(e) => setWithdrawAmount(e.target.value)}
+                  aria-label="Withdrawal amount"
                 />
                 <button className="resident-primary-btn" type="button" onClick={requestWithdrawal}>
                   Request Withdrawal
@@ -299,7 +295,7 @@ export default function TenantFinance() {
                     </div>
                     <div className="resident-row-main">
                       <h4>{formatKES(row.amount)}</h4>
-                      <p>{row.reference_text || "Wallet withdrawal request"}</p>
+                      <p>{row.reference_text || "Rent credit withdrawal request"}</p>
                     </div>
                     <div className="resident-row-meta">
                       <span>{formatDateTime(row.created_at)}</span>
@@ -314,13 +310,13 @@ export default function TenantFinance() {
               <div className="resident-section-head">
                 <div className="resident-title-row">
                   <WalletCards size={18} />
-                  <h3>Recent Wallet Activity</h3>
+                  <h3>Recent Rent Credit Activity</h3>
                 </div>
                 <span className="resident-chip">{wallet?.recent?.length || 0} entries</span>
               </div>
 
               {wallet?.recent?.length === 0 ? (
-                <p className="subtitle">No wallet transactions yet.</p>
+                <p className="subtitle">No rent credit transactions yet.</p>
               ) : (
                 wallet.recent.map((row) => (
                   <article className="resident-row-card" key={row.id}>
