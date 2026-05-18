@@ -125,7 +125,7 @@ def _database_config_from_env():
             "Unsupported DATABASE_URL scheme. Use mysql://, mariadb://, or sqlite:///")
 
 
-DEBUG = os.getenv("DJANGO_DEBUG", "1") == "1"
+DEBUG = os.getenv("DJANGO_DEBUG", "0") == "1"
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "").strip()
 if not SECRET_KEY:
     if DEBUG:
@@ -222,6 +222,7 @@ REST_FRAMEWORK = {
         "register": "5/min",
         "password_reset": "3/min",
         "stk_initiate": "10/min",
+        "otp_verify": "5/minute",
     },
 }
 

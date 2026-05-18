@@ -376,6 +376,12 @@ class TenantInviteSerializer(serializers.ModelSerializer):
     property_name = serializers.CharField(source="property.name", read_only=True)
     unit_label = serializers.SerializerMethodField()
     expires_at = serializers.DateTimeField(required=False)
+    otp_code = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+    )
 
     class Meta:
         model = TenantInvite

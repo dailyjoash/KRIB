@@ -412,7 +412,7 @@ def send_sms(phone_number, message, *, include_detail=False):
 def intasend_stk_push(phone_number, amount, reference):
     token = os.getenv("INTASEND_API_TOKEN", "").strip()
     publishable_key = os.getenv("INTASEND_PUBLISHABLE_KEY", "").strip()
-    test_mode = _env_flag(os.getenv("INTASEND_TEST_MODE"), default=True)
+    test_mode = _env_flag(os.getenv("INTASEND_TEST_MODE"), default=False)
 
     if not token or not publishable_key:
         return {"success": False, "error": "IntaSend is not configured."}
@@ -455,7 +455,7 @@ def _intasend_service_kwargs():
     publishable_key = os.getenv("INTASEND_PUBLISHABLE_KEY", "").strip()
     kwargs = {
         "token": token,
-        "test": _env_flag(os.getenv("INTASEND_TEST_MODE"), default=True),
+        "test": _env_flag(os.getenv("INTASEND_TEST_MODE"), default=False),
     }
     if publishable_key:
         kwargs["publishable_key"] = publishable_key

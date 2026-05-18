@@ -18,7 +18,7 @@ from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.http import FileResponse, Http404
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import F, Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils.encoding import force_bytes, force_str
 from django.utils.decorators import method_decorator
@@ -108,6 +108,7 @@ from .services import (
 )
 from .throttles import (
     LoginRateThrottle,
+    OTPRateThrottle,
     PasswordResetRateThrottle,
     RegisterRateThrottle,
     STKInitiateRateThrottle,
@@ -1288,18 +1289,41 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
         invite.save(update_fields=["status"])
         return Response({"detail": "Tenant invite cancelled.", "status": invite.status}, status=200)
 
-    @action(detail=True, methods=["post"], url_path="verify-otp")
+    @action(detail=True, methods=["post"], url_path="verify-otp", throttle_classes=[OTPRateThrottle])
     def verify_otp(self, request, pk=None):
         invite = TenantInvite.objects.filter(token=pk).first()
         if not invite:
             return Response({"detail": "Tenant invite not found."}, status=404)
-        otp = request.data.get("otp_code")
         if not invite.otp_code:
             return Response({"detail": "OTP not enabled for this invite."}, status=400)
         if invite.otp_expires_at and timezone.now() > invite.otp_expires_at:
             return Response({"detail": "OTP expired."}, status=400)
-        if otp != invite.otp_code:
+
+        if invite.otp_locked:
+            return Response(
+                {"detail": "Too many failed attempts. Request a new invite."},
+                status=429,
+            )
+
+        TenantInvite.objects.filter(pk=invite.pk).update(
+            otp_attempts=F("otp_attempts") + 1
+        )
+        invite.refresh_from_db()
+
+        if invite.otp_attempts > 5:
+            invite.otp_locked = True
+            invite.save(update_fields=["otp_locked"])
+            return Response(
+                {"detail": "Too many failed attempts. Request a new invite."},
+                status=429,
+            )
+
+        submitted_otp = (request.data.get("otp_code") or "").strip()
+        if not submitted_otp or submitted_otp != invite.otp_code:
             return Response({"detail": "Invalid OTP."}, status=400)
+
+        invite.otp_attempts = 0
+        invite.save(update_fields=["otp_attempts"])
         return Response({"detail": "OTP verified."})
 
     @action(detail=True, methods=["post"])

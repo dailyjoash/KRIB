@@ -168,6 +168,8 @@ class TenantInvite(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
     expires_at = models.DateTimeField()
     otp_code = models.CharField(max_length=6, blank=True, null=True)
+    otp_attempts = models.PositiveSmallIntegerField(default=0)
+    otp_locked = models.BooleanField(default=False)
     otp_expires_at = models.DateTimeField(blank=True, null=True)
 
     def is_expired(self):

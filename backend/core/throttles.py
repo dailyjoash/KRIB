@@ -1,4 +1,4 @@
-from rest_framework.throttling import SimpleRateThrottle
+from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle
 
 
 class IdentityRateThrottle(SimpleRateThrottle):
@@ -30,3 +30,7 @@ class PasswordResetRateThrottle(IdentityRateThrottle):
 
 class STKInitiateRateThrottle(IdentityRateThrottle):
     scope = "stk_initiate"
+
+
+class OTPRateThrottle(AnonRateThrottle):
+    scope = "otp_verify"
