@@ -42,6 +42,9 @@ jobs:
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Install libmagic (required by python-magic)
+        run: sudo apt-get update && sudo apt-get install -y libmagic1
+
       - name: Install backend dependencies
         run: pip install -r backend/requirements.txt
 
@@ -56,18 +59,37 @@ jobs:
         env:
           DATABASE_URL: mysql://krib_user:krib_password@127.0.0.1:3306/krib_db
           DJANGO_DEBUG: "0"
-          DJANGO_SECRET_KEY: "12345678901234567890123456789012345678901234567890"
+          DJANGO_SECRET_KEY: "ci-only-secret-key-please-replace-12345678901234567890"
           DJANGO_ALLOWED_HOSTS: "example.com"
           DJANGO_CORS_ALLOWED_ORIGINS: "https://app.example.com"
           DJANGO_CSRF_TRUSTED_ORIGINS: "https://app.example.com"
           DJANGO_SECURE_SSL_REDIRECT: "1"
+          INTASEND_WEBHOOK_SECRET: "ci-only-intasend-webhook-secret-please-replace-1234567890"
+          # When STRIPE_SECRET_KEY is set in real deploys, STRIPE_WEBHOOK_SECRET
+          # must also be present (settings.py now enforces this at boot). The
+          # CI deploy check leaves STRIPE_SECRET_KEY unset so we don't need it,
+          # but operators editing this file should add both together.
+          DEFAULT_PAYMENT_CURRENCY: "KES"
         run: |
           python manage.py check --deploy
           python manage.py collectstatic --noinput
 
+      - name: pip-audit (advisory)
+        # Advisory only; failing dependencies should be triaged but not block
+        # the build until we have an explicit allow-list.
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit -r backend/requirements.txt
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+
+      - name: npm audit (advisory)
+        working-directory: frontend
+        continue-on-error: true
+        run: npm audit --audit-level=high
 
       - name: Build frontend
         working-directory: frontend

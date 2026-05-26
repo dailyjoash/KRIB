@@ -6,6 +6,7 @@ from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import RegexValidator
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 try:
@@ -31,6 +32,168 @@ from .models import (
     compute_lease_rent_status,
 )
 from .services import build_lease_agreement_pdf, normalize_mpesa_phone_number
+
+
+def _scoped_property_queryset(user):
+    """Mirror of views._scoped_properties (kept local to avoid import cycles)."""
+    if not user or not user.is_authenticated:
+        return Property.objects.none()
+    if user.is_staff:
+        return Property.objects.all()
+    profile = getattr(user, "profile", None)
+    role = profile.role if profile else None
+    if role == Profile.ROLE_LANDLORD:
+        return Property.objects.filter(landlord=user)
+    if role == Profile.ROLE_MANAGER:
+        return Property.objects.filter(manager=user)
+    if role == Profile.ROLE_TENANT:
+        return Property.objects.filter(
+            units__leases__tenant=user,
+            units__leases__status=Lease.STATUS_ACTIVE,
+        ).distinct()
+    return Property.objects.none()
+
+
+def _scoped_user_field(role, related_field=None):
+    """Return a callable suitable for `queryset=` on PrimaryKeyRelatedField.
+
+    Tenants and managers are both restricted to people who have a legitimate
+    relationship to the requesting landlord/manager. This blocks the
+    "attach another landlord's tenant/manager to my own lease/property"
+    attack identified in the security review.
+    """
+
+    def _qs(serializer):
+        request = serializer.context.get("request") if serializer.context else None
+        user = getattr(request, "user", None) if request else None
+        base = User.objects.filter(profile__role=role)
+        if not user or not user.is_authenticated:
+            return base.none()
+        if user.is_staff:
+            return base
+
+        scoped = _scoped_property_queryset(user)
+        if role == Profile.ROLE_TENANT:
+            # Tenants the requester is allowed to point a lease at:
+            #   - tenants currently on a lease in one of their properties, or
+            #   - tenants whose accepted invite was created by this requester
+            #     (matched by the invite's email or phone since TenantInvite
+            #     itself has no FK back to the resulting User).
+            invite_emails = list(
+                TenantInvite.objects.filter(
+                    invited_by=user,
+                    status=TenantInvite.STATUS_ACCEPTED,
+                )
+                .exclude(email__isnull=True)
+                .exclude(email__exact="")
+                .values_list("email", flat=True)
+            )
+            invite_phones = list(
+                TenantInvite.objects.filter(
+                    invited_by=user,
+                    status=TenantInvite.STATUS_ACCEPTED,
+                )
+                .exclude(phone__isnull=True)
+                .exclude(phone__exact="")
+                .values_list("phone", flat=True)
+            )
+            filters = Q(leases__unit__property__in=scoped)
+            if invite_emails:
+                filters |= Q(email__in=invite_emails)
+            if invite_phones:
+                filters |= Q(profile__phone_number__in=invite_phones) | Q(
+                    tenant_profile__phone__in=invite_phones
+                )
+            return base.filter(filters).distinct()
+
+        if role == Profile.ROLE_MANAGER:
+            # Managers the requester may attach: those already running one of
+            # their properties, OR managers whose email/phone matches a
+            # ManagerInvite that this requester sent and that was accepted.
+            # ManagerInvite has no FK back to the resulting User so we match
+            # the contact fields the invite was sent to.
+            invites = ManagerInvite.objects.filter(
+                created_by=user,
+                accepted_at__isnull=False,
+            )
+            invite_emails = list(
+                invites.exclude(email__isnull=True)
+                .exclude(email__exact="")
+                .values_list("email", flat=True)
+            )
+            invite_phones = list(
+                invites.exclude(phone__isnull=True)
+                .exclude(phone__exact="")
+                .values_list("phone", flat=True)
+            )
+            filters = Q(managed_properties__in=scoped)
+            if invite_emails:
+                filters |= Q(email__in=invite_emails)
+            if invite_phones:
+                filters |= Q(profile__phone_number__in=invite_phones)
+            return base.filter(filters).distinct()
+        return base.none()
+
+    _qs.__name__ = f"scoped_{role}_users"
+    return _qs
+
+
+class ScopedPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
+    """PrimaryKeyRelatedField that resolves its queryset at request time using
+    the current request user. Use this for any FK whose target must be inside
+    the requester's scope (their properties, their tenants, etc.).
+    """
+
+    def __init__(self, *, scope_queryset, **kwargs):
+        self._scope_queryset = scope_queryset
+        # Provide a placeholder queryset so DRF's parent __init__ accepts it.
+        super().__init__(queryset=Property.objects.none(), **kwargs)
+
+    def get_queryset(self):
+        return self._scope_queryset(self)
+
+
+def _scoped_property_field(field):
+    request = field.context.get("request") if field.context else None
+    user = getattr(request, "user", None) if request else None
+    return _scoped_property_queryset(user)
+
+
+def _scoped_unit_field(field):
+    request = field.context.get("request") if field.context else None
+    user = getattr(request, "user", None) if request else None
+    if not user or not user.is_authenticated:
+        return Unit.objects.none()
+    if user.is_staff:
+        return Unit.objects.all()
+    return Unit.objects.filter(property__in=_scoped_property_queryset(user))
+
+
+# Explicit deny-list of script-bearing MIME families that must never be served
+# inline by any of our /media/ endpoints, even if libmagic mis-classifies them
+# as an image or PDF. Defence in depth.
+_FORBIDDEN_MIME_PREFIXES = (
+    "text/html",
+    "application/xhtml",
+    "image/svg",
+    "application/javascript",
+    "text/javascript",
+)
+
+# Magic byte sniff: if any of these appear in the first 4 KiB we refuse the
+# upload regardless of the declared MIME type or extension. Catches HTML/SVG
+# files renamed to .pdf/.jpg/.png.
+_FORBIDDEN_MAGIC_SUBSTRINGS = (
+    b"<html",
+    b"<HTML",
+    b"<!doctype html",
+    b"<!DOCTYPE html",
+    b"<script",
+    b"<SCRIPT",
+    b"<svg",
+    b"<SVG",
+    b"<?xml",  # SVG starts with this too; we also block all xml on these endpoints
+)
 
 
 def validate_uploaded_file(upload, *, allowed_mime_types, max_size=None):
@@ -60,9 +223,41 @@ def validate_uploaded_file(upload, *, allowed_mime_types, max_size=None):
     mime_type = magic.from_buffer(sample or b"", mime=True)
     if mime_type not in allowed_mime_types:
         allowed_labels = ", ".join(sorted(allowed_mime_types))
-        raise serializers.ValidationError(f"Unsupported file type '{mime_type}'. Allowed types: {allowed_labels}.")
+        raise serializers.ValidationError(
+            f"Unsupported file type '{mime_type}'. Allowed types: {allowed_labels}."
+        )
+
+    if any(mime_type.startswith(prefix) for prefix in _FORBIDDEN_MIME_PREFIXES):
+        raise serializers.ValidationError("This file type is not allowed.")
+
+    # Even if libmagic identifies the file as an "image/png", reject it if
+    # the head of the file looks like HTML/SVG/script. Browsers can sniff
+    # in surprising ways, and we never want to serve user content that could
+    # execute in their own browsing context.
+    head = (sample or b"")[:512]
+    if any(token in head for token in _FORBIDDEN_MAGIC_SUBSTRINGS):
+        raise serializers.ValidationError("This file appears to contain script content and is not allowed.")
 
     return upload
+
+
+# Centralized minimum so we cannot accidentally drop one signup path back to
+# 6 characters in the future. Django's AUTH_PASSWORD_VALIDATORS still runs on
+# top of this length check.
+MIN_USER_PASSWORD_LENGTH = 12
+
+
+def _validate_signup_password(value, *, user=None):
+    if len(value) < MIN_USER_PASSWORD_LENGTH:
+        raise serializers.ValidationError(
+            f"Password must be at least {MIN_USER_PASSWORD_LENGTH} characters long."
+        )
+    try:
+        validate_password(value, user=user)
+    except Exception as exc:  # django.core.exceptions.ValidationError shape varies
+        messages = getattr(exc, "messages", None) or [str(exc)]
+        raise serializers.ValidationError(messages)
+    return value
 
 
 class LandlordSignupSerializer(serializers.Serializer):
@@ -75,7 +270,10 @@ class LandlordSignupSerializer(serializers.Serializer):
         allow_blank=True,
         validators=[RegexValidator(regex=r"^[0-9+\-()\s]{7,20}$", message="Invalid phone number format.")],
     )
-    password = serializers.CharField(write_only=True, min_length=6)
+    password = serializers.CharField(write_only=True)
+
+    def validate_password(self, value):
+        return _validate_signup_password(value)
 
 
 class RegisterSerializer(serializers.Serializer):
@@ -89,11 +287,15 @@ class RegisterSerializer(serializers.Serializer):
         validators=[RegexValidator(regex=r"^[0-9+\-()\s]{7,20}$", message="Invalid phone number format.")],
     )
     role = serializers.ChoiceField(choices=ROLE_CHOICES)
-    password = serializers.CharField(write_only=True, min_length=8)
+    password = serializers.CharField(write_only=True)
+
+    def validate_password(self, value):
+        return _validate_signup_password(value)
 
     def validate_email(self, value):
-        if User.objects.filter(email__iexact=value).exists():
-            raise serializers.ValidationError("Email already registered.")
+        # Do not leak whether an address already exists. The view layer is
+        # responsible for short-circuiting on collision without surfacing it
+        # to the caller (account-enumeration mitigation).
         return value
 
 
@@ -193,6 +395,32 @@ class LandlordSettingsSerializer(serializers.ModelSerializer):
 
         return attrs
 
+    def update(self, instance, validated_data):
+        # If the payout target changed, stamp the change time so the payout
+        # endpoint can enforce a cool-down window. Without this, a hijacked
+        # landlord session can update the destination then immediately drain
+        # funds because the destination-match guard alone is trivially
+        # bypassed by editing the saved destination first.
+        previous_dest = (instance.payout_destination or "").strip()
+        previous_method = (instance.payout_method or "").strip().upper()
+        previous_bank = (instance.payout_bank_code or "").strip()
+
+        new_dest = (validated_data.get("payout_destination", instance.payout_destination) or "").strip()
+        new_method = (validated_data.get("payout_method", instance.payout_method) or "").strip().upper()
+        new_bank = (validated_data.get("payout_bank_code", instance.payout_bank_code) or "").strip()
+
+        target_changed = (
+            new_dest != previous_dest
+            or new_method != previous_method
+            or new_bank != previous_bank
+        )
+
+        instance = super().update(instance, validated_data)
+        if target_changed:
+            instance.payout_destination_updated_at = timezone.now()
+            instance.save(update_fields=["payout_destination_updated_at"])
+        return instance
+
 
 class MeSerializer(serializers.Serializer):
     id = serializers.IntegerField(read_only=True)
@@ -209,14 +437,30 @@ class MeSerializer(serializers.Serializer):
         validators=[RegexValidator(regex=r"^[0-9+\-()\s]{7,20}$", message="Invalid phone number format.")],
     )
 
+    def validate_email(self, value):
+        # Reject change to an address already used by another account so a
+        # user cannot squat on someone else's email. Note: this is best-effort
+        # uniqueness without a DB constraint; collisions inside a race window
+        # are possible but unlikely. TODO(security): send a confirmation email
+        # to the new address and only persist on click-through.
+        if not value:
+            return value
+        request = self.context.get("request") if self.context else None
+        current_user = getattr(request, "user", None) if request else None
+        clash = User.objects.filter(email__iexact=value)
+        if current_user is not None and getattr(current_user, "pk", None):
+            clash = clash.exclude(pk=current_user.pk)
+        if clash.exists():
+            raise serializers.ValidationError("This email address is already in use.")
+        return value
+
 
 class ChangePasswordSerializer(serializers.Serializer):
     old_password = serializers.CharField(write_only=True)
     new_password = serializers.CharField(write_only=True)
 
     def validate_new_password(self, value):
-        validate_password(value)
-        return value
+        return _validate_signup_password(value)
 
 
 class PasswordResetRequestSerializer(serializers.Serializer):
@@ -229,8 +473,7 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
     new_password = serializers.CharField(write_only=True)
 
     def validate_new_password(self, value):
-        validate_password(value)
-        return value
+        return _validate_signup_password(value)
 
 
 class ManagerInviteSerializer(serializers.ModelSerializer):
@@ -247,15 +490,18 @@ class ManagerInviteAcceptSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
     def validate_password(self, value):
-        validate_password(value)
-        return value
+        return _validate_signup_password(value)
 
 
 class PropertySerializer(serializers.ModelSerializer):
     landlord = UserLiteSerializer(read_only=True)
     manager = UserLiteSerializer(read_only=True)
-    manager_id = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.filter(profile__role=Profile.ROLE_MANAGER), source="manager", write_only=True, required=False, allow_null=True
+    manager_id = ScopedPrimaryKeyRelatedField(
+        scope_queryset=_scoped_user_field(Profile.ROLE_MANAGER),
+        source="manager",
+        write_only=True,
+        required=False,
+        allow_null=True,
     )
 
     class Meta:
@@ -265,7 +511,11 @@ class PropertySerializer(serializers.ModelSerializer):
 
 class UnitSerializer(serializers.ModelSerializer):
     property = PropertySerializer(read_only=True)
-    property_id = serializers.PrimaryKeyRelatedField(queryset=Property.objects.all(), source="property", write_only=True)
+    property_id = ScopedPrimaryKeyRelatedField(
+        scope_queryset=_scoped_property_field,
+        source="property",
+        write_only=True,
+    )
 
     class Meta:
         model = Unit
@@ -282,10 +532,20 @@ class TenantSerializer(serializers.ModelSerializer):
 
 class LeaseSerializer(serializers.ModelSerializer):
     unit = UnitSerializer(read_only=True)
-    unit_id = serializers.PrimaryKeyRelatedField(queryset=Unit.objects.all(), source="unit", write_only=True)
+    unit_id = ScopedPrimaryKeyRelatedField(
+        scope_queryset=_scoped_unit_field,
+        source="unit",
+        write_only=True,
+    )
     tenant = UserLiteSerializer(read_only=True)
-    tenant_id = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.filter(profile__role=Profile.ROLE_TENANT),
+    # Tenants the requester is allowed to attach to a lease:
+    #   - someone they invited and who accepted the invite, or
+    #   - someone already on a lease in one of their properties.
+    # This blocks landlord A from creating a lease that names landlord B's
+    # tenant — which would otherwise leak that tenant's contact info to A and
+    # forge a contractual relationship the tenant never agreed to.
+    tenant_id = ScopedPrimaryKeyRelatedField(
+        scope_queryset=_scoped_user_field(Profile.ROLE_TENANT),
         source="tenant",
         write_only=True,
     )
@@ -425,8 +685,11 @@ class TenantInviteSerializer(serializers.ModelSerializer):
 class InviteAcceptSerializer(serializers.Serializer):
     first_name = serializers.CharField(max_length=150)
     last_name = serializers.CharField(max_length=150)
-    password = serializers.CharField(write_only=True, min_length=6)
+    password = serializers.CharField(write_only=True)
     identity_document = serializers.FileField(required=False, allow_null=True)
+
+    def validate_password(self, value):
+        return _validate_signup_password(value)
 
     def validate_identity_document(self, value):
         return validate_uploaded_file(value, allowed_mime_types=settings.ALLOWED_DOCUMENT_MIME_TYPES)
@@ -510,7 +773,32 @@ class MaintenanceRequestSerializer(serializers.ModelSerializer):
         return validate_uploaded_file(value, allowed_mime_types=settings.ALLOWED_IMAGE_MIME_TYPES)
 
 
+def _scoped_lease_field(field):
+    request = field.context.get("request") if field.context else None
+    user = getattr(request, "user", None) if request else None
+    if not user or not user.is_authenticated:
+        return Lease.objects.none()
+    if user.is_staff:
+        return Lease.objects.all()
+    profile = getattr(user, "profile", None)
+    role = profile.role if profile else None
+    if role == Profile.ROLE_LANDLORD:
+        return Lease.objects.filter(unit__property__landlord=user)
+    if role == Profile.ROLE_MANAGER:
+        return Lease.objects.filter(unit__property__manager=user)
+    if role == Profile.ROLE_TENANT:
+        return Lease.objects.filter(tenant=user)
+    return Lease.objects.none()
+
+
 class DocumentSerializer(serializers.ModelSerializer):
+    property = ScopedPrimaryKeyRelatedField(scope_queryset=_scoped_property_field)
+    lease = ScopedPrimaryKeyRelatedField(scope_queryset=_scoped_lease_field, required=False, allow_null=True)
+    tenant = ScopedPrimaryKeyRelatedField(
+        scope_queryset=_scoped_user_field(Profile.ROLE_TENANT),
+        required=False,
+        allow_null=True,
+    )
     property_name = serializers.CharField(source="property.name", read_only=True)
     uploaded_by_name = serializers.SerializerMethodField()
     tenant_name = serializers.SerializerMethodField()
@@ -644,7 +932,26 @@ class WalletWithdrawSerializer(serializers.Serializer):
 class LandlordPayoutSerializer(serializers.ModelSerializer):
     class Meta:
         model = LandlordPayout
-        fields = ["id", "amount", "method", "destination", "bank_code", "status", "created_at", "paid_at"]
+        fields = [
+            "id",
+            "amount",
+            "method",
+            "destination",
+            "bank_code",
+            "status",
+            "created_at",
+            "paid_at",
+            "processing_at",
+            "failed_at",
+            "reversed_at",
+            "provider_reference",
+            "provider_status",
+            "idempotency_key",
+        ]
+        # provider_response is intentionally NOT exposed via the API even
+        # though we now store a redacted version — landlords don't need to
+        # see raw provider blobs, and keeping it server-side reduces the
+        # chance of leaking through frontend logging.
 
 
 class LandlordPayoutRequestSerializer(serializers.Serializer):

@@ -47,8 +47,10 @@ services:
         sync: false
       - key: DEFAULT_FROM_EMAIL
         sync: false
+      # Real outbound mail. Override to console backend in a staging service
+      # ONLY if you are knowingly redirecting all mail to logs.
       - key: EMAIL_BACKEND
-        value: django.core.mail.backends.console.EmailBackend
+        value: django.core.mail.backends.smtp.EmailBackend
       - key: EMAIL_HOST
         sync: false
       - key: EMAIL_PORT
@@ -77,10 +79,12 @@ services:
         sync: false
       - key: PAYPAL_SECRET
         sync: false
+      # PayPal mode and base must be explicitly set per environment so we
+      # never silently ship a "production" service still pointing at sandbox.
       - key: PAYPAL_MODE
-        value: sandbox
+        sync: false
       - key: PAYPAL_API_BASE
-        value: https://api-m.sandbox.paypal.com
+        sync: false
       - key: PAYPAL_CURRENCY
         value: KES
       - key: STRIPE_SECRET_KEY
@@ -97,5 +101,21 @@ services:
         sync: false
       - key: AFRICASTALKING_SENDER_ID
         sync: false
+      # Per-environment so a production deploy cannot silently keep sending
+      # SMS via the Africa's Talking sandbox.
       - key: AFRICASTALKING_SMS_URL
-        value: https://api.sandbox.africastalking.com/version1/messaging
+        sync: false
+      # IntaSend webhook + API credentials. Settings.py refuses to boot if
+      # INTASEND_WEBHOOK_SECRET is missing or shorter than 32 characters when
+      # DJANGO_DEBUG=0.
+      - key: INTASEND_API_TOKEN
+        sync: false
+      - key: INTASEND_PUBLISHABLE_KEY
+        sync: false
+      - key: INTASEND_WEBHOOK_SECRET
+        sync: false
+      - key: INTASEND_TEST_MODE
+        sync: false
+      # Currency the payment core validates incoming provider events against.
+      - key: DEFAULT_PAYMENT_CURRENCY
+        value: KES

@@ -10,10 +10,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BASE_DIR.parent
 
 # Load env files explicitly so running Django from /backend or the repo root
-# picks up the same configuration every time. Override existing shell values
-# with the repo .env so local dev doesn't keep using stale credentials.
-load_dotenv(PROJECT_ROOT / ".env", override=True)
-load_dotenv(BASE_DIR / ".env", override=True)
+# picks up the same configuration every time. In production we do NOT let a
+# stray repo-checkout .env clobber the operator-supplied shell environment
+# (the previous override=True caused `python manage.py check --deploy` to
+# silently read dev values from a committed .env on the deploy host).
+_dotenv_override = os.getenv("DJANGO_DEBUG", "0") == "1"
+load_dotenv(PROJECT_ROOT / ".env", override=_dotenv_override)
+load_dotenv(BASE_DIR / ".env", override=_dotenv_override)
 
 HAS_DJANGO_CRONTAB = importlib.util.find_spec("django_crontab") is not None
 HAS_WHITENOISE = importlib.util.find_spec("whitenoise") is not None
@@ -133,6 +136,40 @@ if not SECRET_KEY:
     else:
         raise RuntimeError("DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0.")
 
+# In production, fail boot if the DJANGO_SECRET_KEY is too short to be safe.
+# Django uses it for cookie signing, password reset tokens, and CSRF tokens.
+if not DEBUG and len(SECRET_KEY) < 32:
+    raise RuntimeError("DJANGO_SECRET_KEY must be at least 32 characters long in production.")
+
+# Webhook authenticity depends entirely on the IntaSend HMAC secret. In
+# production we refuse to boot if it is missing or weak; this turns the
+# previously-silent failure mode (anyone with the URL could potentially
+# forge a webhook if signature verification was misconfigured) into a
+# loud startup error.
+INTASEND_WEBHOOK_SECRET_MIN_LENGTH = 32
+_intasend_webhook_secret = os.getenv("INTASEND_WEBHOOK_SECRET", "").strip()
+if not DEBUG:
+    if not _intasend_webhook_secret:
+        raise RuntimeError(
+            "INTASEND_WEBHOOK_SECRET must be set in production. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+        )
+    if len(_intasend_webhook_secret) < INTASEND_WEBHOOK_SECRET_MIN_LENGTH:
+        raise RuntimeError(
+            "INTASEND_WEBHOOK_SECRET must be at least "
+            f"{INTASEND_WEBHOOK_SECRET_MIN_LENGTH} characters long in production."
+        )
+
+    # If Stripe is configured at all, the webhook secret MUST also be set,
+    # otherwise the StripeWebhookView falls back to 503 at request time but
+    # the operator never finds out until the first failed event lands.
+    _stripe_key = os.getenv("STRIPE_SECRET_KEY", "").strip()
+    _stripe_webhook = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+    if _stripe_key and not _stripe_webhook:
+        raise RuntimeError(
+            "STRIPE_WEBHOOK_SECRET is required whenever STRIPE_SECRET_KEY is set."
+        )
+
 ALLOWED_HOSTS = _csv_env("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 for env_name in ("PUBLIC_BASE_URL", "FRONTEND_URL", "BACKEND_URL", "MPESA_CALLBACK_URL"):
     _append_unique(ALLOWED_HOSTS, _env_url_host(env_name))
@@ -146,6 +183,10 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    # token_blacklist powers server-side refresh-token invalidation. Without
+    # it, a stolen refresh token stays valid until natural expiry; with it,
+    # /api/auth/logout/ can revoke it immediately.
+    "rest_framework_simplejwt.token_blacklist",
     "core",
 ]
 
@@ -221,14 +262,23 @@ REST_FRAMEWORK = {
         "login": "5/min",
         "register": "5/min",
         "password_reset": "3/min",
+        "password_reset_confirm": "10/min",
         "stk_initiate": "10/min",
         "otp_verify": "5/minute",
+        # Stop attackers from bypassing /api/auth/login/'s 5/min cap by
+        # hammering the alternate SimpleJWT token endpoint at the same rate.
+        "token_obtain": "5/min",
     },
 }
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=int(os.getenv("JWT_ACCESS_MINUTES", "60"))),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=int(os.getenv("JWT_REFRESH_DAYS", "7"))),
+    # Rotate the refresh token on every /api/token/refresh/ call and blacklist
+    # the previous one. This means a leaked refresh token has a much smaller
+    # usable window before the legitimate client rotates it out.
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 
@@ -248,13 +298,29 @@ ALLOWED_IMAGE_MIME_TYPES = (
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
-CALLBACK_PATH_SECRET = os.getenv("CALLBACK_PATH_SECRET", "krib-cb").strip().strip("/")
+# CALLBACK_PATH_SECRET was historically interpolated into MPESA_CALLBACK_URL but
+# never enforced by any URL route, so it gave a false sense of "path secret"
+# protection. The HMAC signature verification on the IntaSend webhook
+# (INTASEND_WEBHOOK_SECRET) is the only legitimate gate. The env var is now
+# ignored; the variable name is kept here for legacy boot scripts but does
+# not change the callback URL.
 _callback_base_url = (PUBLIC_BASE_URL or BACKEND_URL or "http://localhost:8000").rstrip("/")
 MPESA_CALLBACK_URL = os.getenv(
     "MPESA_CALLBACK_URL",
-    f"{_callback_base_url}/api/payments/mpesa/callback/{CALLBACK_PATH_SECRET}/",
+    f"{_callback_base_url}/api/payments/mpesa/callback/",
 ).rstrip("/")
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "KRIB")
+# Hours that must pass between updating LandlordSettings.payout_destination
+# and being allowed to request a payout. Defends against session-hijack →
+# update destination → immediate payout. 24h by default; can be lowered for
+# staging/test runs via the env var.
+LANDLORD_PAYOUT_COOLDOWN_HOURS = int(os.getenv("LANDLORD_PAYOUT_COOLDOWN_HOURS", "24"))
+
+# The currency the payment core compares incoming provider events against.
+# IntaSend is fixed to KES, Stripe accepts whatever the PaymentIntent was
+# created in (we currency-pin via STRIPE_CURRENCY), PayPal mirrors
+# PAYPAL_CURRENCY. Set this to whatever the merchant account uses.
+DEFAULT_PAYMENT_CURRENCY = os.getenv("DEFAULT_PAYMENT_CURRENCY", "KES").upper()
 SUPPORT_PHONE = os.getenv("SUPPORT_PHONE", "")
 SUPPORT_EMAIL = os.getenv("SUPPORT_EMAIL", "")
 BUSINESS_ADDRESS = os.getenv("BUSINESS_ADDRESS", "")
@@ -279,10 +345,17 @@ for env_name in ("PUBLIC_BASE_URL", "FRONTEND_URL", "BACKEND_URL", "MPESA_CALLBA
     _append_unique(CSRF_TRUSTED_ORIGINS, origin)
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-SECURE_SSL_REDIRECT = not DEBUG and os.getenv(
-    "DJANGO_SECURE_SSL_REDIRECT", "0") == "1"
+# Default to redirecting HTTP→HTTPS in production. Operators must explicitly
+# set DJANGO_SECURE_SSL_REDIRECT=0 to opt out (e.g. behind a TLS-terminating
+# proxy that already enforces HTTPS). The previous default was "off until
+# someone remembers to flip it", which is the wrong way around.
+SECURE_SSL_REDIRECT = (not DEBUG) and os.getenv("DJANGO_SECURE_SSL_REDIRECT", "1") != "0"
 SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
 SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
 SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
 SECURE_HSTS_PRELOAD = not DEBUG

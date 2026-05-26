@@ -18,6 +18,7 @@ urlpatterns = [
     path("health/", views.health_check, name="health-check"),
     path("auth/register/", views.register, name="auth-register"),
     path("auth/login/", views.login, name="auth-login"),
+    path("auth/logout/", views.LogoutView.as_view(), name="auth-logout"),
     path("auth/me/", views.get_me, name="get_me"),
     path("me/", views.get_me, name="me"),
     path("auth/change-password/", views.change_password, name="change-password"),
@@ -55,5 +56,6 @@ urlpatterns = [
     path("landlord/payouts/", views.LandlordPayoutsView.as_view(), name="landlord-payouts"),
     path("landlord/payouts/request/", views.LandlordPayoutRequestView.as_view(), name="landlord-payout-request"),
     path("landlord/payouts/<int:pk>/mark-paid/", views.LandlordPayoutMarkPaidView.as_view(), name="landlord-payout-mark-paid"),
+    path("landlord/payouts/<int:pk>/reverse/", views.LandlordPayoutReverseView.as_view(), name="landlord-payout-reverse"),
     path("", include(router.urls)),
 ]

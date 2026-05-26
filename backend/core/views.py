@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import random
+import re
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 
@@ -33,7 +35,9 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import (
     Document,
@@ -85,6 +89,13 @@ from .serializers import (
     UnitSerializer,
     WalletWithdrawSerializer,
 )
+from .payments import (
+    apply_payment_event,
+    normalize_intasend_callback,
+    normalize_paypal_capture,
+    normalize_stripe_event,
+)
+from .payments.redact import redact_payment_payload, redact_text
 from .permissions import (
     IsLandlord,
     IsPropertyOwner,
@@ -100,18 +111,23 @@ from .services import (
     current_period_string,
     execute_intasend_payout,
     intasend_stk_push,
+    normalize_mpesa_phone_number,
     paypal_capture_order,
     paypal_create_order,
     period_string_to_date,
     save_payment_receipt,
     send_sms,
+    unlock_due_landlord_balance,
+    unlock_due_wallet_for_user,
 )
 from .throttles import (
     LoginRateThrottle,
     OTPRateThrottle,
+    PasswordResetConfirmThrottle,
     PasswordResetRateThrottle,
     RegisterRateThrottle,
     STKInitiateRateThrottle,
+    TokenObtainRateThrottle,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,7 +182,11 @@ def _generate_unique_username(full_name, email="", prefix="user"):
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def health_check(_request):
-    return Response({"status": "ok", "service": "krib-api", "debug": settings.DEBUG})
+    # Intentionally minimal: anything more leaks build/version metadata to
+    # anonymous callers. The previous "debug" field told scanners whether the
+    # service was running with DEBUG=1, which is a useful fingerprint for
+    # attackers. Drop it.
+    return Response({"status": "ok", "service": "krib-api"})
 
 
 def _get_role(user):
@@ -242,21 +262,20 @@ def _validate_payment_amount(lease, amount, period):
 
 def _user_can_access_document(user, document):
     role = _get_role(user)
+    if user.is_staff:
+        return True
     if role == Profile.ROLE_LANDLORD and document.property.landlord_id == user.id:
         return True
     if role == Profile.ROLE_MANAGER and document.property.manager_id == user.id:
         return True
     if role == Profile.ROLE_TENANT:
+        # A tenant can only view documents that explicitly target them.
+        # Property-wide visibility (lease/other documents owned by the
+        # landlord) is intentionally not granted here.
         if document.tenant_id == user.id:
             return True
         if document.lease_id and document.lease.tenant_id == user.id:
             return True
-        if document.document_type == Document.TYPE_LEASE:
-            return Lease.objects.filter(
-                tenant=user,
-                unit__property=document.property,
-                status=Lease.STATUS_ACTIVE,
-            ).exists()
         return False
     return False
 
@@ -334,39 +353,27 @@ def _require_landlord_or_staff(user):
 
 
 def _unlock_wallet(profile):
-    now = timezone.now()
-    rows = LedgerTransaction.objects.filter(
-        user=profile.user,
-        kind=LedgerTransaction.KIND_WALLET_CREDIT,
-        status=LedgerTransaction.STATUS_LOCKED,
-        available_at__lte=now,
-    )
-    amount = sum((row.amount for row in rows), Decimal("0.00"))
-    if amount > 0:
-        rows.update(status=LedgerTransaction.STATUS_AVAILABLE)
-        profile.wallet_locked = max(
-            profile.wallet_locked - amount, Decimal("0.00"))
-        profile.wallet_available += amount
-        profile.save(update_fields=["wallet_locked",
-                     "wallet_available", "updated_at"])
+    """Backwards-compatible shim around the safe service.
+
+    The previous implementation aggregated and updated rows without row locks,
+    which let two concurrent requests double-credit the same locked ledger
+    rows. All call sites now route through services.unlock_due_wallet_for_user
+    which processes one row at a time inside select_for_update.
+    """
+    if not profile:
+        return
+    unlock_due_wallet_for_user(profile.user)
+    # Refresh in-memory profile so the caller sees the new balances. The view
+    # layer reads these fields right after calling us.
+    profile.refresh_from_db(fields=["wallet_locked", "wallet_available", "updated_at"])
 
 
 def _unlock_landlord(balance):
-    now = timezone.now()
-    rows = LedgerTransaction.objects.filter(
-        user=balance.landlord,
-        kind=LedgerTransaction.KIND_LANDLORD_CREDIT_RENT,
-        status=LedgerTransaction.STATUS_LOCKED,
-        available_at__lte=now,
-    )
-    amount = sum((row.amount for row in rows), Decimal("0.00"))
-    if amount > 0:
-        rows.update(status=LedgerTransaction.STATUS_AVAILABLE)
-        balance.locked_balance = max(
-            balance.locked_balance - amount, Decimal("0.00"))
-        balance.available_balance += amount
-        balance.save(update_fields=["locked_balance",
-                     "available_balance", "updated_at"])
+    """Backwards-compatible shim around the safe service."""
+    if not balance:
+        return
+    unlock_due_landlord_balance(balance.landlord)
+    balance.refresh_from_db(fields=["locked_balance", "available_balance", "updated_at"])
 
 
 def _apply_wallet_to_current_rent(lease):
@@ -611,12 +618,14 @@ def get_me(request):
             }
         )
 
-    serializer = MeSerializer(data=request.data, partial=True)
+    serializer = MeSerializer(data=request.data, partial=True, context={"request": request})
     serializer.is_valid(raise_exception=True)
     email = serializer.validated_data.get("email")
     phone_number = serializer.validated_data.get("phone_number")
     if email is not None:
-        request.user.email = email
+        # Normalize before persisting so the uniqueness check at the
+        # serializer layer and the stored value cannot drift apart.
+        request.user.email = email.strip().lower()
         request.user.save(update_fields=["email"])
     if phone_number is not None:
         profile.phone_number = phone_number
@@ -648,6 +657,27 @@ def register(request):
     email = serializer.validated_data["email"].strip().lower()
     phone = serializer.validated_data.get("phone", "").strip()
     role = serializer.validated_data["role"]
+
+    # Account-enumeration mitigation: return the same neutral payload whether
+    # the email is in use or not. The legitimate owner of the address gets a
+    # heads-up email; the caller learns nothing.
+    if User.objects.filter(email__iexact=email).exists():
+        existing = User.objects.filter(email__iexact=email).first()
+        try:
+            send_mail(
+                subject="KRIB account exists",
+                message=(
+                    "Someone tried to create a new KRIB account using this email. "
+                    "If that was you, sign in with your existing credentials or "
+                    "use the password reset link from the login page."
+                ),
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                recipient_list=[existing.email],
+                fail_silently=True,
+            )
+        except Exception:  # pragma: no cover - defensive when SMTP is unconfigured
+            logger.exception("Failed to send 'account exists' notice.")
+        return Response({"detail": "Registration submitted."}, status=202)
 
     with transaction.atomic():
         username = _generate_unique_username(name, email=email)
@@ -728,14 +758,36 @@ def signup_landlord(request):
     serializer = LandlordSignupSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
 
+    first_name = serializer.validated_data["first_name"].strip()
+    last_name = serializer.validated_data["last_name"].strip()
+    email = (serializer.validated_data.get("email", "") or "").strip().lower()
+
+    # Same neutral-response pattern as /api/auth/register/. We must never
+    # reveal whether an email is already in use, otherwise this endpoint
+    # becomes an account-enumeration oracle.
+    if email and User.objects.filter(email__iexact=email).exists():
+        existing = User.objects.filter(email__iexact=email).first()
+        try:
+            send_mail(
+                subject="KRIB account exists",
+                message=(
+                    "Someone tried to create a new KRIB landlord account using this email. "
+                    "If that was you, sign in with your existing credentials or use the "
+                    "password reset link from the login page."
+                ),
+                from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                recipient_list=[existing.email],
+                fail_silently=True,
+            )
+        except Exception:  # pragma: no cover
+            logger.exception("Failed to send 'account exists' notice (landlord).")
+        return Response({"detail": "Landlord signup submitted."}, status=202)
+
     with transaction.atomic():
-        first_name = serializer.validated_data["first_name"].strip()
-        last_name = serializer.validated_data["last_name"].strip()
         full_name = f"{first_name} {last_name}".strip()
         user = User.objects.create(
-            username=_generate_unique_username(
-                full_name, email=serializer.validated_data.get("email", "")),
-            email=serializer.validated_data.get("email", ""),
+            username=_generate_unique_username(full_name, email=email),
+            email=email,
             first_name=first_name,
             last_name=last_name,
         )
@@ -744,14 +796,12 @@ def signup_landlord(request):
 
         profile, _ = Profile.objects.get_or_create(user=user)
         profile.role = Profile.ROLE_LANDLORD
-        profile.phone_number = serializer.validated_data.get(
-            "phone_number") or ""
+        profile.phone_number = serializer.validated_data.get("phone_number") or ""
         profile.save(update_fields=["role", "phone_number"])
 
         LandlordSettings.objects.update_or_create(
             user=user,
-            defaults={
-                "business_name": serializer.validated_data["business_name"]},
+            defaults={"business_name": serializer.validated_data["business_name"]},
         )
 
     return Response({"detail": "Landlord account created successfully."}, status=201)
@@ -796,6 +846,7 @@ def password_reset_request(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([PasswordResetConfirmThrottle])
 def password_reset_confirm(request):
     serializer = PasswordResetConfirmSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -983,16 +1034,93 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        user_role = _get_role(self.request.user)
-        if user_role != Profile.ROLE_LANDLORD and not self.request.user.is_staff:
-            return User.objects.none()
-        qs = User.objects.all().order_by("id")
+        # Staff/admin keeps full visibility. Everyone else only sees users
+        # they have a legitimate relationship with — same scoping logic as
+        # TenantViewSet/PropertySerializer's manager_id field. Previously this
+        # leaked every tenant/landlord/manager email on the platform to any
+        # authenticated landlord.
+        request_user = self.request.user
+        if request_user.is_staff:
+            base = User.objects.all().order_by("id")
+            role = self.request.query_params.get("role")
+            if role in dict(Profile.ROLE_CHOICES):
+                base = base.filter(profile__role=role)
+            return base
+
         role = self.request.query_params.get("role")
-        if role in dict(Profile.ROLE_CHOICES):
-            qs = qs.filter(profile__role=role)
+        if role not in dict(Profile.ROLE_CHOICES):
+            return User.objects.none()
+
+        requester_role = _get_role(request_user)
+
+        if requester_role == Profile.ROLE_TENANT:
+            # Tenants see themselves only when asking about their own role;
+            # all other roles return an empty list so a tenant cannot use
+            # /api/users/?role=manager as a back-channel into the manager pool.
+            if role == Profile.ROLE_TENANT:
+                return User.objects.filter(pk=request_user.pk)
+            return User.objects.none()
+
+        if requester_role == Profile.ROLE_MANAGER:
+            scoped_properties = Property.objects.filter(manager=request_user)
+        elif requester_role == Profile.ROLE_LANDLORD:
+            scoped_properties = Property.objects.filter(landlord=request_user)
         else:
-            qs = qs.none()
-        return qs
+            return User.objects.none()
+
+        if role == Profile.ROLE_TENANT:
+            invite_emails = list(
+                TenantInvite.objects.filter(
+                    invited_by=request_user,
+                    status=TenantInvite.STATUS_ACCEPTED,
+                )
+                .exclude(email__isnull=True).exclude(email__exact="")
+                .values_list("email", flat=True)
+            )
+            invite_phones = list(
+                TenantInvite.objects.filter(
+                    invited_by=request_user,
+                    status=TenantInvite.STATUS_ACCEPTED,
+                )
+                .exclude(phone__isnull=True).exclude(phone__exact="")
+                .values_list("phone", flat=True)
+            )
+            filters = Q(leases__unit__property__in=scoped_properties)
+            if invite_emails:
+                filters |= Q(email__in=invite_emails)
+            if invite_phones:
+                filters |= Q(profile__phone_number__in=invite_phones) | Q(
+                    tenant_profile__phone__in=invite_phones
+                )
+            return User.objects.filter(profile__role=role).filter(filters).distinct().order_by("id")
+
+        if role == Profile.ROLE_MANAGER:
+            # Managers visible to a landlord: those already on one of their
+            # properties OR managers who accepted an invite this landlord sent.
+            invites = ManagerInvite.objects.filter(
+                created_by=request_user,
+                accepted_at__isnull=False,
+            )
+            invite_emails = list(
+                invites.exclude(email__isnull=True).exclude(email__exact="")
+                .values_list("email", flat=True)
+            )
+            invite_phones = list(
+                invites.exclude(phone__isnull=True).exclude(phone__exact="")
+                .values_list("phone", flat=True)
+            )
+            filters = Q(managed_properties__in=scoped_properties)
+            if invite_emails:
+                filters |= Q(email__in=invite_emails)
+            if invite_phones:
+                filters |= Q(profile__phone_number__in=invite_phones)
+            return User.objects.filter(profile__role=role).filter(filters).distinct().order_by("id")
+
+        if role == Profile.ROLE_LANDLORD:
+            # Non-staff has no legitimate reason to enumerate landlords.
+            return User.objects.none()
+
+        return User.objects.none()
 
 
 class PropertyViewSet(viewsets.ModelViewSet):
@@ -1047,6 +1175,26 @@ class UnitViewSet(viewsets.ModelViewSet):
 
         serializer.save()
 
+    def perform_update(self, serializer):
+        # Re-run the create-time scope check. Without this a landlord could
+        # PATCH `property_id` to a property they do not own (since DRF's
+        # default scoping only filters reads, not the writable FK target).
+        role = _get_role(self.request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not self.request.user.is_staff:
+            raise PermissionDenied("Only landlord/manager can update units")
+        target_property = serializer.validated_data.get("property", serializer.instance.property)
+        if target_property not in _scoped_properties(self.request.user):
+            raise PermissionDenied("Cannot move a unit outside your assigned properties")
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        role = _get_role(self.request.user)
+        if role not in [Profile.ROLE_LANDLORD] and not self.request.user.is_staff:
+            raise PermissionDenied("Only landlord can delete units")
+        if instance.property not in _scoped_properties(self.request.user):
+            raise PermissionDenied("Cannot delete units outside your portfolio")
+        instance.delete()
+
 
 class LeaseViewSet(viewsets.ModelViewSet):
     serializer_class = LeaseSerializer
@@ -1071,6 +1219,20 @@ class LeaseViewSet(viewsets.ModelViewSet):
                 "Cannot create leases outside your assigned properties")
 
         lease = serializer.save()
+        self._lease_post_create(lease)
+
+    def perform_update(self, serializer):
+        # Guard PATCH on /api/leases/<id>/ so a landlord cannot retarget an
+        # owned lease at a unit they do not own.
+        role = _get_role(self.request.user)
+        if role not in [Profile.ROLE_LANDLORD, Profile.ROLE_MANAGER] and not self.request.user.is_staff:
+            raise PermissionDenied("Only landlord/manager can update leases")
+        target_unit = serializer.validated_data.get("unit", serializer.instance.unit)
+        if target_unit.property not in _scoped_properties(self.request.user):
+            raise PermissionDenied("Cannot move a lease outside your assigned properties")
+        serializer.save()
+
+    def _lease_post_create(self, lease):
         login_link = (
             settings.FRONTEND_URL or "http://localhost:5173").rstrip("/") + "/login"
         phone_number = _lease_tenant_phone_number(lease)
@@ -1328,36 +1490,69 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
 
     @action(detail=True, methods=["post"])
     def accept(self, request, pk=None):
-        invite = TenantInvite.objects.filter(token=pk).first()
-        if not invite:
-            return Response({"detail": "Tenant invite not found."}, status=404)
-        if invite.is_expired():
-            if invite.status == TenantInvite.STATUS_PENDING:
-                invite.status = TenantInvite.STATUS_EXPIRED
-                invite.save(update_fields=["status"])
-            return Response({"detail": "This tenant invite has expired."}, status=400)
-        if invite.status == TenantInvite.STATUS_CANCELLED:
-            return Response({"detail": "This tenant invite was cancelled."}, status=400)
-        if invite.status == TenantInvite.STATUS_ACCEPTED:
-            return Response({"detail": "This tenant invite has already been used."}, status=400)
-        if invite.status != TenantInvite.STATUS_PENDING:
-            return Response({"detail": "This tenant invite is no longer active."}, status=400)
         serializer = InviteAcceptSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        submitted_otp = (request.data.get("otp_code") or "").strip()
         first_name = serializer.validated_data["first_name"].strip()
         last_name = serializer.validated_data["last_name"].strip()
-        full_name = f"{first_name} {last_name}".strip()
-        username = _generate_unique_username(
-            full_name, email=invite.email or "", prefix="tenant")
 
+        # The whole acceptance happens under select_for_update so two
+        # concurrent acceptances of the same invite cannot both win.
         with transaction.atomic():
+            invite = (
+                TenantInvite.objects.select_for_update()
+                .filter(token=pk)
+                .first()
+            )
+            if not invite:
+                return Response({"detail": "Tenant invite not found."}, status=404)
+            if invite.is_expired():
+                if invite.status == TenantInvite.STATUS_PENDING:
+                    invite.status = TenantInvite.STATUS_EXPIRED
+                    invite.save(update_fields=["status"])
+                return Response({"detail": "This tenant invite has expired."}, status=400)
+            if invite.status == TenantInvite.STATUS_CANCELLED:
+                return Response({"detail": "This tenant invite was cancelled."}, status=400)
+            if invite.status == TenantInvite.STATUS_ACCEPTED:
+                return Response({"detail": "This tenant invite has already been used."}, status=400)
+            if invite.status != TenantInvite.STATUS_PENDING:
+                return Response({"detail": "This tenant invite is no longer active."}, status=400)
+
+            # OTP gate: if the inviter set an OTP on the invite, the caller
+            # MUST submit it and it MUST match. Without this check anyone with
+            # the invite token (e.g. via email/SMS sniffing) could accept.
+            if invite.otp_code:
+                if invite.otp_locked:
+                    return Response(
+                        {"detail": "Too many failed attempts. Request a new invite."},
+                        status=429,
+                    )
+                if invite.otp_expires_at and timezone.now() > invite.otp_expires_at:
+                    return Response({"detail": "OTP expired."}, status=400)
+                if not submitted_otp:
+                    return Response({"detail": "OTP is required to accept this invite.", "code": "otp_required"}, status=400)
+                if submitted_otp != invite.otp_code:
+                    invite.otp_attempts = (invite.otp_attempts or 0) + 1
+                    if invite.otp_attempts > 5:
+                        invite.otp_locked = True
+                        invite.save(update_fields=["otp_attempts", "otp_locked"])
+                        return Response(
+                            {"detail": "Too many failed attempts. Request a new invite."},
+                            status=429,
+                        )
+                    invite.save(update_fields=["otp_attempts"])
+                    return Response({"detail": "Invalid OTP."}, status=400)
+
+            full_name = f"{first_name} {last_name}".strip()
+            username = _generate_unique_username(
+                full_name, email=invite.email or "", prefix="tenant")
+
             user = User.objects.create(
                 username=username,
-                email=invite.email or "",
+                email=(invite.email or "").lower(),
                 first_name=first_name,
                 last_name=last_name,
             )
-            created = True
             user.set_password(serializer.validated_data["password"])
             user.save()
             profile, _ = Profile.objects.get_or_create(user=user)
@@ -1372,8 +1567,9 @@ class InviteViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, mixins.Retri
                 tenant_profile.phone = invite.phone
                 tenant_profile.save(update_fields=["phone"])
             invite.status = TenantInvite.STATUS_ACCEPTED
-            invite.save(update_fields=["status"])
-        return Response({"detail": "Invite accepted.", "name": _display_name(user), "created": created})
+            invite.otp_attempts = 0
+            invite.save(update_fields=["status", "otp_attempts"])
+        return Response({"detail": "Invite accepted.", "name": _display_name(user), "created": True})
 
 
 class LandlordSettingsView(APIView):
@@ -1542,108 +1738,46 @@ class STKCallbackView(APIView):
         # IntaSend signs the exact raw webhook body, so verify that before trusting
         # any parsed fields from the callback payload.
         if not _verify_intasend_signature(raw_body, signature):
-            logger.warning(
-                "Rejected IntaSend callback due to invalid signature.")
+            logger.warning("payment.intasend.invalid_signature")
             return Response({"detail": "Invalid signature."}, status=400)
 
         try:
             payload = request.data if isinstance(request.data, dict) else {}
         except Exception:
-            logger.warning(
-                "Rejected IntaSend callback because the JSON payload could not be parsed.")
-            return Response({"detail": "Invalid payload."})
+            logger.warning("payment.intasend.bad_payload")
+            return Response({"detail": "Invalid payload."}, status=400)
 
+        # Normalize into the shared event format and hand off. All security
+        # checks (amount, lease, idempotency) live in apply_payment_event so
+        # adding Pesapal/Daraja later cannot accidentally skip one.
         try:
-            invoice = payload.get("invoice") or {}
-            invoice_id = payload.get("invoice_id") or invoice.get("invoice_id")
-            state = str(payload.get("state") or "").upper()
+            event = normalize_intasend_callback(payload)
+        except Exception:
+            logger.exception("payment.intasend.normalize_failed")
+            return Response({"detail": "Invalid payload."}, status=400)
 
-            if not invoice_id:
-                logger.warning("IntaSend callback missing invoice id.", extra={
-                               "payload": payload})
-                return Response({"detail": "Missing invoice id."})
+        result = apply_payment_event(event)
 
-            payment = PaymentTransaction.objects.filter(
-                checkout_request_id=invoice_id).first()
-            if not payment:
-                logger.warning("Unmatched IntaSend callback received", extra={
-                               "invoice_id": invoice_id})
-                return Response({"detail": "No matching payment."})
-
-            # Webhooks can be retried, so once a payment leaves pending we intentionally
-            # skip all state transitions and side effects.
-            if payment.status != PaymentTransaction.STATUS_PENDING:
-                logger.info(
-                    "Duplicate IntaSend callback ignored",
-                    extra={
-                        "payment_id": payment.id,
-                        "invoice_id": invoice_id,
-                        "current_status": payment.status,
-                        "incoming_state": state,
-                    },
+        # Post-allocation side effects: receipt + SMS. We do these in the view
+        # so the payment core stays I/O-free and easy to test.
+        # Only the first-time SUCCESS transition triggers receipts/SMS. The
+        # "allocation_retried" path is a back-fill for a previous event that
+        # already sent those notifications, so we must not double them up.
+        if result.ok and result.code == "applied" and result.payment_id is not None:
+            payment = (
+                PaymentTransaction.objects.select_related(
+                    "lease", "lease__unit", "lease__unit__property", "tenant"
                 )
-                return Response({"detail": "Duplicate callback ignored."})
-
-            if state not in {"COMPLETE", "FAILED"}:
-                logger.info(
-                    "IntaSend callback ignored because state is not terminal yet.",
-                    extra={"payment_id": payment.id,
-                           "invoice_id": invoice_id, "state": state},
-                )
-                return Response({"detail": "Callback ignored."})
-
-            payment.raw_callback = payload
-            payment.result_code = 0 if state == "COMPLETE" else 1
-            payment.result_desc = state
-            payment.mpesa_receipt = invoice.get(
-                "mpesa_receipt") or payment.mpesa_receipt
-            payment.transaction_code = payment.mpesa_receipt or payment.transaction_code
-            payment.status = (
-                PaymentTransaction.STATUS_SUCCESS
-                if state == "COMPLETE"
-                else PaymentTransaction.STATUS_FAILED
+                .filter(pk=result.payment_id)
+                .first()
             )
-            if state == "COMPLETE" and not payment.transaction_date:
-                payment.transaction_date = timezone.now()
-
-            update_fields = [
-                "raw_callback",
-                "result_code",
-                "result_desc",
-                "mpesa_receipt",
-                "transaction_code",
-                "status",
-            ]
-            if state == "COMPLETE" and payment.transaction_date:
-                update_fields.append("transaction_date")
-            payment.save(update_fields=update_fields)
-
-            logger.info(
-                "IntaSend callback transition processed",
-                extra={
-                    "payment_id": payment.id,
-                    "invoice_id": invoice_id,
-                    "status": payment.status,
-                    "state": state,
-                },
-            )
-
-            if payment.status == PaymentTransaction.STATUS_SUCCESS:
-                try:
-                    _allocate_success_payment(payment)
-                except Exception:
-                    logger.exception("Payment allocation failed after IntaSend success callback.", extra={
-                                     "payment_id": payment.id})
-
+            if payment:
                 try:
                     save_payment_receipt(payment)
                 except Exception:
-                    logger.exception("Receipt generation failed after IntaSend success callback.", extra={
-                                     "payment_id": payment.id})
-
+                    logger.exception("payment.intasend.receipt_failed payment_id=%s", payment.id)
                 tenant_profile = getattr(payment.tenant, "profile", None)
-                phone_number = getattr(
-                    tenant_profile, "phone_number", "") or payment.phone_number
+                phone_number = getattr(tenant_profile, "phone_number", "") or payment.phone_number
                 if phone_number:
                     try:
                         send_sms(
@@ -1651,13 +1785,9 @@ class STKCallbackView(APIView):
                             f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code or payment.id}",
                         )
                     except Exception:
-                        logger.exception("SMS notification failed after IntaSend success callback.", extra={
-                                         "payment_id": payment.id})
-        except Exception:
-            logger.exception(
-                "Unexpected error while processing IntaSend callback.")
+                        logger.exception("payment.intasend.sms_failed payment_id=%s", payment.id)
 
-        return Response({"detail": "Callback processed."})
+        return Response({"detail": result.detail or "Callback processed."}, status=200)
 
 
 class MPesaPaymentStatusView(APIView):
@@ -1734,42 +1864,68 @@ class PayPalCaptureView(APIView):
             return Response({"detail": "Unauthorized request."}, status=403)
 
         order_id = request.data.get("order_id")
-        payment = PaymentTransaction.objects.filter(paypal_order_id=order_id, tenant=request.user).select_related(
-            "lease", "lease__unit", "lease__unit__property", "tenant").first()
+        payment = (
+            PaymentTransaction.objects.filter(paypal_order_id=order_id, tenant=request.user)
+            .select_related("lease", "lease__unit", "lease__unit__property", "tenant")
+            .first()
+        )
         if not payment:
             return Response({"detail": "Payment not found."}, status=404)
 
         capture = paypal_capture_order(order_id)
-        if not capture or capture.get("error") or capture.get("status") != "COMPLETED":
-            payment.status = PaymentTransaction.STATUS_FAILED
-            payment.raw_callback = capture
-            payment.result_desc = (
-                capture.get("detail")
-                if isinstance(capture, dict) and capture.get("detail")
-                else "Payment failed. Please try again."
+        if not capture or capture.get("error"):
+            detail = capture.get("detail") if isinstance(capture, dict) and capture.get("detail") else "Payment failed. Please try again."
+            # Mark failed via the payment core so we get the same idempotency
+            # contract as the other providers.
+            apply_payment_event(
+                normalize_paypal_capture(
+                    {"id": order_id, "status": "FAILED"},
+                    expected_lease_id=payment.lease_id,
+                    expected_tenant_id=payment.tenant_id,
+                )
             )
-            payment.save(update_fields=[
-                         "status", "raw_callback", "result_desc"])
-            return Response({"detail": payment.result_desc}, status=capture.get("status", 502) if isinstance(capture, dict) else 502)
+            return Response(
+                {"detail": detail},
+                status=capture.get("status", 502) if isinstance(capture, dict) else 502,
+            )
 
-        purchase_units = capture.get("purchase_units", [])
-        capture_rows = purchase_units[0].get("payments", {}).get(
-            "captures", []) if purchase_units else []
-        capture_row = capture_rows[0] if capture_rows else {}
-        payment.status = PaymentTransaction.STATUS_SUCCESS
-        payment.transaction_code = capture_row.get("id") or order_id
-        payment.result_desc = capture.get("status")
-        payment.transaction_date = timezone.now()
-        payment.raw_callback = capture
-        payment.save(update_fields=[
-                     "status", "transaction_code", "result_desc", "transaction_date", "raw_callback"])
-        _allocate_success_payment(payment)
-        save_payment_receipt(payment)
-        profile = getattr(request.user, "profile", None)
-        phone_number = getattr(profile, "phone_number", "")
-        if phone_number:
-            send_sms(
-                phone_number, f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code}")
+        normalized = normalize_paypal_capture(
+            capture,
+            expected_lease_id=payment.lease_id,
+            expected_tenant_id=payment.tenant_id,
+        )
+        result = apply_payment_event(normalized)
+
+        if not result.ok:
+            return Response({"detail": result.detail, "code": result.code}, status=400)
+
+        if result.code == "applied" and result.payment_id is not None:
+            fresh = (
+                PaymentTransaction.objects.select_related(
+                    "lease", "lease__unit", "lease__unit__property", "tenant"
+                )
+                .filter(pk=result.payment_id)
+                .first()
+            )
+            if fresh:
+                try:
+                    save_payment_receipt(fresh)
+                except Exception:
+                    logger.exception("payment.paypal.receipt_failed payment_id=%s", fresh.id)
+                profile = getattr(request.user, "profile", None)
+                phone_number = getattr(profile, "phone_number", "")
+                if phone_number:
+                    try:
+                        send_sms(
+                            phone_number,
+                            f"KRIB payment received for {fresh.period}. Receipt: {fresh.transaction_code}",
+                        )
+                    except Exception:
+                        logger.exception("payment.paypal.sms_failed payment_id=%s", fresh.id)
+                return Response({"payment": PaymentTransactionSerializer(fresh).data})
+
+        # Duplicate / non-terminal — return current row state.
+        payment.refresh_from_db()
         return Response({"payment": PaymentTransactionSerializer(payment).data})
 
 
@@ -1854,64 +2010,62 @@ class StripeWebhookView(APIView):
         if stripe is None or not stripe_secret_key:
             return Response({"detail": "Payment failed. Please try again."}, status=503)
 
+        # Fail closed: a missing webhook secret means we cannot authenticate the
+        # event, so we must NOT mark any payment successful.
+        if not webhook_secret:
+            logger.error("payment.stripe.no_secret")
+            return Response({"detail": "Webhook secret not configured."}, status=503)
+
         stripe.api_key = stripe_secret_key
         payload = request.body
         signature = request.META.get("HTTP_STRIPE_SIGNATURE", "")
 
         try:
-            if webhook_secret:
-                event = stripe.Webhook.construct_event(
-                    payload=payload, sig_header=signature, secret=webhook_secret)
-            else:
-                event = json.loads(payload.decode() or "{}")
+            event = stripe.Webhook.construct_event(
+                payload=payload, sig_header=signature, secret=webhook_secret)
         except (ValueError, stripe.error.SignatureVerificationError) as exc:
-            logger.warning("Stripe webhook rejected: %s", exc)
+            logger.warning("payment.stripe.invalid_signature %s", redact_text(str(exc)))
             return Response({"detail": "Unauthorized request."}, status=400)
 
-        event_type = event.get("type")
-        intent = event.get("data", {}).get("object", {})
-        intent_id = intent.get("id")
-        payment = PaymentTransaction.objects.filter(stripe_payment_intent_id=intent_id).select_related(
-            "lease",
-            "lease__unit",
-            "lease__unit__property",
-            "tenant",
-        ).first()
-        if not payment:
-            return Response({"detail": "Ignored."}, status=200)
+        # Normalize + apply via the shared payment core. Amount/currency/
+        # lease/tenant checks live there; this view only does signature
+        # verification + side effects.
+        try:
+            normalized = normalize_stripe_event(event)
+        except Exception:
+            logger.exception("payment.stripe.normalize_failed")
+            return Response({"detail": "Invalid payload."}, status=400)
 
-        if event_type == "payment_intent.succeeded":
-            charges = intent.get("charges", {}).get("data", [])
-            charge = charges[0] if charges else {}
-            payment.status = PaymentTransaction.STATUS_SUCCESS
-            payment.transaction_code = charge.get("id") or intent_id
-            payment.result_desc = intent.get("status", "succeeded")
-            payment.transaction_date = timezone.now()
-            payment.raw_callback = event
-            payment.save(
-                update_fields=["status", "transaction_code",
-                               "result_desc", "transaction_date", "raw_callback"]
-            )
-            _allocate_success_payment(payment)
-            save_payment_receipt(payment)
-            tenant_profile = getattr(payment.tenant, "profile", None)
-            phone_number = getattr(
-                tenant_profile, "phone_number", "") or payment.phone_number
-            if phone_number:
-                send_sms(
-                    phone_number,
-                    f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code}",
+        result = apply_payment_event(normalized)
+
+        # Only the first-time SUCCESS transition triggers receipts/SMS. The
+        # "allocation_retried" path is a back-fill for a previous event that
+        # already sent those notifications, so we must not double them up.
+        if result.ok and result.code == "applied" and result.payment_id is not None:
+            payment = (
+                PaymentTransaction.objects.select_related(
+                    "lease", "lease__unit", "lease__unit__property", "tenant"
                 )
-        elif event_type == "payment_intent.payment_failed":
-            payment.status = PaymentTransaction.STATUS_FAILED
-            payment.result_desc = (
-                intent.get("last_payment_error", {}) or {}
-            ).get("message") or "Payment failed. Please try again."
-            payment.raw_callback = event
-            payment.save(update_fields=[
-                         "status", "result_desc", "raw_callback"])
+                .filter(pk=result.payment_id)
+                .first()
+            )
+            if payment:
+                try:
+                    save_payment_receipt(payment)
+                except Exception:
+                    logger.exception("payment.stripe.receipt_failed payment_id=%s", payment.id)
+                tenant_profile = getattr(payment.tenant, "profile", None)
+                phone_number = getattr(tenant_profile, "phone_number", "") or payment.phone_number
+                if phone_number:
+                    try:
+                        send_sms(
+                            phone_number,
+                            f"KRIB payment received for {payment.period}. Receipt: {payment.transaction_code}",
+                        )
+                    except Exception:
+                        logger.exception("payment.stripe.sms_failed payment_id=%s", payment.id)
 
-        return Response({"detail": "Webhook processed."})
+        return Response({"detail": result.detail or "Webhook processed."}, status=200)
 
 
 class PaymentViewSet(viewsets.ReadOnlyModelViewSet):
@@ -1991,7 +2145,12 @@ class PaymentReceiptView(APIView):
             save_payment_receipt(payment)
         if not payment.receipt_file:
             return Response({"detail": "Receipt generation is currently unavailable."}, status=503)
-        return FileResponse(payment.receipt_file.open("rb"), content_type="application/pdf", filename=os.path.basename(payment.receipt_file.name))
+        return FileResponse(
+            payment.receipt_file.open("rb"),
+            as_attachment=True,
+            content_type="application/pdf",
+            filename=os.path.basename(payment.receipt_file.name),
+        )
 
 
 class DocumentListView(APIView):
@@ -2006,17 +2165,20 @@ class DocumentListView(APIView):
             docs = Document.objects.filter(property__manager=request.user).select_related(
                 "property", "lease", "lease__unit", "uploaded_by", "tenant")
         elif role == Profile.ROLE_TENANT:
-            active_leases = Lease.objects.filter(
-                tenant=request.user, status=Lease.STATUS_ACTIVE)
+            # Tenants ONLY see documents that explicitly target them. The old
+            # query also returned any TYPE_LEASE/TYPE_OTHER document attached
+            # to any unit in any property they rent, which leaked other
+            # tenants' lease agreements and IDs to a co-tenant in the same
+            # building.
+            tenant_leases = Lease.objects.filter(tenant=request.user)
             docs = Document.objects.filter(
-                Q(tenant=request.user)
-                | Q(lease__in=active_leases)
-                | Q(document_type=Document.TYPE_LEASE, property__units__leases__in=active_leases)
-                | Q(document_type=Document.TYPE_OTHER, property__units__leases__in=active_leases)
-            ).distinct().select_related("property", "lease", "lease__unit", "uploaded_by", "tenant")
+                Q(tenant=request.user) | Q(lease__in=tenant_leases)
+            ).distinct().select_related(
+                "property", "lease", "lease__unit", "uploaded_by", "tenant"
+            )
         else:
             return Response([], status=200)
-        return Response(DocumentSerializer(docs, many=True).data)
+        return Response(DocumentSerializer(docs, many=True, context={"request": request}).data)
 
 
 class DocumentUploadView(APIView):
@@ -2029,18 +2191,30 @@ class DocumentUploadView(APIView):
         if not property_obj:
             return Response({"detail": "Property not found."}, status=404)
 
+        # Allow-list style check: a request must positively match one of the
+        # legitimate scopes. The previous chain only enumerated rejection
+        # branches, so a landlord uploading to their own property fell through
+        # every `elif` to the trailing `else: 403`.
         role = _get_role(request.user)
-        if role == Profile.ROLE_LANDLORD and property_obj.landlord_id != request.user.id:
-            return Response({"detail": "Unauthorized request."}, status=403)
-        elif role == Profile.ROLE_MANAGER and property_obj.manager_id != request.user.id:
-            return Response({"detail": "Unauthorized request."}, status=403)
-        elif role == Profile.ROLE_TENANT:
-            if not Lease.objects.filter(tenant=request.user, unit__property=property_obj, status=Lease.STATUS_ACTIVE).exists():
-                return Response({"detail": "Unauthorized request."}, status=403)
-        else:
+        allowed = False
+        if request.user.is_staff:
+            allowed = True
+        elif role == Profile.ROLE_LANDLORD and property_obj.landlord_id == request.user.id:
+            allowed = True
+        elif role == Profile.ROLE_MANAGER and property_obj.manager_id == request.user.id:
+            allowed = True
+        elif role == Profile.ROLE_TENANT and Lease.objects.filter(
+            tenant=request.user,
+            unit__property=property_obj,
+            status=Lease.STATUS_ACTIVE,
+        ).exists():
+            allowed = True
+        if not allowed:
             return Response({"detail": "Unauthorized request."}, status=403)
 
-        serializer = DocumentSerializer(data=request.data)
+        # Pass request context so the scoped PrimaryKeyRelatedFields on
+        # DocumentSerializer can resolve their queryset against the requester.
+        serializer = DocumentSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         lease = serializer.validated_data.get("lease")
         document_type = serializer.validated_data.get("document_type")
@@ -2055,7 +2229,7 @@ class DocumentUploadView(APIView):
             if not tenant:
                 return Response({"detail": "Select a lease tied to the tenant ID or passport."}, status=400)
         document = serializer.save(uploaded_by=request.user, tenant=tenant)
-        return Response(DocumentSerializer(document).data, status=201)
+        return Response(DocumentSerializer(document, context={"request": request}).data, status=201)
 
 
 class DocumentDownloadView(APIView):
@@ -2068,7 +2242,79 @@ class DocumentDownloadView(APIView):
             raise Http404("Document not found.")
         if not _user_can_access_document(request.user, document):
             return Response({"detail": "Unauthorized request."}, status=403)
-        return FileResponse(document.file_path.open("rb"), filename=os.path.basename(document.file_path.name))
+        # Force attachment download so uploaded user content (HTML/SVG renamed to
+        # PDF) cannot be rendered inline in a victim's browser.
+        return FileResponse(
+            document.file_path.open("rb"),
+            as_attachment=True,
+            filename=os.path.basename(document.file_path.name),
+            content_type="application/octet-stream",
+        )
+
+
+class MediaProxyView(APIView):
+    """Permission-checked replacement for the legacy public nginx /media/ alias.
+
+    Every uploaded file lives under MEDIA_ROOT and is reachable as
+    /media/<subdir>/<filename>. This view looks up the matching DB row
+    (Document, PaymentTransaction.receipt_file, MaintenanceRequest.photo_path)
+    and re-runs the same access checks the dedicated endpoints use, then
+    serves the bytes as an attachment.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, relative_path):
+        # Defence in depth against path traversal even though Django's URL
+        # routing already strips ".." segments.
+        if ".." in relative_path or relative_path.startswith("/"):
+            raise Http404("File not found.")
+
+        normalized = relative_path.lstrip("/")
+        document = Document.objects.filter(file_path=normalized).select_related(
+            "property", "lease", "uploaded_by").first()
+        if document:
+            if not _user_can_access_document(request.user, document):
+                return Response({"detail": "Unauthorized request."}, status=403)
+            return FileResponse(
+                document.file_path.open("rb"),
+                as_attachment=True,
+                filename=os.path.basename(document.file_path.name),
+                content_type="application/octet-stream",
+            )
+
+        payment = PaymentTransaction.objects.filter(receipt_file=normalized).select_related(
+            "lease", "lease__unit", "lease__unit__property", "tenant").first()
+        if payment:
+            if not _user_can_access_payment_receipt(request.user, payment):
+                return Response({"detail": "Unauthorized request."}, status=403)
+            return FileResponse(
+                payment.receipt_file.open("rb"),
+                as_attachment=True,
+                filename=os.path.basename(payment.receipt_file.name),
+                content_type="application/pdf",
+            )
+
+        maintenance = MaintenanceRequest.objects.filter(photo_path=normalized).select_related(
+            "tenant", "lease", "lease__unit", "lease__unit__property").first()
+        if maintenance:
+            role = _get_role(request.user)
+            allowed = (
+                request.user.id == maintenance.tenant_id
+                or (role == Profile.ROLE_LANDLORD and maintenance.lease.unit.property.landlord_id == request.user.id)
+                or (role == Profile.ROLE_MANAGER and maintenance.lease.unit.property.manager_id == request.user.id)
+                or request.user.is_staff
+            )
+            if not allowed:
+                return Response({"detail": "Unauthorized request."}, status=403)
+            return FileResponse(
+                maintenance.photo_path.open("rb"),
+                as_attachment=True,
+                filename=os.path.basename(maintenance.photo_path.name),
+                content_type="application/octet-stream",
+            )
+
+        raise Http404("File not found.")
 
 
 class MaintenanceViewSet(viewsets.ModelViewSet):
@@ -2594,103 +2840,441 @@ class LandlordPayoutsView(APIView):
         )
 
 
+def _normalized_destination(method, destination):
+    """Canonicalize a payout destination so saved-vs-submitted comparisons are stable."""
+    text = (destination or "").strip()
+    if method == LandlordPayout.METHOD_MPESA:
+        return normalize_mpesa_phone_number(text) or text
+    return re.sub(r"\s+", "", text)
+
+
+def _matches_saved_destination(user, method, destination, bank_code):
+    """Return True iff the submitted destination matches the landlord's saved
+    payout method. This is the load-bearing guard that prevents a hijacked
+    landlord session from instantly draining the balance to an attacker-chosen
+    account."""
+    try:
+        saved = user.landlord_settings
+    except LandlordSettings.DoesNotExist:
+        return False
+
+    saved_method = (saved.payout_method or "").upper()
+    if saved_method != str(method or "").upper():
+        return False
+
+    submitted = _normalized_destination(method, destination)
+    saved_dest = _normalized_destination(method, saved.payout_destination or "")
+    if not submitted or submitted != saved_dest:
+        return False
+
+    if method == LandlordPayout.METHOD_BANK:
+        saved_bank = (saved.payout_bank_code or "").strip()
+        submitted_bank = (bank_code or "").strip()
+        if saved_bank != submitted_bank:
+            return False
+
+    return True
+
+
+def _release_payout_reservation(landlord, amount):
+    """Atomically refund `amount` to landlord.available_balance.
+
+    Used by FAILED and REVERSED transitions. We re-lock the balance row so
+    a concurrent payout request cannot race with the refund.
+    """
+    with transaction.atomic():
+        balance, _ = LandlordBalance.objects.get_or_create(landlord=landlord)
+        balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
+        balance.available_balance = balance.available_balance + amount
+        balance.save(update_fields=["available_balance", "updated_at"])
+
+
+def _record_payout_ledger(*, payout, kind, status, reference_text):
+    LedgerTransaction.objects.create(
+        user=payout.landlord,
+        kind=kind,
+        amount=payout.amount,
+        status=status,
+        reference_text=reference_text,
+    )
+
+
 class LandlordPayoutRequestView(APIView):
     permission_classes = [IsAuthenticated]
 
-    @transaction.atomic
     def post(self, request):
         if _get_role(request.user) != Profile.ROLE_LANDLORD:
             return Response({"detail": "Landlord only endpoint"}, status=403)
         serializer = LandlordPayoutRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         amount = serializer.validated_data["amount"]
+        method = serializer.validated_data["method"]
+        destination = serializer.validated_data["destination"]
+        bank_code = serializer.validated_data.get("bank_code")
+
         if amount <= 0:
             return Response({"detail": "Amount must be greater than zero"}, status=400)
 
-        balance, _ = LandlordBalance.objects.get_or_create(
-            landlord=request.user)
-        balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
-        _unlock_landlord(balance)
-        if amount > balance.available_balance:
-            return Response({"detail": "Insufficient available balance"}, status=400)
-
-        # Deduct while holding the balance row lock so concurrent payout requests
-        # cannot overspend the available landlord balance.
-        balance.available_balance -= amount
-        balance.save(update_fields=["available_balance", "updated_at"])
-        payout = LandlordPayout.objects.create(
-            landlord=request.user,
-            amount=amount,
-            method=serializer.validated_data["method"],
-            destination=serializer.validated_data["destination"],
-            bank_code=serializer.validated_data.get("bank_code"),
-            status=LandlordPayout.STATUS_PENDING,
-        )
-        ledger_row = LedgerTransaction.objects.create(
-            user=request.user,
-            kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
-            amount=amount,
-            status=LedgerTransaction.STATUS_PENDING,
-            reference_text=f"payout:{payout.id}",
-        )
-
-        result = execute_intasend_payout(payout)
-        if result.get("success"):
-            payout.status = LandlordPayout.STATUS_PAID
-            payout.paid_at = timezone.now()
-            payout.save(update_fields=["status", "paid_at"])
-
-            ledger_row.status = LedgerTransaction.STATUS_PAID
-            ledger_row.save(update_fields=["status"])
-            LedgerTransaction.objects.create(
-                user=request.user,
-                kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_PAID,
-                amount=amount,
-                status=LedgerTransaction.STATUS_PAID,
-                reference_text=f"payout:{payout.id}",
+        # Destination + cool-down guards (unchanged from previous pass).
+        if not _matches_saved_destination(request.user, method, destination, bank_code):
+            return Response(
+                {
+                    "detail": "Payout destination must match the saved landlord settings.",
+                    "code": "destination_not_verified",
+                },
+                status=403,
             )
-            return Response(LandlordPayoutSerializer(payout).data, status=201)
 
-        balance.available_balance += amount
-        balance.save(update_fields=["available_balance", "updated_at"])
-        payout.status = LandlordPayout.STATUS_FAILED
-        payout.save(update_fields=["status"])
-        ledger_row.status = LedgerTransaction.STATUS_REJECTED
-        error_note = str(result.get("error") or "failed")[:200]
-        ledger_row.reference_text = f"payout:{payout.id};error:{error_note}"
-        ledger_row.save(update_fields=["status", "reference_text"])
-        return Response({"detail": result.get("error") or "Payout failed."}, status=502)
+        cooldown_hours = max(int(getattr(settings, "LANDLORD_PAYOUT_COOLDOWN_HOURS", 24)), 0)
+        try:
+            saved = request.user.landlord_settings
+            last_change = getattr(saved, "payout_destination_updated_at", None)
+        except LandlordSettings.DoesNotExist:
+            last_change = None
+        if cooldown_hours and last_change:
+            elapsed = timezone.now() - last_change
+            if elapsed < timedelta(hours=cooldown_hours):
+                remaining = timedelta(hours=cooldown_hours) - elapsed
+                remaining_minutes = int(remaining.total_seconds() // 60) + 1
+                return Response(
+                    {
+                        "detail": (
+                            "Payout destination was changed recently. "
+                            f"Please try again in about {remaining_minutes} minutes."
+                        ),
+                        "code": "destination_cooldown_active",
+                    },
+                    status=403,
+                )
+
+        # ------------------------------------------------------------------
+        # Idempotency. Clients can supply an X-Idempotency-Key header or an
+        # `idempotency_key` body field; if a payout already exists for this
+        # landlord with the same key we return its current state without
+        # double-deducting and without re-submitting to the provider.
+        # ------------------------------------------------------------------
+        raw_key = (
+            request.META.get("HTTP_X_IDEMPOTENCY_KEY")
+            or (request.data.get("idempotency_key") if isinstance(request.data, dict) else None)
+            or ""
+        )
+        try:
+            idempotency_key = uuid.UUID(str(raw_key)) if raw_key else uuid.uuid4()
+        except (ValueError, TypeError):
+            return Response({"detail": "idempotency_key must be a UUID."}, status=400)
+
+        existing = LandlordPayout.objects.filter(
+            landlord=request.user, idempotency_key=idempotency_key
+        ).first()
+        if existing:
+            return Response(LandlordPayoutSerializer(existing).data, status=200)
+
+        # ------------------------------------------------------------------
+        # Step 1: reserve funds and persist a REQUESTED row in its own
+        # short-lived transaction. We commit BEFORE calling the external
+        # provider so a network timeout or crash mid-call leaves us with a
+        # row we can reconcile later, not an orphaned deduction.
+        # ------------------------------------------------------------------
+        normalized_destination = _normalized_destination(method, destination)
+        try:
+            with transaction.atomic():
+                balance, _ = LandlordBalance.objects.get_or_create(landlord=request.user)
+                balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
+                unlock_due_landlord_balance(request.user)
+                balance.refresh_from_db()
+                if amount > balance.available_balance:
+                    return Response({"detail": "Insufficient available balance"}, status=400)
+                balance.available_balance = balance.available_balance - amount
+                balance.save(update_fields=["available_balance", "updated_at"])
+                payout = LandlordPayout.objects.create(
+                    landlord=request.user,
+                    amount=amount,
+                    method=method,
+                    destination=normalized_destination,
+                    bank_code=bank_code,
+                    status=LandlordPayout.STATUS_REQUESTED,
+                    requested_by=request.user,
+                    idempotency_key=idempotency_key,
+                )
+                _record_payout_ledger(
+                    payout=payout,
+                    kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+                    status=LedgerTransaction.STATUS_PENDING,
+                    reference_text=f"payout:{payout.id};key:{idempotency_key}",
+                )
+        except Exception:
+            logger.exception("payout.reserve_failed landlord_id=%s", request.user.id)
+            return Response({"detail": "Could not reserve funds for this payout."}, status=500)
+
+        logger.info(
+            "payout.requested payout_id=%s landlord_id=%s amount=%s method=%s",
+            payout.id, request.user.id, str(amount), method,
+        )
+
+        # ------------------------------------------------------------------
+        # Step 2: call the provider OUTSIDE any open DB transaction.
+        # ------------------------------------------------------------------
+        result = execute_intasend_payout(payout)
+        return self._apply_payout_outcome(payout, result)
+
+    def _apply_payout_outcome(self, payout, result):
+        outcome = result.get("outcome")
+        provider_reference = result.get("provider_reference")
+        provider_status = result.get("provider_status")
+        redacted = result.get("redacted_response") or {}
+        detail = result.get("detail")
+
+        now = timezone.now()
+
+        if outcome == "rejected":
+            # Provider explicitly refused. No money left their system, so we
+            # release the reservation and FAIL. We UPDATE the existing
+            # PAYOUT_REQUEST ledger row in place (rather than appending a
+            # second one) so the audit history stays one-row-per-payout.
+            with transaction.atomic():
+                locked = LandlordPayout.objects.select_for_update().get(pk=payout.id)
+                if locked.status == LandlordPayout.STATUS_REQUESTED:
+                    locked.status = LandlordPayout.STATUS_FAILED
+                    locked.failed_at = now
+                    locked.provider_reference = provider_reference
+                    locked.provider_status = provider_status
+                    locked.provider_response = redacted
+                    locked.save(update_fields=[
+                        "status", "failed_at", "provider_reference",
+                        "provider_status", "provider_response",
+                    ])
+            _release_payout_reservation(payout.landlord, payout.amount)
+            short_detail = (detail or "")[:120]
+            LedgerTransaction.objects.filter(
+                user=payout.landlord,
+                kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+                reference_text__startswith=f"payout:{payout.id}",
+            ).update(
+                status=LedgerTransaction.STATUS_REJECTED,
+                reference_text=f"payout:{payout.id};provider_reject:{short_detail}",
+            )
+            return Response({"detail": detail or "Payout was rejected by the provider."}, status=502)
+
+        if outcome == "settled":
+            # Provider gave us an unambiguous "settled" answer (rare for
+            # async M-Pesa, common on instant rails). Promote straight to PAID.
+            return self._mark_paid(payout, provider_reference, provider_status, redacted, source="provider")
+
+        if outcome == "accepted":
+            # Provider acknowledged with a tracking id. Payout is PROCESSING.
+            # Funds remain reserved. The reconciliation loop / mark-paid
+            # admin endpoint will finalize once settlement is confirmed.
+            with transaction.atomic():
+                locked = LandlordPayout.objects.select_for_update().get(pk=payout.id)
+                if locked.status == LandlordPayout.STATUS_REQUESTED:
+                    locked.status = LandlordPayout.STATUS_PROCESSING
+                    locked.processing_at = now
+                    locked.provider_reference = provider_reference
+                    locked.provider_status = provider_status
+                    locked.provider_response = redacted
+                    locked.save(update_fields=[
+                        "status", "processing_at", "provider_reference",
+                        "provider_status", "provider_response",
+                    ])
+                payout = locked
+            return Response(LandlordPayoutSerializer(payout).data, status=202)
+
+        # ambiguous OR transport_error: the safest default is to KEEP the
+        # reservation. If we got a provider_reference we know the request
+        # reached IntaSend, so we move to PROCESSING. Otherwise we stay
+        # REQUESTED so reconciliation can retry by idempotency key.
+        with transaction.atomic():
+            locked = LandlordPayout.objects.select_for_update().get(pk=payout.id)
+            if provider_reference and locked.status == LandlordPayout.STATUS_REQUESTED:
+                locked.status = LandlordPayout.STATUS_PROCESSING
+                locked.processing_at = now
+            locked.provider_reference = provider_reference or locked.provider_reference
+            locked.provider_status = provider_status
+            locked.provider_response = redacted
+            locked.save(update_fields=[
+                "status", "processing_at", "provider_reference",
+                "provider_status", "provider_response",
+            ])
+            payout = locked
+        logger.warning(
+            "payout.ambiguous payout_id=%s outcome=%s has_ref=%s",
+            payout.id, outcome, bool(provider_reference),
+        )
+        return Response(
+            {
+                "detail": detail or "Payout was submitted but the provider has not confirmed settlement yet.",
+                "code": "payout_processing",
+                "payout": LandlordPayoutSerializer(payout).data,
+            },
+            status=202,
+        )
+
+    def _mark_paid(self, payout, provider_reference, provider_status, redacted, *, source):
+        with transaction.atomic():
+            locked = LandlordPayout.objects.select_for_update().get(pk=payout.id)
+            if locked.status == LandlordPayout.STATUS_PAID:
+                return Response(LandlordPayoutSerializer(locked).data, status=200)
+            if locked.status not in (
+                LandlordPayout.STATUS_REQUESTED,
+                LandlordPayout.STATUS_PROCESSING,
+            ):
+                return Response(
+                    {"detail": "Payout is no longer in a markable state.", "code": "invalid_state"},
+                    status=409,
+                )
+            now = timezone.now()
+            locked.status = LandlordPayout.STATUS_PAID
+            locked.paid_at = now
+            if not locked.processing_at:
+                locked.processing_at = now
+            if provider_reference and not locked.provider_reference:
+                locked.provider_reference = provider_reference
+            if provider_status:
+                locked.provider_status = provider_status
+            if redacted:
+                locked.provider_response = redacted
+            locked.save(update_fields=[
+                "status", "paid_at", "processing_at",
+                "provider_reference", "provider_status", "provider_response",
+            ])
+            payout = locked
+        _record_payout_ledger(
+            payout=payout,
+            kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_PAID,
+            status=LedgerTransaction.STATUS_PAID,
+            reference_text=f"payout:{payout.id};source:{source}",
+        )
+        # Mark the original REQUEST ledger row as PAID so the audit trail
+        # tells the full story.
+        LedgerTransaction.objects.filter(
+            user=payout.landlord,
+            kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+            reference_text__startswith=f"payout:{payout.id}",
+        ).update(status=LedgerTransaction.STATUS_PAID)
+        return Response(LandlordPayoutSerializer(payout).data, status=201)
 
 
 class LandlordPayoutMarkPaidView(APIView):
     permission_classes = [IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, pk):
         if not request.user.is_staff:
             return Response({"detail": "Admin only endpoint"}, status=403)
-        payout = LandlordPayout.objects.filter(pk=pk).first()
+        payout = LandlordPayout.objects.select_for_update().filter(pk=pk).first()
         if not payout:
             return Response({"detail": "Payout not found"}, status=404)
         if payout.status == LandlordPayout.STATUS_PAID:
-            return Response({"detail": "Payout already marked paid."})
-        if payout.status != LandlordPayout.STATUS_PENDING:
-            return Response({"detail": "Only pending payouts can be marked paid."}, status=400)
+            return Response({"detail": "Payout already marked paid."}, status=400)
+        # Admin can ONLY finalize payouts that reached PROCESSING. PROCESSING
+        # means we successfully submitted to the provider AND received back a
+        # provider_reference, so the admin's "yes, it actually settled" is a
+        # decision about a real provider-side transaction — not a fabrication.
+        #
+        # Earlier revisions also accepted the legacy STATUS_PENDING value
+        # here. That widened the door enough for staff to "settle" a payout
+        # row that had never been sent to IntaSend at all, which is exactly
+        # the abuse path this endpoint must close. Legacy PENDING rows must
+        # now go through the reverse endpoint (admin confirms no money moved)
+        # or be migrated via the reconciler.
+        if payout.status != LandlordPayout.STATUS_PROCESSING:
+            return Response(
+                {
+                    "detail": "Only PROCESSING payouts can be marked paid by an admin.",
+                    "code": "invalid_state",
+                    "current_status": payout.status,
+                },
+                status=400,
+            )
+        # And the row MUST already carry a provider_reference. Without one
+        # there is no way for the admin to have verified settlement
+        # off-platform — they'd be guessing.
+        if not (payout.provider_reference or "").strip():
+            return Response(
+                {
+                    "detail": "Payout has no provider reference yet; verify settlement before marking paid.",
+                    "code": "missing_provider_reference",
+                },
+                status=400,
+            )
+        now = timezone.now()
         payout.status = LandlordPayout.STATUS_PAID
-        payout.paid_at = timezone.now()
-        payout.save(update_fields=["status", "paid_at"])
+        payout.paid_at = now
+        payout.marked_paid_by = request.user
+        payout.marked_paid_at = now
+        if not payout.processing_at:
+            payout.processing_at = now
+        payout.save(update_fields=[
+            "status", "paid_at", "marked_paid_by", "marked_paid_at", "processing_at"
+        ])
         logger.info(
-            "Landlord payout marked as paid",
-            extra={"payout_id": payout.id, "landlord_id": payout.landlord_id,
-                   "amount": str(payout.amount)},
+            "payout.admin.mark_paid payout_id=%s landlord_id=%s marked_by=%s",
+            payout.id, payout.landlord_id, request.user.id,
         )
+        # Roll the original REQUEST ledger row up to PAID and write the PAID
+        # event in one go so the audit history is unambiguous.
+        LedgerTransaction.objects.filter(
+            user=payout.landlord,
+            kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+            reference_text__startswith=f"payout:{payout.id}",
+        ).update(status=LedgerTransaction.STATUS_PAID)
         LedgerTransaction.objects.create(
             user=payout.landlord,
             kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_PAID,
             amount=payout.amount,
             status=LedgerTransaction.STATUS_PAID,
-            reference_text=f"payout:{payout.id}",
+            reference_text=f"payout:{payout.id};marked_by:{request.user.id}",
         )
         return Response({"detail": "Payout marked paid"})
+
+
+class LandlordPayoutReverseView(APIView):
+    """Admin-only endpoint to mark a PROCESSING payout REVERSED.
+
+    Use this when the operator has confirmed off-platform (e.g. through the
+    IntaSend dashboard or a bank statement) that the transfer did not
+    settle. Releases the reservation and writes a REJECTED ledger row.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        if not request.user.is_staff:
+            return Response({"detail": "Admin only endpoint"}, status=403)
+        payout = LandlordPayout.objects.select_for_update().filter(pk=pk).first()
+        if not payout:
+            return Response({"detail": "Payout not found"}, status=404)
+        if payout.status == LandlordPayout.STATUS_REVERSED:
+            return Response({"detail": "Payout already reversed."}, status=400)
+        if payout.status not in (LandlordPayout.STATUS_PROCESSING, LandlordPayout.STATUS_REQUESTED):
+            return Response(
+                {
+                    "detail": "Only PROCESSING or REQUESTED payouts can be reversed.",
+                    "code": "invalid_state",
+                    "current_status": payout.status,
+                },
+                status=400,
+            )
+        now = timezone.now()
+        payout.status = LandlordPayout.STATUS_REVERSED
+        payout.reversed_at = now
+        payout.save(update_fields=["status", "reversed_at"])
+        # Restore funds under the balance row lock.
+        balance, _ = LandlordBalance.objects.get_or_create(landlord=payout.landlord)
+        balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
+        balance.available_balance = balance.available_balance + payout.amount
+        balance.save(update_fields=["available_balance", "updated_at"])
+        LedgerTransaction.objects.filter(
+            user=payout.landlord,
+            kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+            reference_text__startswith=f"payout:{payout.id}",
+        ).update(status=LedgerTransaction.STATUS_REJECTED)
+        logger.info(
+            "payout.admin.reversed payout_id=%s landlord_id=%s marked_by=%s",
+            payout.id, payout.landlord_id, request.user.id,
+        )
+        return Response({"detail": "Payout reversed."})
 
 
 @api_view(["GET"])
@@ -2782,3 +3366,29 @@ def landlord_followups(request):
         )
 
     return Response(LandlordFollowupSerializer(rows, many=True).data)
+
+
+class ThrottledTokenObtainPairView(TokenObtainPairView):
+    """Drop-in replacement for SimpleJWT's /api/token/ view that respects the
+    same 5/min throttle our custom login endpoint enforces."""
+    throttle_classes = [TokenObtainRateThrottle]
+
+
+class LogoutView(APIView):
+    """Blacklist the supplied refresh token. Idempotent: re-posting a token
+    that is already blacklisted simply returns 205. Without this endpoint a
+    stolen refresh token stayed valid for up to JWT_REFRESH_DAYS."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        token_value = (request.data or {}).get("refresh")
+        if not token_value:
+            return Response({"detail": "Refresh token is required."}, status=400)
+        try:
+            RefreshToken(token_value).blacklist()
+        except TokenError:
+            # Already invalid/blacklisted/expired. Returning 205 keeps the
+            # frontend logout idempotent and avoids leaking token-state info.
+            return Response(status=205)
+        return Response(status=205)

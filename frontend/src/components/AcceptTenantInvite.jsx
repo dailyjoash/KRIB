@@ -73,12 +73,19 @@ export default function AcceptTenantInvite() {
   const [lastName, setLastName] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [otpCode, setOtpCode] = useState("");
   const [error, setError] = useState("");
   const [deadState, setDeadState] = useState(null);
   const [loading, setLoading] = useState(false);
   const [loadingInvite, setLoadingInvite] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
+
+  // The detail endpoint exposes otp_expires_at when the inviter attached an
+  // OTP. We use it to decide whether to render the OTP input. The actual OTP
+  // code itself is never sent to the client; the user receives it out-of-band
+  // (SMS/email) and types it in.
+  const requiresOtp = Boolean(invite?.otp_expires_at);
 
   useEffect(() => {
     let active = true;
@@ -123,12 +130,20 @@ export default function AcceptTenantInvite() {
       return;
     }
 
+    if (requiresOtp && !otpCode.trim()) {
+      setError("Enter the OTP your landlord sent you.");
+      return;
+    }
+
     setLoading(true);
     try {
       const payload = new FormData();
       payload.append("first_name", firstName.trim());
       payload.append("last_name", lastName.trim());
       payload.append("password", password);
+      if (requiresOtp) {
+        payload.append("otp_code", otpCode.trim());
+      }
       await api.post(`/api/invites/${token}/accept/`, payload, {
         headers: { "Content-Type": "multipart/form-data" },
       });
@@ -225,6 +240,18 @@ export default function AcceptTenantInvite() {
                   {showConfirm ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
+              {requiresOtp ? (
+                <input
+                  className="auth-input"
+                  name="otp_code"
+                  value={otpCode}
+                  onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, "").slice(0, 8))}
+                  placeholder="One-time code (from SMS/email)"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  required
+                />
+              ) : null}
               {error ? <p className="error">{error}</p> : null}
               <button type="submit" className="auth-button" disabled={loading || !invite}>
                 {loading ? "Accepting invite..." : "Accept invite"}

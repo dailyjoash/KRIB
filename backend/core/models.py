@@ -30,6 +30,18 @@ class Profile(models.Model):
     wallet_locked = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     updated_at = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(wallet_available__gte=Decimal("0.00")),
+                name="profile_wallet_available_non_negative",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(wallet_locked__gte=Decimal("0.00")),
+                name="profile_wallet_locked_non_negative",
+            ),
+        ]
+
     def __str__(self):
         return f"{self.user.username} ({self.role})"
 
@@ -40,6 +52,10 @@ class LandlordSettings(models.Model):
     payout_method = models.CharField(max_length=20, blank=True, null=True)
     payout_destination = models.CharField(max_length=255, blank=True, null=True)
     payout_bank_code = models.CharField(max_length=50, blank=True, null=True)
+    # Updated by the settings serializer whenever the payout destination/method
+    # changes. The payout view refuses to release funds while this is recent
+    # so a hijacked session that pivots through settings has a forced wait.
+    payout_destination_updated_at = models.DateTimeField(blank=True, null=True)
 
     def __str__(self):
         return f"{self.business_name} ({self.user.username})"
@@ -94,6 +110,19 @@ class Unit(models.Model):
 
     class Meta:
         unique_together = ("property", "unit_number")
+        constraints = [
+            # Application code already validates these, but DB-level constraints
+            # defend against bypasses via shell-loaded fixtures, raw SQL, or
+            # imports that skip Django form/serializer validation.
+            models.CheckConstraint(
+                condition=models.Q(rent_amount__gte=Decimal("0.00")),
+                name="unit_rent_amount_non_negative",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(deposit__gte=Decimal("0.00")),
+                name="unit_deposit_non_negative",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.property.name} - {self.unit_number}"
@@ -141,6 +170,30 @@ class Lease(models.Model):
         super().save(*args, **kwargs)
         self.unit.status = Unit.STATUS_OCCUPIED if self.status == self.STATUS_ACTIVE else Unit.STATUS_VACANT
         self.unit.save(update_fields=["status"])
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(rent_amount__gte=Decimal("0.00")),
+                name="lease_rent_amount_non_negative",
+            ),
+            models.CheckConstraint(
+                # Months only have 28-31 days; 28 is the safest universal cap.
+                # `due_day` is also a PositiveSmallIntegerField so the >= 1
+                # half is enforced by the column type.
+                condition=models.Q(due_day__gte=1) & models.Q(due_day__lte=28),
+                name="lease_due_day_in_range",
+            ),
+            # Partial unique index: at most one ACTIVE lease per unit. The
+            # application-side check in `clean()` still runs (with a friendly
+            # error) and there is also `tenant+property` enforcement there,
+            # but this guarantees the invariant even against raw SQL.
+            models.UniqueConstraint(
+                fields=["unit"],
+                condition=models.Q(status="active"),
+                name="lease_one_active_per_unit",
+            ),
+        ]
 
     def __str__(self):
         return f"Lease {self.unit} - {self.tenant.username}"
@@ -231,6 +284,14 @@ class PaymentTransaction(models.Model):
     allocation_done = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(amount__gt=Decimal("0.00")),
+                name="paymenttransaction_amount_positive",
+            ),
+        ]
+
     def __str__(self):
         return f"{self.tenant.username} {self.period} {self.amount}"
 
@@ -240,6 +301,18 @@ class LandlordBalance(models.Model):
     available_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     locked_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(available_balance__gte=Decimal("0.00")),
+                name="landlordbalance_available_non_negative",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(locked_balance__gte=Decimal("0.00")),
+                name="landlordbalance_locked_non_negative",
+            ),
+        ]
 
 
 class LedgerTransaction(models.Model):
@@ -287,19 +360,80 @@ class LandlordPayout(models.Model):
     METHOD_BANK = "BANK"
     METHOD_CHOICES = [(METHOD_MPESA, "Mpesa"), (METHOD_BANK, "Bank")]
 
-    STATUS_PENDING = "PENDING"
+    # State machine
+    # ---------------------------------------------------------------------
+    # REQUESTED  : funds reserved in KRIB; provider call not yet made (or
+    #              made and we have no provider reference yet).
+    # PROCESSING : provider acknowledged the transfer and returned a
+    #              provider_reference. Funds remain reserved. Awaiting
+    #              settlement confirmation via callback or polling.
+    # PAID       : provider explicitly reported settlement. Final.
+    # FAILED     : provider explicitly rejected before any settlement risk
+    #              OR call failed before any provider reference. Funds are
+    #              returned to available_balance.
+    # REVERSED   : was PROCESSING but provider later confirmed the transfer
+    #              did not settle (or our reconciliation determined this).
+    #              Funds returned to available_balance.
+    # PENDING    : legacy alias retained so older rows continue to render in
+    #              the admin. New code paths never write PENDING.
+    STATUS_REQUESTED = "REQUESTED"
+    STATUS_PROCESSING = "PROCESSING"
     STATUS_PAID = "PAID"
     STATUS_FAILED = "FAILED"
-    STATUS_CHOICES = [(STATUS_PENDING, "Pending"), (STATUS_PAID, "Paid"), (STATUS_FAILED, "Failed")]
+    STATUS_REVERSED = "REVERSED"
+    STATUS_PENDING = "PENDING"  # legacy
+    STATUS_CHOICES = [
+        (STATUS_REQUESTED, "Requested"),
+        (STATUS_PROCESSING, "Processing"),
+        (STATUS_PAID, "Paid"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_REVERSED, "Reversed"),
+        (STATUS_PENDING, "Pending (legacy)"),
+    ]
 
     landlord = models.ForeignKey(User, on_delete=models.CASCADE, related_name="landlord_payouts")
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     method = models.CharField(max_length=20, choices=METHOD_CHOICES)
     destination = models.CharField(max_length=255)
     bank_code = models.CharField(max_length=20, blank=True, null=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_REQUESTED)
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(blank=True, null=True)
+    requested_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payouts_requested",
+    )
+    marked_paid_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payouts_marked_paid",
+    )
+    marked_paid_at = models.DateTimeField(blank=True, null=True)
+    # Client-supplied (or server-generated) idempotency key. Lets us safely
+    # retry a payout without double-deducting if the original response was
+    # lost in transit. Scoped per-landlord so two different landlords can
+    # use the same UUID without collision (very unlikely, but unique-per-row
+    # is the safest invariant).
+    idempotency_key = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    # Provider's own transfer/tracking id. Stored so reconciliation can ask
+    # the provider for the authoritative settlement status later.
+    provider_reference = models.CharField(max_length=120, blank=True, null=True, db_index=True)
+    # Last raw provider status string (e.g. "SENT", "APPROVED", "FAILED").
+    # Free-text because each provider uses different vocabulary.
+    provider_status = models.CharField(max_length=50, blank=True, null=True)
+    # Redacted/minimized last provider response. Run through
+    # core.payments.redact.redact_payment_payload before persisting so
+    # raw phone numbers / account numbers do not land in the DB.
+    provider_response = models.JSONField(blank=True, null=True)
+    processing_at = models.DateTimeField(blank=True, null=True)
+    failed_at = models.DateTimeField(blank=True, null=True)
+    reversed_at = models.DateTimeField(blank=True, null=True)
+    last_reconciled_at = models.DateTimeField(blank=True, null=True)
 
 
 class MaintenanceRequest(models.Model):

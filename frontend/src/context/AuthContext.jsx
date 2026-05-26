@@ -107,7 +107,18 @@ export function AuthProvider({ children }) {
     }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    // Best-effort server-side blacklist of the refresh token. We always clear
+    // local storage even if the network call fails so the UI is never stuck
+    // signed in after the user clicked Sign Out.
+    const refresh = localStorage.getItem("refresh");
+    if (refresh) {
+      try {
+        await api.post("/api/auth/logout/", { refresh });
+      } catch (err) {
+        // network/offline/server-down: ignore; local logout still happens
+      }
+    }
     localStorage.removeItem("user");
     localStorage.removeItem("access");
     localStorage.removeItem("refresh");

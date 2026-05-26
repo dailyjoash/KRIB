@@ -3,17 +3,19 @@ services:
     image: mysql:8.4
     restart: unless-stopped
     environment:
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-krib_db}
-      MYSQL_USER: ${MYSQL_USER:-krib_user}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-krib_password}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      # ${VAR:?message} causes docker compose to fail loud rather than
+      # silently boot MySQL with the dev defaults krib_password / root.
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?MYSQL_DATABASE required}
+      MYSQL_USER: ${MYSQL_USER:?MYSQL_USER required}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD required}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD required}
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -28,17 +30,24 @@ services:
       mysql:
         condition: service_healthy
     environment:
-      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY required}
       DJANGO_DEBUG: "0"
-      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS}
-      DJANGO_CORS_ALLOWED_ORIGINS: ${DJANGO_CORS_ALLOWED_ORIGINS}
-      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?DJANGO_ALLOWED_HOSTS required}
+      DJANGO_CORS_ALLOWED_ORIGINS: ${DJANGO_CORS_ALLOWED_ORIGINS:?DJANGO_CORS_ALLOWED_ORIGINS required}
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:?DJANGO_CSRF_TRUSTED_ORIGINS required}
       DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-1}
       DJANGO_LOG_LEVEL: ${DJANGO_LOG_LEVEL:-INFO}
       DJANGO_GUNICORN_WORKERS: ${DJANGO_GUNICORN_WORKERS:-3}
       DJANGO_GUNICORN_TIMEOUT: ${DJANGO_GUNICORN_TIMEOUT:-120}
       DJANGO_COLLECTSTATIC: ${DJANGO_COLLECTSTATIC:-1}
-      DATABASE_URL: ${DATABASE_URL:-mysql://krib_user:krib_password@mysql:3306/krib_db}
+      # No fallback to the dev MySQL DSN — production must point at its own DB.
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      # Required for IntaSend webhook authenticity; settings.py refuses to boot
+      # in production if this is missing/short.
+      INTASEND_API_TOKEN: ${INTASEND_API_TOKEN:?INTASEND_API_TOKEN required}
+      INTASEND_PUBLISHABLE_KEY: ${INTASEND_PUBLISHABLE_KEY:?INTASEND_PUBLISHABLE_KEY required}
+      INTASEND_TEST_MODE: ${INTASEND_TEST_MODE:-0}
+      INTASEND_WEBHOOK_SECRET: ${INTASEND_WEBHOOK_SECRET:?INTASEND_WEBHOOK_SECRET required}
       MYSQL_CHARSET: ${MYSQL_CHARSET:-utf8mb4}
       MYSQL_USE_SSL: ${MYSQL_USE_SSL:-0}
       MYSQL_SSL_CA: ${MYSQL_SSL_CA:-}
@@ -112,14 +121,15 @@ services:
         condition: service_healthy
     command: ["sh", "-c", "python manage.py migrate --noinput && python manage.py run_periodic_tasks"]
     environment:
-      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY required}
       DJANGO_DEBUG: "0"
-      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS}
-      DJANGO_CORS_ALLOWED_ORIGINS: ${DJANGO_CORS_ALLOWED_ORIGINS}
-      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:?DJANGO_ALLOWED_HOSTS required}
+      DJANGO_CORS_ALLOWED_ORIGINS: ${DJANGO_CORS_ALLOWED_ORIGINS:?DJANGO_CORS_ALLOWED_ORIGINS required}
+      DJANGO_CSRF_TRUSTED_ORIGINS: ${DJANGO_CSRF_TRUSTED_ORIGINS:?DJANGO_CSRF_TRUSTED_ORIGINS required}
       DJANGO_SECURE_SSL_REDIRECT: ${DJANGO_SECURE_SSL_REDIRECT:-1}
       DJANGO_LOG_LEVEL: ${DJANGO_LOG_LEVEL:-INFO}
-      DATABASE_URL: ${DATABASE_URL:-mysql://krib_user:krib_password@mysql:3306/krib_db}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL required}
+      INTASEND_WEBHOOK_SECRET: ${INTASEND_WEBHOOK_SECRET:?INTASEND_WEBHOOK_SECRET required}
       MYSQL_CHARSET: ${MYSQL_CHARSET:-utf8mb4}
       MYSQL_USE_SSL: ${MYSQL_USE_SSL:-0}
       MYSQL_SSL_CA: ${MYSQL_SSL_CA:-}

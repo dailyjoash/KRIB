@@ -11,6 +11,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from django.core.files.base import ContentFile
+from django.db import transaction
 from django.utils import timezone
 
 from .models import Lease, compute_lease_rent_status
@@ -94,6 +95,233 @@ def current_period_string(today=None):
 def current_billing_period(today=None):
     today = today or timezone.localdate()
     return date(today.year, today.month, 1)
+
+
+def reconcile_processing_payouts(limit=None):
+    """Walk PROCESSING (and stale REQUESTED-with-reference) payouts and ask
+    the provider for an authoritative settlement state.
+
+    State machine applied here:
+      PROCESSING + provider says SETTLED   → PAID    (release credit ledger)
+      PROCESSING + provider says REJECTED  → REVERSED (refund balance)
+      PROCESSING + provider says ACCEPTED  → stay PROCESSING (still in flight)
+      PROCESSING + provider AMBIGUOUS      → stay PROCESSING, update last_reconciled_at
+      PROCESSING + provider TRANSPORT_ERR  → stay PROCESSING, no state change
+
+    The function is safe to run as a cron job. Each payout transitions in
+    its own atomic block under select_for_update, so a parallel admin
+    mark-paid call cannot race with the reconciler.
+
+    Returns a dict of counts for logging.
+    """
+    from .models import LandlordBalance, LandlordPayout, LedgerTransaction
+
+    qs = LandlordPayout.objects.filter(
+        status=LandlordPayout.STATUS_PROCESSING
+    ).order_by("processing_at", "id")
+    if limit:
+        qs = qs[:limit]
+
+    payout_ids = list(qs.values_list("id", flat=True))
+    stats = {"checked": 0, "paid": 0, "reversed": 0, "left_processing": 0, "errored": 0}
+
+    for payout_id in payout_ids:
+        stats["checked"] += 1
+        try:
+            payout = LandlordPayout.objects.select_related("landlord").get(pk=payout_id)
+        except LandlordPayout.DoesNotExist:
+            continue
+
+        result = intasend_payout_status(payout.provider_reference)
+        outcome = result.get("outcome")
+        provider_status = result.get("provider_status")
+        redacted = result.get("redacted_response") or {}
+
+        now = timezone.now()
+
+        if outcome == PAYOUT_OUTCOME_SETTLED:
+            with transaction.atomic():
+                locked = LandlordPayout.objects.select_for_update().get(pk=payout_id)
+                if locked.status == LandlordPayout.STATUS_PROCESSING:
+                    locked.status = LandlordPayout.STATUS_PAID
+                    locked.paid_at = now
+                    locked.provider_status = provider_status or locked.provider_status
+                    locked.provider_response = redacted or locked.provider_response
+                    locked.last_reconciled_at = now
+                    locked.save(update_fields=[
+                        "status", "paid_at", "provider_status",
+                        "provider_response", "last_reconciled_at",
+                    ])
+                    # The original "request" ledger row becomes PAID; create
+                    # the matching "paid" ledger entry exactly once.
+                    LedgerTransaction.objects.filter(
+                        user=locked.landlord,
+                        kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+                        reference_text__startswith=f"payout:{locked.id}",
+                    ).update(status=LedgerTransaction.STATUS_PAID)
+                    LedgerTransaction.objects.create(
+                        user=locked.landlord,
+                        kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_PAID,
+                        amount=locked.amount,
+                        status=LedgerTransaction.STATUS_PAID,
+                        reference_text=f"payout:{locked.id};source:reconcile",
+                    )
+            stats["paid"] += 1
+            continue
+
+        if outcome == PAYOUT_OUTCOME_REJECTED:
+            with transaction.atomic():
+                locked = LandlordPayout.objects.select_for_update().get(pk=payout_id)
+                if locked.status == LandlordPayout.STATUS_PROCESSING:
+                    locked.status = LandlordPayout.STATUS_REVERSED
+                    locked.reversed_at = now
+                    locked.provider_status = provider_status or locked.provider_status
+                    locked.provider_response = redacted or locked.provider_response
+                    locked.last_reconciled_at = now
+                    locked.save(update_fields=[
+                        "status", "reversed_at", "provider_status",
+                        "provider_response", "last_reconciled_at",
+                    ])
+                    # Restore the reserved funds under the balance lock so a
+                    # concurrent new payout request sees the refunded value.
+                    balance, _ = LandlordBalance.objects.get_or_create(landlord=locked.landlord)
+                    balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
+                    balance.available_balance = balance.available_balance + locked.amount
+                    balance.save(update_fields=["available_balance", "updated_at"])
+                    LedgerTransaction.objects.filter(
+                        user=locked.landlord,
+                        kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+                        reference_text__startswith=f"payout:{locked.id}",
+                    ).update(status=LedgerTransaction.STATUS_REJECTED)
+            stats["reversed"] += 1
+            continue
+
+        # ACCEPTED / AMBIGUOUS / TRANSPORT_ERROR: keep PROCESSING, but
+        # bump last_reconciled_at so an operator can see we tried.
+        with transaction.atomic():
+            locked = LandlordPayout.objects.select_for_update().get(pk=payout_id)
+            locked.last_reconciled_at = now
+            if provider_status:
+                locked.provider_status = provider_status
+            if redacted:
+                locked.provider_response = redacted
+            locked.save(update_fields=["last_reconciled_at", "provider_status", "provider_response"])
+        if outcome == PAYOUT_OUTCOME_TRANSPORT_ERROR:
+            stats["errored"] += 1
+        stats["left_processing"] += 1
+
+    return stats
+
+
+def _unlock_single_ledger_row(ledger_id):
+    """Unlock a single LedgerTransaction with proper row-level locking.
+
+    Returns True iff the row transitioned from LOCKED→AVAILABLE and its
+    counterpart balance row was credited. Safe to call concurrently — if two
+    requests race for the same row, only one will see status=LOCKED inside
+    the `select_for_update` window and the other will short-circuit.
+    """
+    from .models import LandlordBalance, LedgerTransaction, Profile
+
+    with transaction.atomic():
+        try:
+            row = (
+                LedgerTransaction.objects.select_for_update()
+                .select_related("user")
+                .get(pk=ledger_id)
+            )
+        except LedgerTransaction.DoesNotExist:
+            return False
+
+        if row.status != LedgerTransaction.STATUS_LOCKED:
+            return False
+        if row.available_at is None or row.available_at > timezone.now():
+            return False
+
+        if row.kind == LedgerTransaction.KIND_LANDLORD_CREDIT_RENT:
+            balance, _ = LandlordBalance.objects.get_or_create(landlord=row.user)
+            balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
+            balance.locked_balance = max(balance.locked_balance - row.amount, Decimal("0.00"))
+            balance.available_balance += row.amount
+            balance.save(update_fields=["locked_balance", "available_balance", "updated_at"])
+        elif row.kind == LedgerTransaction.KIND_WALLET_CREDIT:
+            profile, _ = Profile.objects.get_or_create(user=row.user)
+            profile = Profile.objects.select_for_update().get(pk=profile.pk)
+            profile.wallet_locked = max(profile.wallet_locked - row.amount, Decimal("0.00"))
+            profile.wallet_available += row.amount
+            profile.save(update_fields=["wallet_locked", "wallet_available", "updated_at"])
+        else:
+            return False
+
+        row.status = LedgerTransaction.STATUS_AVAILABLE
+        row.save(update_fields=["status"])
+        return True
+
+
+def unlock_due_wallet_for_user(user):
+    """Unlock all wallet-credit ledger rows for `user` whose hold has expired.
+
+    Returns the total amount that became newly available. Idempotent: rows
+    that another caller (cron or a parallel request) already unlocked are
+    skipped via the per-row lock in `_unlock_single_ledger_row`.
+    """
+    from .models import LedgerTransaction
+
+    if not user or not getattr(user, "is_authenticated", False):
+        return Decimal("0.00")
+
+    due_ids = list(
+        LedgerTransaction.objects.filter(
+            user=user,
+            kind=LedgerTransaction.KIND_WALLET_CREDIT,
+            status=LedgerTransaction.STATUS_LOCKED,
+            available_at__lte=timezone.now(),
+        )
+        .order_by("available_at", "id")
+        .values_list("id", flat=True)
+    )
+    unlocked = Decimal("0.00")
+    for ledger_id in due_ids:
+        # Look up the amount inside the row lock window so we never count
+        # an amount belonging to a row another worker already unlocked.
+        row = LedgerTransaction.objects.filter(
+            pk=ledger_id,
+            status=LedgerTransaction.STATUS_LOCKED,
+        ).first()
+        amount = row.amount if row else Decimal("0.00")
+        if _unlock_single_ledger_row(ledger_id):
+            unlocked += amount
+    return unlocked
+
+
+def unlock_due_landlord_balance(landlord):
+    """Unlock all landlord-credit ledger rows for `landlord` whose hold has
+    expired. Returns the total amount that became newly available."""
+    from .models import LedgerTransaction
+
+    if not landlord or not getattr(landlord, "is_authenticated", False):
+        return Decimal("0.00")
+
+    due_ids = list(
+        LedgerTransaction.objects.filter(
+            user=landlord,
+            kind=LedgerTransaction.KIND_LANDLORD_CREDIT_RENT,
+            status=LedgerTransaction.STATUS_LOCKED,
+            available_at__lte=timezone.now(),
+        )
+        .order_by("available_at", "id")
+        .values_list("id", flat=True)
+    )
+    unlocked = Decimal("0.00")
+    for ledger_id in due_ids:
+        row = LedgerTransaction.objects.filter(
+            pk=ledger_id,
+            status=LedgerTransaction.STATUS_LOCKED,
+        ).first()
+        amount = row.amount if row else Decimal("0.00")
+        if _unlock_single_ledger_row(ledger_id):
+            unlocked += amount
+    return unlocked
 
 
 def can_withdraw_wallet(tenant_user, amount):
@@ -385,26 +613,31 @@ def send_sms(phone_number, message, *, include_detail=False):
     try:
         with urllib_request.urlopen(req, timeout=20) as resp:
             raw_body = resp.read().decode()
-            logger.info("Africa's Talking SMS response: %s", raw_body)
             parsed = json.loads(raw_body or "{}")
             recipients = ((parsed.get("SMSMessageData") or {}).get("Recipients")) or []
             first_recipient = recipients[0] if recipients else {}
             status_text = first_recipient.get("status") or (parsed.get("SMSMessageData") or {}).get("Message") or "SMS sent."
             ok = first_recipient.get("status") == "Success" or "Sent to" in ((parsed.get("SMSMessageData") or {}).get("Message") or "")
+            # Log only the boolean outcome + a short safe status word. The
+            # provider body echoes the recipient phone number and was being
+            # written verbatim to stdout/logs.
+            logger.info("sms.send result=%s status=%s", ok, status_text[:80])
             result = {"ok": ok, "detail": status_text, "body": parsed}
             return result if include_detail else ok
     except HTTPError as exc:  # pragma: no cover - network path
+        from .payments.redact import redact_text
         body = ""
         try:
             body = exc.read().decode()
         except Exception:
             body = ""
-        logger.warning("SMS delivery failed: %s %s", exc, body)
+        logger.warning("sms.send.failed %s", redact_text(body or str(exc)))
         detail = body or str(exc)
         result = {"ok": False, "detail": detail}
         return result if include_detail else False
     except Exception as exc:  # pragma: no cover - network path
-        logger.warning("SMS delivery failed: %s", exc)
+        from .payments.redact import redact_text
+        logger.warning("sms.send.failed %s", redact_text(str(exc)))
         result = {"ok": False, "detail": str(exc)}
         return result if include_detail else False
 
@@ -482,71 +715,345 @@ def _intasend_payout_error(response, fallback):
     return fallback
 
 
-def _intasend_payout_accepted(response):
-    if not response:
-        return False
-    if isinstance(response, dict):
-        status = str(response.get("status") or response.get("state") or "").upper()
-        if status in {"FAILED", "ERROR", "REJECTED"}:
-            return False
-        if response.get("tracking_id") or response.get("id"):
-            return True
-        if response.get("invoice") or response.get("reference"):
-            return True
-        if isinstance(response.get("results"), list) and response.get("results"):
-            return True
-    return False
+# Payout lifecycle outcomes returned by the provider adapter. The view
+# translates these into LandlordPayout state transitions. Keep the surface
+# narrow so Pesapal / Daraja / any other adapter cannot accidentally widen
+# the contract.
+PAYOUT_OUTCOME_ACCEPTED = "accepted"            # provider acknowledged; awaiting settlement → PROCESSING
+PAYOUT_OUTCOME_SETTLED = "settled"              # provider explicitly confirmed settlement → PAID
+PAYOUT_OUTCOME_REJECTED = "rejected"            # provider explicitly rejected pre-settlement → FAILED + restore
+PAYOUT_OUTCOME_AMBIGUOUS = "ambiguous"          # no clear answer; stay PROCESSING + reconcile later
+PAYOUT_OUTCOME_TRANSPORT_ERROR = "transport_error"  # never reached the provider → stay REQUESTED + reconcile later
+
+
+def _extract_provider_reference(response):
+    """Pull the provider's tracking identifier out of an IntaSend response.
+
+    Reconciliation needs this id to look up the eventual settlement state.
+    """
+    if not isinstance(response, dict):
+        return None
+    for key in ("tracking_id", "id", "reference", "batch_reference"):
+        value = response.get(key)
+        if value:
+            return str(value)
+    # The collection-status SDK returns nested results.
+    results = response.get("results") if isinstance(response.get("results"), list) else []
+    for entry in results:
+        if isinstance(entry, dict):
+            for key in ("tracking_id", "id", "reference"):
+                value = entry.get(key)
+                if value:
+                    return str(value)
+    return None
+
+
+# --- IntaSend status vocabulary ---------------------------------------------
+# Statuses that unambiguously indicate the provider has rejected the transfer.
+_INTASEND_REJECT_STATUSES = frozenset({"FAILED", "ERROR", "REJECTED", "DECLINED"})
+
+# Statuses that unambiguously indicate the provider has SETTLED the transfer
+# (the money has moved to the beneficiary). These are the only labels we
+# accept as "settled" — not "SUCCESS", because for the asynchronous M-Pesa
+# rail "SUCCESS" only means "request accepted into the queue".
+_INTASEND_SETTLED_STATUSES = frozenset({"COMPLETED", "PAID", "SETTLED"})
+
+# Statuses that mean "we have it, awaiting settlement". The provider may
+# still mark these COMPLETED later via a callback or status lookup.
+_INTASEND_ACCEPTED_STATUSES = frozenset({
+    "SENT", "PROCESSING", "QUEUED", "APPROVED",
+    "INITIATED", "RECEIVED", "SUCCESS",
+    # IntaSend's payout API returns "SUCCESS" on the *submission* call to
+    # signal "your request was accepted" — NOT "money has settled". With
+    # requires_approval="YES" enabled, the actual settlement happens later
+    # in their dashboard. The previous classifier promoted SUCCESS straight
+    # to SETTLED here, which is the bug this pass fixes.
+})
+
+
+def classify_initial_intasend_payout_response(response):
+    """Classification for the response returned by the INITIAL payout
+    submission (`service.transfer.mpesa(...)` / `service.transfer.bank(...)`).
+
+    Be conservative: even when the provider says "SUCCESS", treat the payout
+    as accepted-but-not-settled. The reconciler / a dedicated payout-status
+    webhook is the authoritative source for settlement.
+    """
+    if not isinstance(response, dict):
+        return PAYOUT_OUTCOME_AMBIGUOUS, None
+
+    raw_status = str(response.get("status") or response.get("state") or "").upper().strip()
+    provider_reference = _extract_provider_reference(response)
+
+    if raw_status in _INTASEND_REJECT_STATUSES:
+        return PAYOUT_OUTCOME_REJECTED, provider_reference
+
+    # Settlement is a strong claim. We only honour it on the initial
+    # submission if the provider used one of the explicit settled keywords.
+    # "SUCCESS" deliberately does NOT count here — it lives in
+    # _INTASEND_ACCEPTED_STATUSES.
+    if raw_status in _INTASEND_SETTLED_STATUSES:
+        return PAYOUT_OUTCOME_SETTLED, provider_reference
+
+    if raw_status in _INTASEND_ACCEPTED_STATUSES and provider_reference:
+        return PAYOUT_OUTCOME_ACCEPTED, provider_reference
+
+    # No explicit status but we have a tracking id → still only ACCEPTED.
+    if provider_reference:
+        return PAYOUT_OUTCOME_ACCEPTED, provider_reference
+
+    # No status, no tracking id. Fail closed: ambiguous, do not auto-reverse.
+    return PAYOUT_OUTCOME_AMBIGUOUS, provider_reference
+
+
+def classify_intasend_payout_status_response(response):
+    """Classification for the response returned by an explicit STATUS LOOKUP
+    on an existing transfer (i.e. `service.transfer.status(tracking_id=...)`).
+
+    Status-lookup responses are the authoritative source of settlement
+    truth: when the provider tells us "SUCCESS" via the status endpoint it
+    means the underlying transaction has been settled, not just queued.
+
+    This is also where SETTLED keywords act as PAID.
+    """
+    if not isinstance(response, dict):
+        return PAYOUT_OUTCOME_AMBIGUOUS, None
+
+    raw_status = str(response.get("status") or response.get("state") or "").upper().strip()
+    provider_reference = _extract_provider_reference(response)
+
+    if raw_status in _INTASEND_REJECT_STATUSES:
+        return PAYOUT_OUTCOME_REJECTED, provider_reference
+
+    # The status lookup treats "SUCCESS" as settled, in addition to the
+    # explicit settled keywords. This is the *only* IntaSend code path
+    # where a "SUCCESS" string graduates a payout to PAID.
+    if raw_status in _INTASEND_SETTLED_STATUSES or raw_status == "SUCCESS":
+        return PAYOUT_OUTCOME_SETTLED, provider_reference
+
+    if raw_status in _INTASEND_ACCEPTED_STATUSES and provider_reference:
+        return PAYOUT_OUTCOME_ACCEPTED, provider_reference
+
+    if provider_reference:
+        return PAYOUT_OUTCOME_ACCEPTED, provider_reference
+
+    return PAYOUT_OUTCOME_AMBIGUOUS, provider_reference
+
+
+def _classify_intasend_payout_response(response):
+    """Backwards-compatible alias for code that has not been updated yet.
+
+    Behaves like `classify_initial_intasend_payout_response` because that is
+    the safer of the two interpretations. New code should call one of the
+    explicit variants above.
+    """
+    return classify_initial_intasend_payout_response(response)
 
 
 def execute_intasend_payout(payout):
+    """Submit a payout to IntaSend and return a structured outcome dict.
+
+    Shape:
+        {
+            "outcome": one of PAYOUT_OUTCOME_*,
+            "provider_reference": str | None,
+            "provider_status": str | None,
+            "detail": str | None,
+            "redacted_response": dict,
+        }
+    """
+    from .payments.redact import redact_payment_payload
+
     token = os.getenv("INTASEND_API_TOKEN", "").strip()
     if not token:
-        return {"success": False, "error": "IntaSend is not configured."}
+        return {
+            "outcome": PAYOUT_OUTCOME_TRANSPORT_ERROR,
+            "provider_reference": None,
+            "provider_status": None,
+            "detail": "IntaSend is not configured.",
+            "redacted_response": {},
+        }
 
     if APIService is None:
-        return {"success": False, "error": "IntaSend SDK is not installed."}
+        return {
+            "outcome": PAYOUT_OUTCOME_TRANSPORT_ERROR,
+            "provider_reference": None,
+            "provider_status": None,
+            "detail": "IntaSend SDK is not installed.",
+            "redacted_response": {},
+        }
+
+    # Compose the provider request first; if the destination/method itself
+    # is invalid we return REJECTED *without* ever touching the provider so
+    # the caller can FAIL safely and release funds.
+    txn = {
+        "name": _payout_beneficiary_name(payout),
+        "account": str(payout.destination or "").strip(),
+        "amount": float(Decimal(payout.amount)),
+        # Include the local payout id and idempotency_key so the provider's
+        # logs/dashboard show our cross-reference. IntaSend does not have a
+        # first-class idempotency-key feature on payouts; KRIB enforces
+        # idempotency on its side via LandlordPayout.idempotency_key.
+        "narrative": f"KRIB payout #{payout.id} key:{payout.idempotency_key}",
+    }
+
+    if payout.method == payout.METHOD_MPESA:
+        normalized_account = normalize_mpesa_phone_number(txn["account"])
+        if not normalized_account:
+            return {
+                "outcome": PAYOUT_OUTCOME_REJECTED,
+                "provider_reference": None,
+                "provider_status": None,
+                "detail": "Use a valid Kenyan M-Pesa number for payouts.",
+                "redacted_response": {},
+            }
+        txn["account"] = normalized_account
+    elif payout.method == payout.METHOD_BANK:
+        if not getattr(payout, "bank_code", ""):
+            return {
+                "outcome": PAYOUT_OUTCOME_REJECTED,
+                "provider_reference": None,
+                "provider_status": None,
+                "detail": "Bank code is required for bank payouts.",
+                "redacted_response": {},
+            }
+        txn["bank_code"] = str(payout.bank_code).strip()
+    else:
+        return {
+            "outcome": PAYOUT_OUTCOME_REJECTED,
+            "provider_reference": None,
+            "provider_status": None,
+            "detail": "Unsupported payout method.",
+            "redacted_response": {},
+        }
+
+    # Real provider call. Any exception below has to be classified as
+    # transport_error because we cannot be sure whether the request reached
+    # the provider — that's why the caller leaves the payout in REQUESTED
+    # until reconciliation can ask the provider directly.
+    try:
+        service = APIService(**_intasend_service_kwargs())
+        if payout.method == payout.METHOD_MPESA:
+            response = service.transfer.mpesa(
+                currency="KES",
+                transactions=[txn],
+                requires_approval="YES",
+            )
+        else:
+            response = service.transfer.bank(
+                currency="KES",
+                transactions=[txn],
+                requires_approval="YES",
+            )
+    except Exception as exc:  # pragma: no cover - SDK/network path
+        logger.warning("payout.intasend.transport_error payout_id=%s", getattr(payout, "id", None))
+        return {
+            "outcome": PAYOUT_OUTCOME_TRANSPORT_ERROR,
+            "provider_reference": None,
+            "provider_status": None,
+            "detail": str(exc) or "IntaSend payout transport error.",
+            "redacted_response": {},
+        }
+
+    # Initial submission MUST use the conservative classifier — provider
+    # "SUCCESS" here means "request queued", not "money settled". Only the
+    # status-lookup path (used by the reconciler) can promote SUCCESS to PAID.
+    outcome, provider_reference = classify_initial_intasend_payout_response(response)
+    provider_status = None
+    if isinstance(response, dict):
+        provider_status = str(response.get("status") or response.get("state") or "").upper() or None
+
+    redacted = redact_payment_payload(response) if isinstance(response, dict) else {}
+
+    logger.info(
+        "payout.intasend.response payout_id=%s outcome=%s provider_status=%s has_ref=%s",
+        getattr(payout, "id", None),
+        outcome,
+        provider_status,
+        bool(provider_reference),
+    )
+
+    detail = None
+    if outcome == PAYOUT_OUTCOME_REJECTED:
+        detail = _intasend_payout_error(response, "IntaSend payout rejected.")
+    elif outcome == PAYOUT_OUTCOME_AMBIGUOUS:
+        detail = _intasend_payout_error(response, "IntaSend response was ambiguous.")
+
+    return {
+        "outcome": outcome,
+        "provider_reference": provider_reference,
+        "provider_status": provider_status,
+        "detail": detail,
+        "redacted_response": redacted,
+    }
+
+
+def intasend_payout_status(provider_reference):
+    """Ask IntaSend for the current settlement state of a previously-submitted
+    transfer. Used by the reconciliation loop to upgrade PROCESSING payouts
+    to PAID/REVERSED only when the provider gives a clear answer.
+
+    Returns the same outcome shape as execute_intasend_payout(), with one
+    of: SETTLED, REJECTED, ACCEPTED (still processing on their side),
+    AMBIGUOUS, or TRANSPORT_ERROR.
+    """
+    from .payments.redact import redact_payment_payload
+
+    if not provider_reference:
+        return {
+            "outcome": PAYOUT_OUTCOME_AMBIGUOUS,
+            "provider_status": None,
+            "detail": "No provider reference to query.",
+            "redacted_response": {},
+        }
+
+    token = os.getenv("INTASEND_API_TOKEN", "").strip()
+    if not token or APIService is None:
+        return {
+            "outcome": PAYOUT_OUTCOME_TRANSPORT_ERROR,
+            "provider_status": None,
+            "detail": "IntaSend is not configured.",
+            "redacted_response": {},
+        }
 
     try:
         service = APIService(**_intasend_service_kwargs())
-        transaction = {
-            "name": _payout_beneficiary_name(payout),
-            "account": str(payout.destination or "").strip(),
-            "amount": float(Decimal(payout.amount)),
-            "narrative": f"KRIB landlord payout #{payout.id}",
+        # The IntaSend SDK exposes transfer.status(tracking_id=...). If the
+        # installed SDK version does not have this method, the reconciliation
+        # loop will fail closed (TRANSPORT_ERROR) and the operator can run a
+        # manual mark-paid once they verify settlement off-platform.
+        status_fn = getattr(service.transfer, "status", None)
+        if status_fn is None:
+            return {
+                "outcome": PAYOUT_OUTCOME_TRANSPORT_ERROR,
+                "provider_status": None,
+                "detail": "IntaSend SDK does not expose transfer.status().",
+                "redacted_response": {},
+            }
+        response = status_fn(tracking_id=provider_reference)
+    except Exception as exc:  # pragma: no cover - SDK/network path
+        logger.warning("payout.intasend.status_transport_error ref=%s", provider_reference)
+        return {
+            "outcome": PAYOUT_OUTCOME_TRANSPORT_ERROR,
+            "provider_status": None,
+            "detail": str(exc) or "IntaSend status lookup failed.",
+            "redacted_response": {},
         }
 
-        if payout.method == payout.METHOD_MPESA:
-            normalized_account = normalize_mpesa_phone_number(transaction["account"])
-            if not normalized_account:
-                return {"success": False, "error": "Use a valid Kenyan M-Pesa number for payouts."}
-            transaction["account"] = normalized_account
-            # Request immediate release so the request view can finalize the payout
-            # decision without a second approval step.
-            response = service.transfer.mpesa(
-                currency="KES",
-                transactions=[transaction],
-                requires_approval="NO",
-            )
-        elif payout.method == payout.METHOD_BANK:
-            if not getattr(payout, "bank_code", ""):
-                return {"success": False, "error": "Bank code is required for bank payouts."}
-            transaction["bank_code"] = str(payout.bank_code).strip()
-            response = service.transfer.bank(
-                currency="KES",
-                transactions=[transaction],
-                requires_approval="NO",
-            )
-        else:
-            return {"success": False, "error": "Unsupported payout method."}
-    except Exception as exc:  # pragma: no cover - SDK/network path
-        logger.warning("IntaSend payout failed: %s", exc)
-        return {"success": False, "error": str(exc) or "IntaSend payout failed."}
+    # Status lookups are authoritative: this is where provider "SUCCESS" can
+    # legitimately mean "settled" because the lookup endpoint reports the
+    # outcome of a transfer rather than the outcome of submitting it.
+    outcome, _ = classify_intasend_payout_status_response(response)
+    provider_status = None
+    if isinstance(response, dict):
+        provider_status = str(response.get("status") or response.get("state") or "").upper() or None
 
-    if _intasend_payout_accepted(response):
-        return {"success": True}
-
-    logger.warning("IntaSend payout was not accepted: %s", response)
-    return {"success": False, "error": _intasend_payout_error(response, "IntaSend payout failed.")}
+    return {
+        "outcome": outcome,
+        "provider_status": provider_status,
+        "detail": None,
+        "redacted_response": redact_payment_payload(response) if isinstance(response, dict) else {},
+    }
 
 
 def _paypal_api_base():
@@ -613,8 +1120,9 @@ def paypal_access_token():
             payload = json.loads(resp.read().decode())
             return payload.get("access_token")
     except HTTPError as exc:
+        from .payments.redact import redact_text
         error = _paypal_error_result(exc, "PayPal authentication failed.")
-        logger.warning("PayPal access token failed: %s", error["body"] or error["detail"])
+        logger.warning("paypal.token.failed %s", redact_text(str(error.get("detail") or "")))
         return None
     except URLError as exc:
         logger.warning("PayPal access token failed: %s", exc)
@@ -656,8 +1164,9 @@ def paypal_create_order(amount, reference):
         with urllib_request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as exc:
+        from .payments.redact import redact_text
         error = _paypal_error_result(exc, "PayPal order creation failed.")
-        logger.warning("PayPal create order failed: %s", error["body"] or error["detail"])
+        logger.warning("paypal.create_order.failed %s", redact_text(str(error.get("detail") or "")))
         return error
     except URLError as exc:
         logger.warning("PayPal create order failed: %s", exc)
@@ -682,8 +1191,9 @@ def paypal_capture_order(order_id):
         with urllib_request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as exc:
+        from .payments.redact import redact_text
         error = _paypal_error_result(exc, "PayPal capture failed.")
-        logger.warning("PayPal capture failed: %s", error["body"] or error["detail"])
+        logger.warning("paypal.capture.failed %s", redact_text(str(error.get("detail") or "")))
         return error
     except URLError as exc:
         logger.warning("PayPal capture failed: %s", exc)

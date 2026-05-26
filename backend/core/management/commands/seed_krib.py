@@ -1,10 +1,12 @@
+import os
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 
+from django.conf import settings as django_settings
 from django.contrib.auth.models import User
 from django.core.files.base import ContentFile
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.utils import timezone
 from reportlab.pdfgen import canvas
@@ -25,7 +27,7 @@ from core.models import (
 from core.services import save_payment_receipt
 
 
-DEFAULT_PASSWORD = "KribDemo123!"
+DEFAULT_PASSWORD = "KribDemoStrongPass!42"
 
 
 def month_start(months_ago=0):
@@ -64,6 +66,17 @@ class Command(BaseCommand):
 
     @transaction.atomic
     def handle(self, *args, **options):
+        # Demo data ships with a known password. Refuse to create it whenever
+        # we look like we are in production (DEBUG=0). The override env var
+        # gives an operator one explicit way to opt back in for a staging
+        # restore, but the default protects against an accidental boot-time
+        # seed in prod.
+        if not django_settings.DEBUG and os.getenv("KRIB_ALLOW_PROD_SEED", "0") != "1":
+            raise CommandError(
+                "seed_krib refuses to run with DJANGO_DEBUG=0. "
+                "Set KRIB_ALLOW_PROD_SEED=1 only if you really intend to seed demo data in production."
+            )
+
         landlords = [
             self.ensure_user(
                 username="landlord_alpha",

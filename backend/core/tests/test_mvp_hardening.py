@@ -59,7 +59,12 @@ class RoleScopeTests(BaseAPITestCase):
             },
             format="json",
         )
-        self.assertEqual(response.status_code, 403)
+        # 400 = scoped serializer field rejected the FK (security hardening).
+        # 403 = view's perform_create rejected the request.
+        # Both are acceptable; the critical guarantee is the unit was NOT
+        # created in a property the manager does not manage.
+        self.assertIn(response.status_code, (400, 403))
+        self.assertFalse(Unit.objects.filter(property=self.property_b, unit_number="B1").exists())
 
     def test_manager_can_create_unit_for_assigned_property(self):
         self.auth(self.manager)
@@ -78,9 +83,16 @@ class RoleScopeTests(BaseAPITestCase):
 
     def test_tenant_cannot_list_users(self):
         self.auth(self.tenant)
-        response = self.client.get(reverse("users-list"), {"role": Profile.ROLE_MANAGER})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data, [])
+        # Tenants get an empty list for non-self roles; for their own role
+        # they see exactly one row (themselves). Either way they MUST NOT see
+        # other tenants' or managers' details.
+        manager_response = self.client.get(reverse("users-list"), {"role": Profile.ROLE_MANAGER})
+        self.assertEqual(manager_response.status_code, 200)
+        self.assertEqual(manager_response.data, [])
+
+        self_response = self.client.get(reverse("users-list"), {"role": Profile.ROLE_TENANT})
+        self.assertEqual(self_response.status_code, 200)
+        self.assertEqual([item["id"] for item in self_response.data], [self.tenant.id])
 
     def test_manager_cannot_reassign_property_manager(self):
         self.auth(self.manager)
@@ -89,7 +101,11 @@ class RoleScopeTests(BaseAPITestCase):
             {"manager_id": self.manager_b.id},
             format="json",
         )
-        self.assertEqual(response.status_code, 403)
+        # Either 400 (scoped queryset rejects FK) or 403 (perform_update blocks).
+        # Critical assertion: property_a.manager did NOT change.
+        self.assertIn(response.status_code, (400, 403))
+        self.property_a.refresh_from_db()
+        self.assertEqual(self.property_a.manager_id, self.manager.id)
 
     def test_landlord_unassigning_last_property_deactivates_manager_account(self):
         self.auth(self.landlord_a)
@@ -127,8 +143,23 @@ class RoleScopeTests(BaseAPITestCase):
         self.assertTrue(self.manager.is_active)
 
     def test_assigning_property_reactivates_manager_account(self):
+        # Cross-landlord poaching is intentionally blocked, so landlord_b must
+        # have a legitimate relationship with this manager. We model that by
+        # having landlord_b also send a ManagerInvite and marking it accepted,
+        # with a matching email that ties the invite to the existing user.
+        from core.models import ManagerInvite
+
+        self.manager.email = "manager-shared@example.com"
         self.manager.is_active = False
-        self.manager.save(update_fields=["is_active"])
+        self.manager.save(update_fields=["email", "is_active"])
+
+        ManagerInvite.objects.create(
+            email=self.manager.email,
+            created_by=self.landlord_b,
+            expires_at=timezone.now() + timedelta(days=7),
+            accepted_at=timezone.now(),
+            is_active=False,
+        )
 
         self.auth(self.landlord_b)
         response = self.client.patch(
@@ -227,6 +258,19 @@ class LeaseOnboardingDocumentTests(BaseAPITestCase):
         self.landlord = self.create_user("landlord_lease_docs", Profile.ROLE_LANDLORD)
         self.manager = self.create_user("manager_lease_docs", Profile.ROLE_MANAGER)
         self.tenant = self.create_user("tenant_lease_docs", Profile.ROLE_TENANT)
+        # Tie the tenant to this landlord via an accepted TenantInvite so the
+        # scoped LeaseSerializer.tenant_id queryset recognizes them as a
+        # legitimate target. (Security hardening: a landlord must not be able
+        # to graft an unrelated tenant onto a lease.)
+        self.tenant.email = "tenant-lease-docs@example.com"
+        self.tenant.save(update_fields=["email"])
+        TenantInvite.objects.create(
+            full_name="Tenant LeaseDocs",
+            email=self.tenant.email,
+            invited_by=self.landlord,
+            status=TenantInvite.STATUS_ACCEPTED,
+            expires_at=timezone.now() + timedelta(days=7),
+        )
         self.property = Property.objects.create(
             landlord=self.landlord,
             manager=self.manager,
@@ -554,7 +598,10 @@ class PaymentCallbackTests(BaseAPITestCase):
         second_body, second_signature = self._signed_callback("checkout-1", state="COMPLETE")
         second = self.client.post(callback_url, data=second_body, content_type="application/json", HTTP_X_INTASEND_SIGNATURE=second_signature)
         self.assertEqual(second.status_code, 200)
-        self.assertEqual(second.data["detail"], "Duplicate callback ignored.")
+        # The new provider-agnostic core uses the wording "Duplicate event
+        # ignored."; the old IntaSend-specific wording was "Duplicate callback
+        # ignored." — both indicate the same idempotent short-circuit.
+        self.assertIn(second.data["detail"], ("Duplicate event ignored.", "Duplicate callback ignored."))
 
         payment = PaymentTransaction.objects.get(checkout_request_id="checkout-1")
         self.assertEqual(payment.status, PaymentTransaction.STATUS_SUCCESS)
@@ -759,6 +806,17 @@ class LandlordPayoutRequestTests(BaseAPITestCase):
             available_balance=Decimal("15000.00"),
             locked_balance=Decimal("0.00"),
         )
+        # Payouts now require a verified destination saved in LandlordSettings
+        # (security hardening). The legacy tests assumed any destination would
+        # be accepted, so register the canonical destination here.
+        LandlordSettings.objects.update_or_create(
+            user=self.landlord,
+            defaults={
+                "business_name": "Payout LL",
+                "payout_method": LandlordPayout.METHOD_MPESA,
+                "payout_destination": "0712345678",
+            },
+        )
         self.property = Property.objects.create(
             landlord=self.landlord,
             name="Test Property",
@@ -780,8 +838,17 @@ class LandlordPayoutRequestTests(BaseAPITestCase):
         )
 
     @patch("core.views.execute_intasend_payout")
-    def test_payout_success_marks_paid_and_reduces_balance(self, mock_execute):
-        mock_execute.return_value = {"success": True}
+    def test_payout_provider_settled_marks_paid_and_reduces_balance(self, mock_execute):
+        # New lifecycle: only an explicit "settled" provider outcome moves
+        # the payout straight to PAID. Provider "accepted" goes to
+        # PROCESSING and is exercised in test_payout_lifecycle.py.
+        mock_execute.return_value = {
+            "outcome": "settled",
+            "provider_reference": "track-paid-1",
+            "provider_status": "COMPLETED",
+            "detail": None,
+            "redacted_response": {"status": "COMPLETED", "tracking_id": "track-paid-1"},
+        }
         self.auth(self.landlord)
 
         response = self.client.post(
@@ -790,7 +857,7 @@ class LandlordPayoutRequestTests(BaseAPITestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 201, response.data)
         payout = LandlordPayout.objects.get(landlord=self.landlord)
         self.assertEqual(payout.status, LandlordPayout.STATUS_PAID)
         self.assertIsNotNone(payout.paid_at)
@@ -806,8 +873,14 @@ class LandlordPayoutRequestTests(BaseAPITestCase):
         )
 
     @patch("core.views.execute_intasend_payout")
-    def test_payout_failure_restores_balance_and_marks_failed(self, mock_execute):
-        mock_execute.return_value = {"success": False, "error": "Provider unavailable"}
+    def test_payout_provider_rejected_restores_balance_and_marks_failed(self, mock_execute):
+        mock_execute.return_value = {
+            "outcome": "rejected",
+            "provider_reference": None,
+            "provider_status": "FAILED",
+            "detail": "Provider unavailable",
+            "redacted_response": {"status": "FAILED"},
+        }
         self.auth(self.landlord)
 
         response = self.client.post(
@@ -1172,7 +1245,11 @@ class UnlockBalancesCommandTests(BaseAPITestCase):
             return original_save(profile_self, *args, **kwargs)
 
         stdout = StringIO()
-        with patch("core.management.commands.unlock_balances.Profile.save", new=flaky_save):
+        # The unlock command was refactored to delegate to
+        # `core.services._unlock_single_ledger_row` which imports Profile
+        # locally. Patch the class on its defining module so the lookup
+        # inside the service sees the flaky save.
+        with patch("core.models.Profile.save", new=flaky_save):
             call_command("unlock_balances", stdout=stdout)
 
         bad_profile.refresh_from_db()
