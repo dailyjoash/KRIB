@@ -66,12 +66,17 @@ class IsTenantOfProperty(BasePermission):
 
 def landlord_has_payout_setup(user):
     """
-    Returns True if the landlord has a payout method configured.
-    Returns False if LandlordSettings does not exist or
-    payout_method / payout_destination are empty.
+    Returns True if the landlord has the money-collection setup required for
+    their configured collection mode. Legacy custody landlords still need a
+    KRIB payout destination; direct-pay landlords need their own Paybill saved.
     """
     try:
         settings = user.landlord_settings
+        if settings.collection_mode == LandlordSettings.COLLECTION_DIRECT_PAYBILL:
+            try:
+                return bool(user.collection_account.paybill_number)
+            except AttributeError:
+                return False
         return bool(
             settings.payout_method and
             settings.payout_destination

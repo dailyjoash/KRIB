@@ -9,6 +9,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.exceptions import APIException
 try:
     import magic
 except ImportError:  # pragma: no cover - optional dependency in lightweight builds
@@ -16,15 +17,21 @@ except ImportError:  # pragma: no cover - optional dependency in lightweight bui
 
 from .models import (
     Document,
+    LandlordCollectionAccount,
     LandlordPayout,
     LandlordSettings,
     Lease,
     LedgerTransaction,
     MaintenanceRequest,
     Notification,
+    PaymentRecord,
+    PaymentRecordAuditLog,
     PaymentTransaction,
     Profile,
     Property,
+    SubscriptionInvoice,
+    SubscriptionInvoiceAuditLog,
+    SubscriptionInvoiceLineItem,
     Tenant,
     TenantInvite,
     Unit,
@@ -32,6 +39,16 @@ from .models import (
     compute_lease_rent_status,
 )
 from .services import build_lease_agreement_pdf, normalize_mpesa_phone_number
+
+
+class CustodyCutoverConflict(APIException):
+    """409 raised when a collection_mode switch to direct_paybill is blocked by
+    the custody cutover safety rail (outstanding LandlordBalance / in-flight
+    payout). See services.CustodyCutoverError."""
+
+    status_code = 409
+    default_detail = "Custody balance must be settled before switching to direct Paybill."
+    default_code = "custody_balance_outstanding"
 
 
 def _scoped_property_queryset(user):
@@ -308,6 +325,10 @@ class LandlordRevenueSerializer(serializers.Serializer):
     period = serializers.CharField(allow_null=True)
     gross_collected = serializers.DecimalField(max_digits=12, decimal_places=2)
     net_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    legacy_krib_collected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    direct_landlord_collected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    verified_direct_collected = serializers.DecimalField(max_digits=12, decimal_places=2)
+    unverified_direct_reported = serializers.DecimalField(max_digits=12, decimal_places=2)
     lifetime = serializers.DictField()
 
 
@@ -367,6 +388,7 @@ class ProfileSerializer(serializers.ModelSerializer):
 
 
 class LandlordSettingsSerializer(serializers.ModelSerializer):
+    collection_account_configured = serializers.SerializerMethodField()
     payout_method = serializers.ChoiceField(
         choices=[("MPESA", "M-Pesa"), ("BANK", "Bank")],
         required=False,
@@ -376,12 +398,19 @@ class LandlordSettingsSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = LandlordSettings
-        fields = ["business_name", "payout_method", "payout_destination", "payout_bank_code"]
+        fields = ["business_name", "collection_mode", "collection_account_configured", "payout_method", "payout_destination", "payout_bank_code"]
         extra_kwargs = {
             "business_name": {"required": False, "allow_blank": True},
+            "collection_mode": {"required": False},
             "payout_destination": {"required": False, "allow_blank": True, "allow_null": True},
             "payout_bank_code": {"required": False, "allow_blank": True, "allow_null": True},
         }
+
+    def get_collection_account_configured(self, obj):
+        try:
+            return bool(obj.user.collection_account.paybill_number)
+        except AttributeError:
+            return False
 
     def validate(self, attrs):
         payout_method = attrs.get("payout_method", getattr(self.instance, "payout_method", "")) or ""
@@ -396,6 +425,12 @@ class LandlordSettingsSerializer(serializers.ModelSerializer):
         return attrs
 
     def update(self, instance, validated_data):
+        # collection_mode is handled separately, behind the custody cutover
+        # safety rail: a switch to direct_paybill is refused while the landlord
+        # still has outstanding custody funds. Pop it so super().update() does
+        # not write it directly (which would bypass the rail).
+        requested_mode = validated_data.pop("collection_mode", None)
+
         # If the payout target changed, stamp the change time so the payout
         # endpoint can enforce a cool-down window. Without this, a hijacked
         # landlord session can update the destination then immediately drain
@@ -419,7 +454,85 @@ class LandlordSettingsSerializer(serializers.ModelSerializer):
         if target_changed:
             instance.payout_destination_updated_at = timezone.now()
             instance.save(update_fields=["payout_destination_updated_at"])
+
+        if requested_mode and requested_mode != instance.collection_mode:
+            self._apply_collection_mode_change(instance, requested_mode)
+            instance.refresh_from_db()
         return instance
+
+    def _apply_collection_mode_change(self, instance, requested_mode):
+        from .services import CustodyCutoverError, switch_landlord_to_direct_paybill
+
+        if requested_mode == LandlordSettings.COLLECTION_DIRECT_PAYBILL:
+            request = self.context.get("request") if self.context else None
+            actor = getattr(request, "user", None)
+            try:
+                switch_landlord_to_direct_paybill(
+                    instance.user,
+                    actor=actor if getattr(actor, "is_authenticated", False) else None,
+                    note="landlord settings update",
+                )
+            except CustodyCutoverError as exc:
+                raise CustodyCutoverConflict(detail=exc.detail)
+        else:
+            # Switching back to (or staying on) custody_legacy is always safe.
+            instance.collection_mode = requested_mode
+            instance.save(update_fields=["collection_mode"])
+
+
+class LandlordCollectionAccountSerializer(serializers.ModelSerializer):
+    landlord = UserLiteSerializer(read_only=True)
+    verified_by = UserLiteSerializer(read_only=True)
+
+    class Meta:
+        model = LandlordCollectionAccount
+        fields = [
+            "id",
+            "landlord",
+            "collection_method",
+            "paybill_number",
+            "registered_business_name",
+            "verification_status",
+            "verification_notes",
+            "verified_at",
+            "verified_by",
+            "callback_status",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "landlord",
+            "verification_status",
+            "verified_at",
+            "verified_by",
+            "callback_status",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get("request") if self.context else None
+        user = getattr(request, "user", None) if request else None
+        if not getattr(user, "is_staff", False):
+            fields.pop("verification_notes", None)
+        return fields
+
+    def validate_paybill_number(self, value):
+        cleaned = re.sub(r"\s+", "", str(value or ""))
+        if not cleaned.isdigit():
+            raise serializers.ValidationError("Paybill number must contain digits only.")
+        return cleaned
+
+
+class LandlordCollectionAccountVerificationSerializer(serializers.Serializer):
+    verification_status = serializers.ChoiceField(
+        choices=[
+            LandlordCollectionAccount.STATUS_VERIFIED,
+            LandlordCollectionAccount.STATUS_REJECTED,
+        ]
+    )
+    verification_notes = serializers.CharField(required=False, allow_blank=True)
 
 
 class MeSerializer(serializers.Serializer):
@@ -566,10 +679,12 @@ class LeaseSerializer(serializers.ModelSerializer):
             "end_date",
             "due_day",
             "status",
+            "payment_reference",
             "rent_status",
             "identity_document",
             "tenant_signature",
         ]
+        read_only_fields = ["payment_reference"]
 
     def get_rent_status(self, obj):
         period = self.context.get("period") if self.context else None
@@ -742,6 +857,100 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             "created_at",
             "remaining_balance",
         ]
+
+
+class PaymentRecordAuditLogSerializer(serializers.ModelSerializer):
+    actor = UserLiteSerializer(read_only=True)
+
+    class Meta:
+        model = PaymentRecordAuditLog
+        fields = ["id", "actor", "action", "old_status", "new_status", "note", "created_at"]
+
+
+class PaymentRecordSerializer(serializers.ModelSerializer):
+    lease = LeaseSerializer(read_only=True)
+    tenant = UserLiteSerializer(read_only=True)
+    landlord = UserLiteSerializer(read_only=True)
+    collection_account = LandlordCollectionAccountSerializer(read_only=True)
+    audit_logs = PaymentRecordAuditLogSerializer(many=True, read_only=True)
+    remaining_balance = serializers.SerializerMethodField()
+    verification_label = serializers.CharField(read_only=True)
+    collection_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PaymentRecord
+        fields = [
+            "id",
+            "lease",
+            "tenant",
+            "landlord",
+            "collection_account",
+            "source",
+            "period",
+            "phone_number",
+            "amount",
+            "allocated_amount",
+            "transaction_code",
+            "transaction_date",
+            "status",
+            "confirmation_note",
+            "rejection_note",
+            "flagged_reason",
+            "confirmed_at",
+            "rejected_at",
+            "created_at",
+            "updated_at",
+            "remaining_balance",
+            "verification_label",
+            "collection_label",
+            "audit_logs",
+        ]
+        read_only_fields = fields
+
+    def get_remaining_balance(self, obj):
+        if not obj.lease_id:
+            return None
+        return compute_lease_rent_status(obj.lease, period=obj.period).get("balance")
+
+    def get_collection_label(self, obj):
+        return "direct landlord-collected"
+
+
+class DirectPaymentSubmitSerializer(serializers.Serializer):
+    lease_id = serializers.IntegerField(required=False, allow_null=True)
+    payment_reference = serializers.CharField(required=False, allow_blank=True)
+    paybill_number = serializers.CharField(required=False, allow_blank=True)
+    transaction_code = serializers.CharField(max_length=100)
+    amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    transaction_date = serializers.DateTimeField()
+    phone_number = serializers.CharField(max_length=20)
+    period = serializers.CharField(required=False, allow_blank=True, max_length=7)
+
+    def validate_transaction_code(self, value):
+        cleaned = re.sub(r"\s+", "", str(value or "")).upper()
+        if not cleaned:
+            raise serializers.ValidationError("Transaction code is required.")
+        return cleaned
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Enter an amount greater than zero.")
+        return value
+
+    def validate_paybill_number(self, value):
+        return re.sub(r"\s+", "", str(value or ""))
+
+    def validate_payment_reference(self, value):
+        return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+class DirectPaymentActionSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True)
+
+
+class DirectPaymentAttachSerializer(serializers.Serializer):
+    lease_id = serializers.PrimaryKeyRelatedField(queryset=Lease.objects.all(), source="lease")
+    note = serializers.CharField(required=False, allow_blank=True)
 
 
 class STKInitiateSerializer(serializers.Serializer):
@@ -973,3 +1182,82 @@ class LandlordPayoutRequestSerializer(serializers.Serializer):
             attrs["bank_code"] = bank_code
 
         return attrs
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B: subscription invoice serializers
+# ---------------------------------------------------------------------------
+
+
+class SubscriptionInvoiceLineItemSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SubscriptionInvoiceLineItem
+        fields = [
+            "id",
+            "unit",
+            "lease",
+            "unit_label",
+            "lease_status_at_snapshot",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class SubscriptionInvoiceAuditLogSerializer(serializers.ModelSerializer):
+    actor = UserLiteSerializer(read_only=True)
+
+    class Meta:
+        model = SubscriptionInvoiceAuditLog
+        fields = ["id", "actor", "action", "old_status", "new_status", "note", "created_at"]
+        read_only_fields = fields
+
+
+class SubscriptionInvoiceSerializer(serializers.ModelSerializer):
+    line_items = SubscriptionInvoiceLineItemSerializer(many=True, read_only=True)
+    landlord = UserLiteSerializer(read_only=True)
+    free_tier_threshold = serializers.SerializerMethodField()
+    per_unit_kes = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SubscriptionInvoice
+        fields = [
+            "id",
+            "landlord",
+            "period",
+            "billable_units_count",
+            "amount",
+            "status",
+            "generated_at",
+            "due_at",
+            "paid_at",
+            "paid_via",
+            "intasend_invoice_id",
+            "payment_reference",
+            "payment_initiated_at",
+            "created_at",
+            "updated_at",
+            "line_items",
+            "free_tier_threshold",
+            "per_unit_kes",
+        ]
+        read_only_fields = fields
+
+    def get_free_tier_threshold(self, _obj):
+        return int(getattr(settings, "SUBSCRIPTION_FREE_TIER_THRESHOLD", 5))
+
+    def get_per_unit_kes(self, _obj):
+        return int(getattr(settings, "SUBSCRIPTION_PER_UNIT_KES", 50))
+
+
+class SubscriptionPayInitiateSerializer(serializers.Serializer):
+    phone_number = serializers.CharField()
+
+    def validate_phone_number(self, value):
+        normalized = normalize_mpesa_phone_number(value)
+        if normalized:
+            return normalized
+        compact = re.sub(r"\s+", "", str(value or ""))
+        raise serializers.ValidationError(
+            "Use a valid Kenyan M-Pesa number like 0712345678, 0112345678, or "
+            f"+254712345678. Received: {compact or '-'}."
+        )

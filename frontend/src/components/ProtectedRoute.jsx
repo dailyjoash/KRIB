@@ -1,5 +1,6 @@
-import React from "react";
+import React, { useContext } from "react";
 import { Navigate } from "react-router-dom";
+import { AuthContext } from "../context/AuthContext";
 
 const rolePath = {
   landlord: "/dashboard",
@@ -8,14 +9,13 @@ const rolePath = {
 };
 
 const ProtectedRoute = ({ children, allowedRoles }) => {
-  const token = localStorage.getItem("access");
-  const role = localStorage.getItem("role");
+  const { authReady, isAuthenticated, role } = useContext(AuthContext);
 
-  if (!token) {
-    return <Navigate to="/login" replace />;
+  if (!authReady) {
+    return null;
   }
 
-  if (!role) {
+  if (!isAuthenticated || !role) {
     return <Navigate to="/login" replace />;
   }
 

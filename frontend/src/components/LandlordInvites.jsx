@@ -70,7 +70,11 @@ const buildDeliveryMessage = (payload) => {
   return `Invite sent by ${channels.join(" and ")}.`;
 };
 
-const hasPayoutSetup = (payload) => Boolean(payload?.payout_method && payload?.payout_destination);
+const hasPayoutSetup = (payload) => (
+  payload?.collection_mode === "direct_paybill"
+    ? Boolean(payload?.collection_account_configured)
+    : Boolean(payload?.payout_method && payload?.payout_destination)
+);
 const isPayoutGateError = (error) => error?.response?.status === 403 && error?.response?.data?.code === "payout_not_configured";
 
 function PayoutRequiredNotice({ children, onNavigate, role = "status" }) {

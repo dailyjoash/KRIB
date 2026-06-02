@@ -5,9 +5,33 @@ const api = axios.create({
   timeout: 60000,
 });
 
+const AUTH_STORAGE_KEYS = ["user", "access", "refresh", "role", "krib-exec-amounts-hidden"];
+
+export const setApiAccessToken = (token) => {
+  if (token) {
+    api.defaults.headers.common.Authorization = `Bearer ${token}`;
+    return;
+  }
+
+  delete api.defaults.headers.common.Authorization;
+};
+
+export const clearAuthStorage = () => {
+  AUTH_STORAGE_KEYS.forEach((key) => {
+    localStorage.removeItem(key);
+    sessionStorage.removeItem(key);
+  });
+  setApiAccessToken(null);
+};
+
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem("access");
-  if (token) config.headers.Authorization = `Bearer ${token}`;
+  config.headers = config.headers || {};
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  } else if (!config.headers.Authorization) {
+    delete config.headers.Authorization;
+  }
   return config;
 });
 
@@ -33,15 +57,13 @@ api.interceptors.response.use(
       const refreshResponse = await refreshPromise;
       const nextAccess = refreshResponse.data.access;
       localStorage.setItem("access", nextAccess);
+      setApiAccessToken(nextAccess);
       originalRequest.headers.Authorization = `Bearer ${nextAccess}`;
       return api(originalRequest);
     } catch (refreshError) {
-      localStorage.removeItem("user");
-      localStorage.removeItem("access");
-      localStorage.removeItem("refresh");
-      localStorage.removeItem("role");
+      clearAuthStorage();
       if (window.location.pathname !== "/login") {
-        window.location.assign("/login");
+        window.location.replace("/login");
       }
       return Promise.reject(refreshError);
     } finally {

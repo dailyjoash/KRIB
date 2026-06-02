@@ -25,6 +25,7 @@ const monthLabel = (key) => {
 
 export default function LandlordReports() {
   const [payments, setPayments] = useState([]);
+  const [directPayments, setDirectPayments] = useState([]);
   const [dashboard, setDashboard] = useState(null);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -33,11 +34,13 @@ export default function LandlordReports() {
   useEffect(() => {
     const load = async () => {
       try {
-        const [paymentsRes, dashboardRes] = await Promise.all([
+        const [paymentsRes, directPaymentsRes, dashboardRes] = await Promise.all([
           api.get("/api/payments/"),
+          api.get("/api/payments/direct/"),
           api.get("/api/dashboard/landlord/"),
         ]);
         setPayments(paymentsRes.data || []);
+        setDirectPayments(directPaymentsRes.data || []);
         setDashboard(dashboardRes.data);
       } catch (err) {
         setError(getErrorMessage(err, "Failed to load reports."));
@@ -46,8 +49,24 @@ export default function LandlordReports() {
     load();
   }, []);
 
+  const allReportPayments = useMemo(() => [
+    ...payments.map((payment) => ({
+      ...payment,
+      report_source: "legacy",
+      source_label: "KRIB-collected",
+      report_status: payment.status,
+    })),
+    ...directPayments.map((payment) => ({
+      ...payment,
+      report_source: "direct",
+      source_label: payment.verification_label === "verified_landlord_collected" ? "Verified landlord-collected" : "Tenant-reported / unverified",
+      payment_method: "direct_paybill",
+      report_status: payment.status,
+    })),
+  ], [directPayments, payments]);
+
   const filteredPayments = useMemo(() => {
-    return payments.filter((payment) => {
+    return allReportPayments.filter((payment) => {
       const value = payment.transaction_date || payment.created_at;
       if (!value) return false;
       const date = new Date(value);
@@ -60,10 +79,10 @@ export default function LandlordReports() {
       }
       return true;
     });
-  }, [dateFrom, dateTo, payments]);
+  }, [allReportPayments, dateFrom, dateTo]);
 
   const successfulPayments = useMemo(
-    () => filteredPayments.filter((payment) => payment.status === "success"),
+    () => filteredPayments.filter((payment) => payment.status === "success" || payment.status === "confirmed"),
     [filteredPayments]
   );
 
@@ -145,12 +164,13 @@ export default function LandlordReports() {
   const exportCsv = () => {
     downloadCsv(
       "krib-report-payments.csv",
-      ["Tenant", "Property", "Unit", "Amount", "Method", "Status", "Billing Period", "Processed"],
+      ["Tenant", "Property", "Unit", "Amount", "Source", "Method", "Status", "Billing Period", "Processed"],
       filteredPayments.map((payment) => [
         payment.tenant?.username || payment.tenant?.email || "-",
         payment.lease?.unit?.property?.name || "-",
         payment.lease?.unit?.unit_number || "-",
         payment.amount,
+        payment.source_label || "-",
         payment.payment_method,
         payment.status,
         payment.period,
@@ -168,7 +188,7 @@ export default function LandlordReports() {
       {error ? <p className="error">{error}</p> : null}
 
       <section className="resident-hero-grid">
-        <StatCard variant="blue" title="Collected" subtitle="Successful payments in range" value={formatKES(kpis.collected)} />
+        <StatCard variant="blue" title="Collected" subtitle="Legacy and direct records" value={formatKES(kpis.collected)} />
         <StatCard variant="purple" title="Payments" subtitle="Settled records" value={String(kpis.paymentCount).padStart(2, "0")} />
         <StatCard variant="mint" title="Arrears" subtitle="Current open balance" value={formatKES(kpis.arrears)} />
       </section>
@@ -240,12 +260,12 @@ export default function LandlordReports() {
                 </div>
                 <div className="resident-table-list">
                   {group.rows.map((payment) => (
-                    <article className="resident-row-card" key={payment.id}>
+                    <article className="resident-row-card" key={`${payment.report_source}-${payment.id}`}>
                       <div className="resident-row-id">{payment.id}</div>
                       <div className="resident-row-main">
                         <h4>{payment.tenant?.username || payment.tenant?.email || "Tenant"}</h4>
                         <p>{payment.lease?.unit?.property?.name || "-"} / {payment.lease?.unit?.unit_number || "-"}</p>
-                        <p>{formatKES(payment.amount)} / {(payment.payment_method || "mpesa").toUpperCase()} / {payment.period || "-"}</p>
+                        <p>{formatKES(payment.amount)} / {payment.source_label || (payment.payment_method || "mpesa").toUpperCase()} / {payment.period || "-"}</p>
                       </div>
                       <div className="resident-row-meta">
                         <span>{formatDate(payment.transaction_date || payment.created_at)}</span>

@@ -5,6 +5,7 @@ import api from "../services/api";
 import { AuthContext } from "../context/AuthContext";
 import { getErrorMessage } from "../utils/errors";
 import LandlordPayoutSettingsCard from "./LandlordPayoutSettingsCard";
+import LandlordSubscriptionCard from "./LandlordSubscriptionCard";
 import { PageLayout, SectionCard } from "./ui";
 
 const getStoredTheme = () => (localStorage.getItem("theme") === "dark" ? "dark" : "light");
@@ -229,6 +230,8 @@ export default function Profile() {
       </SectionCard>
 
       <LandlordPayoutSettingsCard />
+
+      <LandlordSubscriptionCard />
 
       <SectionCard
         icon={ShieldCheck}

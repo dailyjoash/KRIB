@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from io import BytesIO
 from urllib.error import HTTPError, URLError
@@ -12,6 +12,8 @@ from urllib import request as urllib_request
 
 from django.core.files.base import ContentFile
 from django.db import transaction
+from django.db.models import Sum
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from .models import Lease, compute_lease_rent_status
@@ -322,6 +324,476 @@ def unlock_due_landlord_balance(landlord):
         if _unlock_single_ledger_row(ledger_id):
             unlocked += amount
     return unlocked
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A: custody float drain & cutover safety
+# ---------------------------------------------------------------------------
+
+# A payout in one of these states is money KRIB has committed to send but has
+# not confirmed as settled (or returned to the balance). Switching a landlord
+# to direct_paybill while such a payout is in flight risks stranding or
+# double-handling funds, so the cutover rail treats them as outstanding.
+# Mirrors LandlordPayout.STATUS_{REQUESTED,PROCESSING,PENDING}.
+NON_FINAL_PAYOUT_STATUSES = ("REQUESTED", "PROCESSING", "PENDING")
+
+
+class CustodyCutoverError(Exception):
+    """Raised when a landlord cannot yet be switched to direct_paybill because
+    they still have outstanding custody obligations: a non-zero LandlordBalance
+    (available or locked) or an in-flight LandlordPayout."""
+
+    def __init__(self, *, available, locked, pending_count, pending_total):
+        self.available = available
+        self.locked = locked
+        self.pending_count = pending_count
+        self.pending_total = pending_total
+        super().__init__(self.detail)
+
+    @property
+    def outstanding_total(self):
+        return self.available + self.locked + self.pending_total
+
+    @property
+    def detail(self):
+        parts = []
+        if self.available:
+            parts.append(f"available balance KES {self.available}")
+        if self.locked:
+            parts.append(f"locked balance KES {self.locked}")
+        if self.pending_count:
+            parts.append(
+                f"{self.pending_count} in-flight payout(s) totalling KES {self.pending_total}"
+            )
+        joined = "; ".join(parts) or "outstanding custody obligations"
+        return (
+            "Cannot switch this landlord to direct Paybill while custody funds "
+            f"are outstanding ({joined}). Settle the custody balance first."
+        )
+
+
+def _lock_landlord_balance(landlord):
+    """Return the landlord's LandlordBalance row locked FOR UPDATE (or None).
+
+    MUST be called inside a transaction.atomic() block. Exposed as a named seam
+    so the cutover guard's locked read can be exercised deterministically in
+    tests (simulating a credit that committed just before we took the lock)."""
+    from .models import LandlordBalance
+
+    return LandlordBalance.objects.select_for_update().filter(landlord=landlord).first()
+
+
+def landlord_outstanding_custody(landlord, *, lock=False):
+    """Compute a landlord's outstanding custody obligations.
+
+    Returns dict(available, locked, pending_count, pending_total, has_outstanding).
+    When lock=True the LandlordBalance row is read FOR UPDATE (call inside an
+    atomic block) so the result cannot be invalidated by a concurrent credit or
+    payout before the caller acts on it.
+    """
+    from .models import LandlordBalance, LandlordPayout
+
+    if lock:
+        balance = _lock_landlord_balance(landlord)
+    else:
+        balance = LandlordBalance.objects.filter(landlord=landlord).first()
+
+    available = balance.available_balance if balance else Decimal("0.00")
+    locked = balance.locked_balance if balance else Decimal("0.00")
+
+    pending_qs = LandlordPayout.objects.filter(
+        landlord=landlord,
+        status__in=NON_FINAL_PAYOUT_STATUSES,
+    )
+    pending_count = pending_qs.count()
+    pending_total = pending_qs.aggregate(
+        total=Coalesce(Sum("amount"), Decimal("0.00"))
+    )["total"]
+
+    has_outstanding = bool(available) or bool(locked) or pending_count > 0
+    return {
+        "available": available,
+        "locked": locked,
+        "pending_count": pending_count,
+        "pending_total": pending_total,
+        "has_outstanding": has_outstanding,
+    }
+
+
+def assert_can_switch_to_direct_paybill(landlord):
+    """Raise CustodyCutoverError if the landlord still owes custody funds.
+
+    Locks the LandlordBalance row FOR UPDATE so the check is atomic with the
+    caller's subsequent collection_mode write. MUST be called inside an atomic
+    block. Returns the outstanding-state dict on success.
+    """
+    state = landlord_outstanding_custody(landlord, lock=True)
+    if state["has_outstanding"]:
+        raise CustodyCutoverError(
+            available=state["available"],
+            locked=state["locked"],
+            pending_count=state["pending_count"],
+            pending_total=state["pending_total"],
+        )
+    return state
+
+
+def switch_landlord_to_direct_paybill(landlord, *, actor=None, note=""):
+    """Atomically flip a landlord to direct_paybill behind the safety rail.
+
+    Locks the balance row, asserts zero outstanding custody obligations, sets
+    collection_mode='direct_paybill', and writes a CustodyAuditLog row. If the
+    rail blocks the switch, records a blocked-attempt audit row (in its own
+    transaction, so it survives the guarded block's rollback) and re-raises
+    CustodyCutoverError. Returns the LandlordSettings instance on success.
+    """
+    from .models import CustodyAuditLog, LandlordSettings
+
+    try:
+        with transaction.atomic():
+            state = assert_can_switch_to_direct_paybill(landlord)
+            settings_obj, _ = LandlordSettings.objects.get_or_create(
+                user=landlord,
+                defaults={"business_name": landlord.get_full_name().strip() or landlord.username},
+            )
+            settings_obj.collection_mode = LandlordSettings.COLLECTION_DIRECT_PAYBILL
+            settings_obj.save(update_fields=["collection_mode"])
+            CustodyAuditLog.objects.create(
+                actor=actor,
+                landlord=landlord,
+                action=CustodyAuditLog.ACTION_CUTOVER,
+                available_balance=state["available"],
+                locked_balance=state["locked"],
+                note=note or "",
+            )
+        return settings_obj
+    except CustodyCutoverError as exc:
+        CustodyAuditLog.objects.create(
+            actor=actor,
+            landlord=landlord,
+            action=CustodyAuditLog.ACTION_CUTOVER_BLOCKED,
+            available_balance=exc.available,
+            locked_balance=exc.locked,
+            note=((note or "") + " | blocked: " + exc.detail)[:2000],
+        )
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B: KRIB subscription billing rail
+# ---------------------------------------------------------------------------
+#
+# Distinct from rent collection. KRIB charges landlords a per-billable-unit fee
+# for using the platform; once the count exceeds the free-tier threshold the
+# landlord pays for ALL units. These helpers are the chokepoint the management
+# command, the API, and the webhook all go through so the count, the price,
+# and the snapshot stay consistent across surfaces.
+
+
+def _subscription_price_per_unit():
+    from django.conf import settings as dj_settings
+
+    return Decimal(str(getattr(dj_settings, "SUBSCRIPTION_PER_UNIT_KES", 50)))
+
+
+def _subscription_free_tier_threshold():
+    from django.conf import settings as dj_settings
+
+    return int(getattr(dj_settings, "SUBSCRIPTION_FREE_TIER_THRESHOLD", 5))
+
+
+def _subscription_grace_days():
+    from django.conf import settings as dj_settings
+
+    return int(getattr(dj_settings, "SUBSCRIPTION_GRACE_PERIOD_DAYS", 7))
+
+
+def current_subscription_period(today=None):
+    """The YYYY-MM string the next subscription invoice cycle bills against.
+
+    Aliased to current_period_string so the subscription rail uses the same
+    period vocabulary as the rent rail; kept as a named helper so a future
+    "bill on a different cadence" change has one place to update.
+    """
+    return current_period_string(today=today)
+
+
+def subscription_billable_units_qs(landlord):
+    """Active-lease units owned by `landlord`, deduplicated.
+
+    "Billable" = a unit with an ACTIVE lease at the moment this query runs.
+    Vacant units and units whose only leases are inactive are excluded. The
+    rule applies uniformly regardless of collection_mode (custody_legacy and
+    direct_paybill landlords both pay the platform fee).
+    """
+    from .models import Lease, Unit
+
+    return (
+        Unit.objects.filter(
+            property__landlord=landlord,
+            leases__status=Lease.STATUS_ACTIVE,
+        )
+        .select_related("property")
+        .distinct()
+    )
+
+
+def generate_subscription_invoice_for_landlord(landlord, period, *, actor=None):
+    """Idempotently create (or return the existing) SubscriptionInvoice.
+
+    Returns the SubscriptionInvoice and a "created" bool. The (landlord,
+    period) DB unique constraint is the authoritative guard against
+    duplicates; the get_or_create here is the optimistic fast-path.
+    """
+    from .models import (
+        Lease,
+        SubscriptionInvoice,
+        SubscriptionInvoiceAuditLog,
+        SubscriptionInvoiceLineItem,
+    )
+
+    per_unit = _subscription_price_per_unit()
+    free_threshold = _subscription_free_tier_threshold()
+    grace_days = _subscription_grace_days()
+
+    with transaction.atomic():
+        existing = SubscriptionInvoice.objects.filter(
+            landlord=landlord, period=period
+        ).first()
+        if existing:
+            return existing, False
+
+        billable_units = list(subscription_billable_units_qs(landlord))
+        count = len(billable_units)
+
+        if count == 0:
+            return None, False
+
+        if count <= free_threshold:
+            amount = Decimal("0.00")
+            status_value = SubscriptionInvoice.STATUS_FREE_TIER
+        else:
+            amount = (per_unit * count).quantize(Decimal("0.01"))
+            status_value = SubscriptionInvoice.STATUS_PENDING
+
+        now = timezone.now()
+        due_at = now + timedelta(days=grace_days) if status_value == SubscriptionInvoice.STATUS_PENDING else None
+        invoice = SubscriptionInvoice.objects.create(
+            landlord=landlord,
+            period=period,
+            billable_units_count=count,
+            amount=amount,
+            status=status_value,
+            generated_at=now,
+            due_at=due_at,
+        )
+
+        # Line items: snapshot exactly which units made up the bill. Use the
+        # unit's currently-ACTIVE lease for the lease snapshot.
+        for unit in billable_units:
+            active_lease = (
+                Lease.objects.filter(unit=unit, status=Lease.STATUS_ACTIVE)
+                .order_by("-id")
+                .first()
+            )
+            SubscriptionInvoiceLineItem.objects.create(
+                invoice=invoice,
+                unit=unit,
+                lease=active_lease,
+                unit_label=f"{unit.property.name} / {unit.unit_number}"[:255],
+                lease_status_at_snapshot=(active_lease.status if active_lease else ""),
+            )
+
+        SubscriptionInvoiceAuditLog.objects.create(
+            invoice=invoice,
+            actor=actor,
+            action=SubscriptionInvoiceAuditLog.ACTION_GENERATED,
+            old_status="",
+            new_status=invoice.status,
+            note=f"count={count} amount={amount}",
+        )
+
+    # Tell the landlord (in-app + best-effort SMS). Free-tier landlords still
+    # get notified — it's a "your bill came in at KES 0" message which doubles
+    # as proof KRIB ran the cycle.
+    _send_subscription_notification(
+        invoice,
+        title="Subscription invoice ready",
+        message=_subscription_notification_message(invoice, kind="generated"),
+    )
+    return invoice, True
+
+
+def mark_subscription_invoice_paid(invoice, *, paid_via, actor=None, note=""):
+    """Idempotently mark a SubscriptionInvoice paid + write audit + notify.
+
+    Idempotent: callers may invoke this from a webhook that fires twice. If
+    the invoice is already paid we return (False, invoice) without touching
+    audit / notifications a second time.
+    """
+    from .models import SubscriptionInvoice, SubscriptionInvoiceAuditLog
+
+    with transaction.atomic():
+        locked = (
+            SubscriptionInvoice.objects.select_for_update()
+            .select_related("landlord")
+            .get(pk=invoice.pk)
+        )
+        if locked.status == SubscriptionInvoice.STATUS_PAID:
+            return False, locked
+        if locked.status not in (
+            SubscriptionInvoice.STATUS_PENDING,
+            SubscriptionInvoice.STATUS_OVERDUE,
+        ):
+            # Free-tier / waived invoices can't transition to paid.
+            return False, locked
+
+        old_status = locked.status
+        locked.status = SubscriptionInvoice.STATUS_PAID
+        locked.paid_at = timezone.now()
+        locked.paid_via = paid_via or locked.paid_via
+        locked.save(update_fields=["status", "paid_at", "paid_via", "updated_at"])
+
+        SubscriptionInvoiceAuditLog.objects.create(
+            invoice=locked,
+            actor=actor,
+            action=SubscriptionInvoiceAuditLog.ACTION_PAYMENT_CONFIRMED,
+            old_status=old_status,
+            new_status=locked.status,
+            note=note or f"paid_via={paid_via or ''}",
+        )
+
+    _send_subscription_notification(
+        locked,
+        title="Subscription invoice paid",
+        message=_subscription_notification_message(locked, kind="paid"),
+    )
+    return True, locked
+
+
+def waive_subscription_invoice(invoice, *, actor, note=""):
+    """Staff-only manual waive. Idempotent."""
+    from .models import SubscriptionInvoice, SubscriptionInvoiceAuditLog
+
+    with transaction.atomic():
+        locked = SubscriptionInvoice.objects.select_for_update().get(pk=invoice.pk)
+        if locked.status == SubscriptionInvoice.STATUS_WAIVED:
+            return False, locked
+        if locked.status == SubscriptionInvoice.STATUS_PAID:
+            # Don't quietly undo a paid invoice — make the operator confirm.
+            return False, locked
+        old_status = locked.status
+        locked.status = SubscriptionInvoice.STATUS_WAIVED
+        locked.save(update_fields=["status", "updated_at"])
+        SubscriptionInvoiceAuditLog.objects.create(
+            invoice=locked,
+            actor=actor,
+            action=SubscriptionInvoiceAuditLog.ACTION_WAIVED,
+            old_status=old_status,
+            new_status=locked.status,
+            note=note or "manual waiver",
+        )
+    return True, locked
+
+
+def apply_subscription_reminders(now=None):
+    """Walk all PENDING/OVERDUE subscription invoices, send reminders and
+    flip overdue when appropriate.
+
+    Light surface only — no enforcement. SUBSCRIPTION_ENFORCEMENT_ENABLED is
+    explicitly NOT read here this phase.
+    """
+    from django.conf import settings as dj_settings
+
+    from .models import SubscriptionInvoice, SubscriptionInvoiceAuditLog
+
+    now = now or timezone.now()
+    grace_days = int(getattr(dj_settings, "SUBSCRIPTION_GRACE_PERIOD_DAYS", 7))
+    overdue_days = int(getattr(dj_settings, "SUBSCRIPTION_OVERDUE_DAYS", 14))
+
+    grace_cutoff = now - timedelta(days=grace_days)
+    overdue_cutoff = now - timedelta(days=overdue_days)
+
+    stats = {"grace_reminders": 0, "overdue_transitions": 0, "overdue_reminders": 0}
+
+    pending = SubscriptionInvoice.objects.filter(status=SubscriptionInvoice.STATUS_PENDING)
+    for invoice in pending.filter(generated_at__lte=grace_cutoff):
+        _send_subscription_notification(
+            invoice,
+            title="Subscription invoice reminder",
+            message=_subscription_notification_message(invoice, kind="reminder"),
+        )
+        stats["grace_reminders"] += 1
+
+    for invoice in pending.filter(generated_at__lte=overdue_cutoff):
+        with transaction.atomic():
+            locked = SubscriptionInvoice.objects.select_for_update().get(pk=invoice.pk)
+            if locked.status != SubscriptionInvoice.STATUS_PENDING:
+                continue
+            old_status = locked.status
+            locked.status = SubscriptionInvoice.STATUS_OVERDUE
+            locked.save(update_fields=["status", "updated_at"])
+            SubscriptionInvoiceAuditLog.objects.create(
+                invoice=locked,
+                action=SubscriptionInvoiceAuditLog.ACTION_STATUS_CHANGED,
+                old_status=old_status,
+                new_status=locked.status,
+                note="auto: overdue threshold reached",
+            )
+        stats["overdue_transitions"] += 1
+        _send_subscription_notification(
+            locked,
+            title="Subscription invoice overdue",
+            message=_subscription_notification_message(locked, kind="overdue"),
+        )
+        stats["overdue_reminders"] += 1
+
+    return stats
+
+
+def _subscription_notification_message(invoice, *, kind):
+    from .models import SubscriptionInvoice
+
+    if invoice.status == SubscriptionInvoice.STATUS_FREE_TIER:
+        threshold = _subscription_free_tier_threshold()
+        return (
+            f"Free tier — {invoice.billable_units_count} units under the "
+            f"{threshold}-unit threshold. No payment required for {invoice.period}."
+        )
+    if kind == "paid":
+        return (
+            f"Thank you. KRIB subscription for {invoice.period} "
+            f"(KES {invoice.amount}) is paid."
+        )
+    if kind == "reminder":
+        return (
+            f"KRIB subscription for {invoice.period} (KES {invoice.amount}) is "
+            "still pending. Please complete payment to keep things tidy."
+        )
+    if kind == "overdue":
+        return (
+            f"KRIB subscription for {invoice.period} (KES {invoice.amount}) is "
+            "overdue. Please clear it at your convenience."
+        )
+    return (
+        f"KRIB subscription invoice for {invoice.period} is ready: "
+        f"{invoice.billable_units_count} unit(s), KES {invoice.amount}."
+    )
+
+
+def _send_subscription_notification(invoice, *, title, message):
+    """Create an in-app Notification for the landlord. SMS/email are
+    intentionally not duplicated here in this phase — landlords already
+    receive the in-app surface, and KRIB transactional messaging is centralized
+    via the existing send_mail / send_sms helpers callers can use when they
+    have a phone number to hand."""
+    from .models import Notification
+
+    Notification.objects.create(
+        user=invoice.landlord,
+        title=title,
+        message=message,
+    )
 
 
 def can_withdraw_wallet(tenant_user, amount):

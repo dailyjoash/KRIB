@@ -1,103 +1,177 @@
-import React, { createContext, useState, useEffect } from "react";
-import api from "../services/api";
+import React, { createContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import api, { clearAuthStorage, setApiAccessToken } from "../services/api";
 import { getErrorMessage } from "../utils/errors";
 
 export const AuthContext = createContext(null);
 
+const emptyAuthState = {
+  user: null,
+  role: "",
+  accessToken: "",
+  refreshToken: "",
+};
+
+const normalizeUser = (data, fallbackRole = "") => ({
+  id: data?.id,
+  name: data?.name || data?.first_name || data?.full_name || data?.username,
+  email: data?.email,
+  phone: data?.phone || data?.phone_number,
+  role: fallbackRole || data?.role || "",
+  is_staff: Boolean(data?.is_staff),
+});
+
+const readStoredUser = () => {
+  const storedUser = localStorage.getItem("user");
+  if (!storedUser) return null;
+
+  try {
+    return JSON.parse(storedUser);
+  } catch {
+    localStorage.removeItem("user");
+    sessionStorage.removeItem("user");
+    return null;
+  }
+};
+
+const readStoredAuth = () => {
+  const accessToken = localStorage.getItem("access") || "";
+  const refreshToken = localStorage.getItem("refresh") || "";
+  const role = localStorage.getItem("role") || "";
+  const storedUser = accessToken && role ? readStoredUser() : null;
+  const user = storedUser ? { ...storedUser, role: storedUser.role || role } : null;
+
+  return {
+    user,
+    role,
+    accessToken,
+    refreshToken,
+  };
+};
+
 export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
+  const authChangeRef = useRef(0);
+  const [authState, setAuthState] = useState(readStoredAuth);
+  const [authReady, setAuthReady] = useState(() => {
+    const storedAuth = readStoredAuth();
+    return !storedAuth.accessToken || Boolean(storedAuth.user);
+  });
 
   const resetExecutiveVisibilityPreference = () => {
     localStorage.setItem("krib-exec-amounts-hidden", "true");
   };
 
-  useEffect(() => {
-    const storedUser = localStorage.getItem("user");
-    if (storedUser) {
-      try {
-        setUser(JSON.parse(storedUser));
-      } catch {
-        localStorage.removeItem("user");
-      }
+  const clearSession = useCallback(() => {
+    authChangeRef.current += 1;
+    clearAuthStorage();
+    setAuthState(emptyAuthState);
+    setAuthReady(true);
+  }, []);
+
+  const persistSession = useCallback((payload) => {
+    const nextUser = payload.user || null;
+    const nextRole = payload.role || nextUser?.role || "";
+    const nextAccessToken = payload.access || "";
+    const nextRefreshToken = payload.refresh || "";
+
+    authChangeRef.current += 1;
+
+    if (nextAccessToken) {
+      localStorage.setItem("access", nextAccessToken);
+      setApiAccessToken(nextAccessToken);
+    } else {
+      localStorage.removeItem("access");
+      setApiAccessToken(null);
     }
+
+    if (nextRefreshToken) {
+      localStorage.setItem("refresh", nextRefreshToken);
+    } else {
+      localStorage.removeItem("refresh");
+    }
+
+    if (nextRole) {
+      localStorage.setItem("role", nextRole);
+    } else {
+      localStorage.removeItem("role");
+    }
+
+    resetExecutiveVisibilityPreference();
+
+    if (nextUser) {
+      localStorage.setItem("user", JSON.stringify({ ...nextUser, role: nextRole }));
+    } else {
+      localStorage.removeItem("user");
+    }
+
+    setAuthState({
+      user: nextUser ? { ...nextUser, role: nextRole } : null,
+      role: nextRole,
+      accessToken: nextAccessToken,
+      refreshToken: nextRefreshToken,
+    });
+    setAuthReady(true);
   }, []);
 
   useEffect(() => {
-    const token = localStorage.getItem("access");
-    if (!token || user) return;
+    const storedAuth = readStoredAuth();
+
+    if (!storedAuth.accessToken || !storedAuth.role) {
+      clearSession();
+      return undefined;
+    }
+
+    setApiAccessToken(storedAuth.accessToken);
+
+    if (storedAuth.user) {
+      setAuthReady(true);
+      return undefined;
+    }
 
     let active = true;
+    const authRun = authChangeRef.current;
+    setAuthReady(false);
+
     api.get("/api/me/")
       .then((res) => {
-        if (!active) return;
-        const restoredUser = {
-          id: res.data?.id,
-          name: res.data?.first_name || res.data?.full_name || res.data?.username,
-          email: res.data?.email,
-          phone: res.data?.phone_number,
-          role: res.data?.role,
-          is_staff: Boolean(res.data?.is_staff),
-        };
-        localStorage.setItem("role", restoredUser.role || "");
-        localStorage.setItem("user", JSON.stringify(restoredUser));
-        setUser(restoredUser);
+        if (!active || authRun !== authChangeRef.current) return;
+        const restoredUser = normalizeUser(res.data, res.data?.role || storedAuth.role);
+        persistSession({
+          access: storedAuth.accessToken,
+          refresh: storedAuth.refreshToken,
+          role: restoredUser.role,
+          user: restoredUser,
+        });
       })
       .catch(() => {
-        localStorage.removeItem("user");
-        localStorage.removeItem("access");
-        localStorage.removeItem("refresh");
-        localStorage.removeItem("role");
+        if (active && authRun === authChangeRef.current) {
+          clearSession();
+        }
       });
 
     return () => {
       active = false;
     };
-  }, [user]);
+  }, [clearSession, persistSession]);
 
-  const persistSession = (payload) => {
-    if (payload.access) localStorage.setItem("access", payload.access);
-    if (payload.refresh) localStorage.setItem("refresh", payload.refresh);
-    if (payload.role) localStorage.setItem("role", payload.role);
-    resetExecutiveVisibilityPreference();
-    if (payload.user) {
-      localStorage.setItem("user", JSON.stringify(payload.user));
-      setUser(payload.user);
-    }
-  };
-
-  const login = async (credentials) => {
+  const login = useCallback(async (credentials) => {
     const res = await api.post("/api/auth/login/", credentials);
-    const userData = {
-      id: res.data.user?.id,
-      name: res.data.user?.name,
-      email: res.data.user?.email,
-      phone: res.data.user?.phone,
-      role: res.data.role || res.data.user?.role,
-      is_staff: Boolean(res.data.user?.is_staff),
-    };
+    const userData = normalizeUser(res.data?.user, res.data?.role || res.data?.user?.role);
     persistSession({
-      access: res.data.access,
-      refresh: res.data.refresh,
+      access: res.data?.access,
+      refresh: res.data?.refresh,
       role: userData.role,
       user: userData,
     });
     return userData;
-  };
+  }, [persistSession]);
 
-  const register = async (payload) => {
+  const register = useCallback(async (payload) => {
     try {
       const res = await api.post("/api/auth/register/", payload);
-      const userData = {
-        id: res.data.user?.id,
-        name: res.data.user?.name,
-        email: res.data.user?.email,
-        phone: res.data.user?.phone,
-        role: res.data.role || res.data.user?.role,
-        is_staff: Boolean(res.data.user?.is_staff),
-      };
+      const userData = normalizeUser(res.data?.user, res.data?.role || res.data?.user?.role);
       persistSession({
-        access: res.data.access,
-        refresh: res.data.refresh,
+        access: res.data?.access,
+        refresh: res.data?.refresh,
         role: userData.role,
         user: userData,
       });
@@ -105,30 +179,45 @@ export function AuthProvider({ children }) {
     } catch (error) {
       throw new Error(getErrorMessage(error, "Unable to create account."));
     }
-  };
+  }, [persistSession]);
 
-  const logout = async () => {
-    // Best-effort server-side blacklist of the refresh token. We always clear
-    // local storage even if the network call fails so the UI is never stuck
-    // signed in after the user clicked Sign Out.
-    const refresh = localStorage.getItem("refresh");
-    if (refresh) {
-      try {
-        await api.post("/api/auth/logout/", { refresh });
-      } catch (err) {
-        // network/offline/server-down: ignore; local logout still happens
-      }
+  const logout = useCallback(() => {
+    const refresh = authState.refreshToken || localStorage.getItem("refresh");
+    const access = authState.accessToken || localStorage.getItem("access");
+
+    clearSession();
+
+    if (!refresh) {
+      return Promise.resolve();
     }
-    localStorage.removeItem("user");
-    localStorage.removeItem("access");
-    localStorage.removeItem("refresh");
-    localStorage.removeItem("role");
-    localStorage.removeItem("krib-exec-amounts-hidden");
-    setUser(null);
-  };
+
+    return api.post(
+      "/api/auth/logout/",
+      { refresh },
+      access ? { headers: { Authorization: `Bearer ${access}` } } : undefined
+    ).catch(() => undefined);
+  }, [authState.accessToken, authState.refreshToken, clearSession]);
+
+  const isAuthenticated = Boolean(authState.accessToken && authState.role && authState.user);
+
+  const contextValue = useMemo(
+    () => ({
+      user: authState.user,
+      role: authState.role,
+      accessToken: authState.accessToken,
+      refreshToken: authState.refreshToken,
+      isAuthenticated,
+      authReady,
+      login,
+      register,
+      logout,
+      clearSession,
+    }),
+    [authReady, authState, clearSession, isAuthenticated, login, logout, register]
+  );
 
   return (
-    <AuthContext.Provider value={{ user, login, register, logout }}>
+    <AuthContext.Provider value={contextValue}>
       {children}
     </AuthContext.Provider>
   );

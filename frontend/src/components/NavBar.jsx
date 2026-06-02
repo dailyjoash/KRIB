@@ -16,7 +16,7 @@ export default function NavBar() {
 
   const doLogout = () => {
     logout();
-    navigate("/");
+    navigate("/login", { replace: true });
   };
 
   const links = [

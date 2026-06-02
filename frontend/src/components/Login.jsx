@@ -8,7 +8,7 @@ import logo from "../assets/Gemini_Generated_Image_2trnue2trnue2trn (1).png";
 
 const Login = () => {
   const navigate = useNavigate();
-  const { login } = useContext(AuthContext);
+  const { authReady, isAuthenticated, login, role } = useContext(AuthContext);
   const location = useLocation();
 
   const [formData, setFormData] = useState({
@@ -21,18 +21,17 @@ const Login = () => {
   const [showPassword, setShowPassword] = useState(false);
 
   useEffect(() => {
-    const storedRole = localStorage.getItem("role");
-    const token = localStorage.getItem("access");
-    if (!token || !storedRole) return;
+    if (!authReady || !isAuthenticated || !role) return;
+
     navigate(
-      storedRole === "landlord"
+      role === "landlord"
         ? "/dashboard"
-        : storedRole === "tenant"
+        : role === "tenant"
           ? "/tenant"
           : "/manager",
       { replace: true }
     );
-  }, [navigate]);
+  }, [authReady, isAuthenticated, navigate, role]);
 
   const handleChange = (e) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });

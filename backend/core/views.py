@@ -18,8 +18,8 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
-from django.http import FileResponse, Http404
-from django.db import transaction
+from django.http import FileResponse, Http404, JsonResponse
+from django.db import IntegrityError, transaction
 from django.db.models import F, Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils.encoding import force_bytes, force_str
@@ -40,7 +40,9 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import (
+    CustodyAuditLog,
     Document,
+    LandlordCollectionAccount,
     LandlordBalance,
     LandlordSettings,
     LandlordPayout,
@@ -49,9 +51,13 @@ from .models import (
     MaintenanceRequest,
     ManagerInvite,
     Notification,
+    PaymentRecord,
+    PaymentRecordAuditLog,
     PaymentTransaction,
     Profile,
     Property,
+    SubscriptionInvoice,
+    SubscriptionInvoiceAuditLog,
     Tenant,
     TenantInvite,
     Unit,
@@ -60,7 +66,12 @@ from .models import (
 from .serializers import (
     ChangePasswordSerializer,
     DocumentSerializer,
+    DirectPaymentActionSerializer,
+    DirectPaymentAttachSerializer,
+    DirectPaymentSubmitSerializer,
     LoginSerializer,
+    LandlordCollectionAccountSerializer,
+    LandlordCollectionAccountVerificationSerializer,
     LandlordFollowupSerializer,
     LandlordSettingsSerializer,
     LandlordReceiptSerializer,
@@ -81,9 +92,12 @@ from .serializers import (
     NotificationSerializer,
     NotificationSendSerializer,
     LeaseTenantContactSerializer,
+    PaymentRecordSerializer,
     PaymentTransactionSerializer,
     PropertySerializer,
     STKInitiateSerializer,
+    SubscriptionInvoiceSerializer,
+    SubscriptionPayInitiateSerializer,
     TenantInviteSerializer,
     TenantSerializer,
     UnitSerializer,
@@ -109,14 +123,19 @@ from .services import (
     can_withdraw_wallet,
     current_billing_period,
     current_period_string,
+    current_subscription_period,
+    CustodyCutoverError,
     execute_intasend_payout,
     intasend_stk_push,
+    landlord_outstanding_custody,
+    mark_subscription_invoice_paid,
     normalize_mpesa_phone_number,
     paypal_capture_order,
     paypal_create_order,
     period_string_to_date,
     save_payment_receipt,
     send_sms,
+    switch_landlord_to_direct_paybill,
     unlock_due_landlord_balance,
     unlock_due_wallet_for_user,
 )
@@ -219,6 +238,56 @@ def _issue_tokens(user):
 
 def _current_period():
     return current_period_string()
+
+
+def _landlord_collection_mode(landlord):
+    try:
+        settings_obj = landlord.landlord_settings
+    except LandlordSettings.DoesNotExist:
+        settings_obj = None
+    if not settings_obj:
+        return LandlordSettings.COLLECTION_CUSTODY_LEGACY
+    return settings_obj.collection_mode or LandlordSettings.COLLECTION_CUSTODY_LEGACY
+
+
+def _lease_collection_mode(lease):
+    return _landlord_collection_mode(lease.unit.property.landlord)
+
+
+def _lease_uses_direct_paybill(lease):
+    return _lease_collection_mode(lease) == LandlordSettings.COLLECTION_DIRECT_PAYBILL
+
+
+def _direct_pay_account_for_landlord(landlord):
+    try:
+        return landlord.collection_account
+    except LandlordCollectionAccount.DoesNotExist:
+        return None
+
+
+def _direct_pay_instructions(lease, period=None):
+    landlord = lease.unit.property.landlord
+    account = _direct_pay_account_for_landlord(landlord)
+    rent_status = compute_lease_rent_status(
+        lease,
+        period=period or _current_period(),
+        today=timezone.localdate(),
+    )
+    return {
+        "collection_mode": LandlordSettings.COLLECTION_DIRECT_PAYBILL,
+        "collection_method": LandlordCollectionAccount.METHOD_MPESA_PAYBILL,
+        "paybill_number": account.paybill_number if account else "",
+        "account_reference": lease.payment_reference,
+        "amount": rent_status.get("balance", Decimal("0.00")),
+        "period": rent_status.get("period") or (period or _current_period()),
+        "verification_status": account.verification_status if account else LandlordCollectionAccount.STATUS_UNVERIFIED,
+        "verification_label": (
+            "verified_landlord_collected"
+            if account and account.verification_status == LandlordCollectionAccount.STATUS_VERIFIED
+            else "tenant_reported_unverified"
+        ),
+        "registered_business_name": account.registered_business_name if account else "",
+    }
 
 
 def _tenant_active_lease(user):
@@ -377,6 +446,9 @@ def _unlock_landlord(balance):
 
 
 def _apply_wallet_to_current_rent(lease):
+    if _lease_uses_direct_paybill(lease):
+        return Decimal("0.00")
+
     profile, _ = Profile.objects.get_or_create(user=lease.tenant)
     _unlock_wallet(profile)
     rent_status = compute_lease_rent_status(lease)
@@ -433,6 +505,9 @@ def _apply_wallet_to_current_rent(lease):
 def _wallet_aware_rent_status(lease, rent_status, wallet_available, *, today=None):
     # Dashboard reads should reflect the balance-based wallet model without
     # creating payment rows or mutating ledger balances on a GET request.
+    if _lease_uses_direct_paybill(lease):
+        return dict(rent_status or {})
+
     today = today or timezone.localdate()
     adjusted = dict(rent_status or {})
     available_wallet = max(
@@ -495,6 +570,12 @@ def _allocate_success_payment(payment):
         lease = Lease.objects.select_for_update().select_related(
             "unit", "unit__property").get(pk=locked_payment.lease_id)
         landlord = lease.unit.property.landlord
+
+        if _lease_uses_direct_paybill(lease):
+            locked_payment.allocation_done = True
+            locked_payment.result_desc = "Skipped custody allocation for direct Paybill lease."
+            locked_payment.save(update_fields=["allocation_done", "result_desc"])
+            return
 
         profile, _ = Profile.objects.get_or_create(user=locked_payment.tenant)
         profile = Profile.objects.select_for_update().get(pk=profile.pk)
@@ -1599,6 +1680,376 @@ class LandlordSettingsView(APIView):
         return Response(serializer.data)
 
 
+class LandlordCollectionAccountView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def _landlord_user(self, request):
+        if request.user.is_staff:
+            landlord_id = request.query_params.get("landlord_id") or request.data.get("landlord_id")
+            if landlord_id:
+                return User.objects.filter(pk=landlord_id, profile__role=Profile.ROLE_LANDLORD).first()
+        return request.user
+
+    def get(self, request):
+        if _get_role(request.user) != Profile.ROLE_LANDLORD and not request.user.is_staff:
+            return Response({"detail": "Landlord only endpoint."}, status=403)
+        landlord = self._landlord_user(request)
+        if not landlord:
+            return Response({"detail": "Landlord not found."}, status=404)
+        account = _direct_pay_account_for_landlord(landlord)
+        if not account:
+            return Response({"detail": "No collection account configured."}, status=404)
+        return Response(LandlordCollectionAccountSerializer(account, context={"request": request}).data)
+
+    def post(self, request):
+        return self._upsert(request)
+
+    def patch(self, request):
+        return self._upsert(request)
+
+    def _upsert(self, request):
+        if _get_role(request.user) != Profile.ROLE_LANDLORD and not request.user.is_staff:
+            return Response({"detail": "Landlord only endpoint."}, status=403)
+        landlord = self._landlord_user(request)
+        if not landlord:
+            return Response({"detail": "Landlord not found."}, status=404)
+        account = _direct_pay_account_for_landlord(landlord)
+        created = account is None
+        serializer = LandlordCollectionAccountSerializer(
+            account,
+            data=request.data,
+            partial=bool(account),
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        account = serializer.save(landlord=landlord)
+        return Response(
+            LandlordCollectionAccountSerializer(account, context={"request": request}).data,
+            status=201 if created else 200,
+        )
+
+
+class LandlordCollectionAccountVerifyView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        if not request.user.is_staff:
+            return Response({"detail": "Staff only endpoint."}, status=403)
+        account = LandlordCollectionAccount.objects.select_related("landlord", "verified_by").filter(pk=pk).first()
+        if not account:
+            return Response({"detail": "Collection account not found."}, status=404)
+        serializer = LandlordCollectionAccountVerificationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        account.verification_status = serializer.validated_data["verification_status"]
+        account.verification_notes = serializer.validated_data.get("verification_notes", "")
+        if account.verification_status == LandlordCollectionAccount.STATUS_VERIFIED:
+            account.verified_at = timezone.now()
+            account.verified_by = request.user
+        else:
+            account.verified_at = None
+            account.verified_by = None
+        account.save(
+            update_fields=[
+                "verification_status",
+                "verification_notes",
+                "verified_at",
+                "verified_by",
+                "updated_at",
+            ]
+        )
+        return Response(LandlordCollectionAccountSerializer(account, context={"request": request}).data)
+
+
+def _user_can_manage_lease(user, lease):
+    if user.is_staff:
+        return True
+    role = _get_role(user)
+    property_obj = lease.unit.property
+    return (
+        (role == Profile.ROLE_LANDLORD and property_obj.landlord_id == user.id)
+        or (role == Profile.ROLE_MANAGER and property_obj.manager_id == user.id)
+    )
+
+
+def _direct_payment_queryset_for_user(user):
+    role = _get_role(user)
+    qs = PaymentRecord.objects.select_related(
+        "lease",
+        "lease__tenant",
+        "lease__unit",
+        "lease__unit__property",
+        "tenant",
+        "landlord",
+        "collection_account",
+    ).prefetch_related("audit_logs", "audit_logs__actor")
+    if user.is_staff:
+        return qs
+    if role == Profile.ROLE_TENANT:
+        return qs.filter(Q(tenant=user) | Q(submitted_by=user))
+    if role == Profile.ROLE_LANDLORD:
+        return qs.filter(Q(landlord=user) | Q(lease__unit__property__landlord=user))
+    if role == Profile.ROLE_MANAGER:
+        return qs.filter(lease__unit__property__manager=user)
+    return qs.none()
+
+
+def _write_payment_audit(payment_record, actor, action, old_status, new_status, note=""):
+    PaymentRecordAuditLog.objects.create(
+        payment_record=payment_record,
+        actor=actor,
+        action=action,
+        old_status=old_status or "",
+        new_status=new_status or "",
+        note=note or "",
+    )
+
+
+def _resolve_direct_payment_submission(user, data):
+    lease = None
+    account = None
+    landlord = None
+    status_value = PaymentRecord.STATUS_UNMATCHED
+    flagged_reason = "Could not confidently match this payment to an active direct-pay lease."
+
+    lease_id = data.get("lease_id")
+    if lease_id:
+        lease = (
+            Lease.objects.select_related("tenant", "unit", "unit__property", "unit__property__landlord")
+            .filter(pk=lease_id)
+            .first()
+        )
+        if not lease or lease.tenant_id != user.id:
+            raise PermissionDenied("Unauthorized lease.")
+        landlord = lease.unit.property.landlord
+        account = _direct_pay_account_for_landlord(landlord)
+        if not _lease_uses_direct_paybill(lease):
+            raise DRFValidationError({"detail": "This lease uses the legacy KRIB custody payment flow."})
+        if lease.status == Lease.STATUS_ACTIVE:
+            status_value = PaymentRecord.STATUS_PENDING_CONFIRMATION
+            flagged_reason = ""
+        else:
+            flagged_reason = "Submitted against an inactive or ended lease."
+        return lease, landlord, account, status_value, flagged_reason
+
+    paybill_number = data.get("paybill_number") or ""
+    payment_reference = data.get("payment_reference") or ""
+    if paybill_number:
+        account = (
+            LandlordCollectionAccount.objects.select_related("landlord")
+            .filter(paybill_number=paybill_number)
+            .first()
+        )
+        if account:
+            landlord = account.landlord
+    if landlord and payment_reference:
+        lease = (
+            Lease.objects.select_related("tenant", "unit", "unit__property", "unit__property__landlord")
+            .filter(
+                payment_reference_landlord=landlord,
+                payment_reference=payment_reference,
+                tenant=user,
+            )
+            .first()
+        )
+        if lease and _lease_uses_direct_paybill(lease) and lease.status == Lease.STATUS_ACTIVE:
+            status_value = PaymentRecord.STATUS_PENDING_CONFIRMATION
+            flagged_reason = ""
+        elif lease:
+            flagged_reason = "Submitted against an inactive or ended lease."
+
+    return lease, landlord, account, status_value, flagged_reason
+
+
+class DirectPaymentInstructionsView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if _get_role(request.user) != Profile.ROLE_TENANT:
+            return Response({"detail": "Tenant only endpoint."}, status=403)
+        lease = _tenant_active_lease(request.user)
+        if not lease:
+            return Response({"detail": "No active lease found."}, status=404)
+        if not _lease_uses_direct_paybill(lease):
+            return Response({"collection_mode": LandlordSettings.COLLECTION_CUSTODY_LEGACY})
+        return Response(_direct_pay_instructions(lease, period=request.query_params.get("period") or _current_period()))
+
+
+class DirectPaymentListSubmitView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = _direct_payment_queryset_for_user(request.user)
+        status_filter = request.query_params.get("status")
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        period = request.query_params.get("period")
+        if period:
+            qs = qs.filter(period=period)
+        return Response(PaymentRecordSerializer(qs, many=True, context={"request": request}).data)
+
+    def post(self, request):
+        if _get_role(request.user) != Profile.ROLE_TENANT:
+            return Response({"detail": "Only tenants can submit manual payment confirmations."}, status=403)
+        serializer = DirectPaymentSubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        lease, landlord, account, status_value, flagged_reason = _resolve_direct_payment_submission(request.user, data)
+        period = data.get("period") or _current_period()
+
+        try:
+            with transaction.atomic():
+                payment_record = PaymentRecord.objects.create(
+                    lease=lease,
+                    tenant=lease.tenant if lease else request.user,
+                    landlord=landlord,
+                    collection_account=account,
+                    period=period,
+                    phone_number=data["phone_number"],
+                    amount=data["amount"],
+                    transaction_code=data["transaction_code"],
+                    transaction_date=data["transaction_date"],
+                    status=status_value,
+                    submitted_by=request.user,
+                    flagged_reason=flagged_reason,
+                )
+                _write_payment_audit(
+                    payment_record,
+                    request.user,
+                    PaymentRecordAuditLog.ACTION_SUBMIT,
+                    "",
+                    payment_record.status,
+                    flagged_reason,
+                )
+        except IntegrityError:
+            return Response({"detail": "This M-Pesa transaction code has already been submitted."}, status=409)
+
+        return Response(PaymentRecordSerializer(payment_record, context={"request": request}).data, status=201)
+
+
+class DirectPaymentActionView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk, action):
+        payment_record = _direct_payment_queryset_for_user(request.user).filter(pk=pk).first()
+        if not payment_record:
+            return Response({"detail": "Payment record not found."}, status=404)
+        if action not in {"confirm", "reject"}:
+            return Response({"detail": "Unsupported action."}, status=400)
+        if payment_record.lease_id and not _user_can_manage_lease(request.user, payment_record.lease):
+            return Response({"detail": "Unauthorized request."}, status=403)
+        if not payment_record.lease_id and not (request.user.is_staff or payment_record.landlord_id == request.user.id):
+            return Response({"detail": "Unauthorized request."}, status=403)
+        if _get_role(request.user) == Profile.ROLE_TENANT and not request.user.is_staff:
+            return Response({"detail": "Tenants cannot confirm or reject landlord-collected payments."}, status=403)
+
+        serializer = DirectPaymentActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        note = serializer.validated_data.get("note", "")
+
+        with transaction.atomic():
+            locked = PaymentRecord.objects.select_for_update().select_related(
+                "lease",
+                "lease__unit",
+                "lease__unit__property",
+                "tenant",
+                "landlord",
+                "collection_account",
+            ).get(pk=payment_record.pk)
+            old_status = locked.status
+            if action == "confirm":
+                if locked.status != PaymentRecord.STATUS_PENDING_CONFIRMATION:
+                    return Response({"detail": "Only pending confirmations can be confirmed."}, status=400)
+                locked.status = PaymentRecord.STATUS_CONFIRMED
+                locked.allocated_amount = locked.amount
+                locked.confirmation_note = note
+                locked.confirmed_by = request.user
+                locked.confirmed_at = timezone.now()
+                update_fields = [
+                    "status",
+                    "allocated_amount",
+                    "confirmation_note",
+                    "confirmed_by",
+                    "confirmed_at",
+                    "updated_at",
+                ]
+                audit_action = PaymentRecordAuditLog.ACTION_CONFIRM
+            else:
+                if locked.status not in [PaymentRecord.STATUS_PENDING_CONFIRMATION, PaymentRecord.STATUS_UNMATCHED]:
+                    return Response({"detail": "Only pending or unmatched payments can be rejected."}, status=400)
+                locked.status = PaymentRecord.STATUS_REJECTED
+                locked.rejection_note = note
+                locked.rejected_by = request.user
+                locked.rejected_at = timezone.now()
+                update_fields = [
+                    "status",
+                    "rejection_note",
+                    "rejected_by",
+                    "rejected_at",
+                    "updated_at",
+                ]
+                audit_action = PaymentRecordAuditLog.ACTION_REJECT
+            locked.save(update_fields=update_fields)
+            _write_payment_audit(locked, request.user, audit_action, old_status, locked.status, note)
+
+        locked.refresh_from_db()
+        return Response(PaymentRecordSerializer(locked, context={"request": request}).data)
+
+
+class DirectPaymentAttachView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        payment_record = _direct_payment_queryset_for_user(request.user).filter(pk=pk).first()
+        if not payment_record:
+            return Response({"detail": "Payment record not found."}, status=404)
+        serializer = DirectPaymentAttachSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        lease = serializer.validated_data["lease"]
+        note = serializer.validated_data.get("note", "")
+        lease = Lease.objects.select_related("tenant", "unit", "unit__property", "unit__property__landlord").get(pk=lease.pk)
+        if not _user_can_manage_lease(request.user, lease):
+            return Response({"detail": "Unauthorized request."}, status=403)
+        if not _lease_uses_direct_paybill(lease):
+            return Response({"detail": "Target lease does not use direct Paybill collection."}, status=400)
+        if payment_record.landlord_id and payment_record.landlord_id != lease.unit.property.landlord_id and not request.user.is_staff:
+            return Response({"detail": "Payment belongs to another landlord."}, status=403)
+
+        with transaction.atomic():
+            locked = PaymentRecord.objects.select_for_update().get(pk=payment_record.pk)
+            if locked.status != PaymentRecord.STATUS_UNMATCHED:
+                return Response({"detail": "Only unmatched payments can be attached."}, status=400)
+            old_status = locked.status
+            locked.lease = lease
+            locked.tenant = lease.tenant
+            locked.landlord = lease.unit.property.landlord
+            locked.collection_account = _direct_pay_account_for_landlord(lease.unit.property.landlord)
+            locked.status = PaymentRecord.STATUS_CONFIRMED
+            locked.allocated_amount = locked.amount
+            locked.confirmed_by = request.user
+            locked.confirmed_at = timezone.now()
+            locked.confirmation_note = note
+            locked.flagged_reason = ""
+            locked.save(
+                update_fields=[
+                    "lease",
+                    "tenant",
+                    "landlord",
+                    "collection_account",
+                    "status",
+                    "allocated_amount",
+                    "confirmed_by",
+                    "confirmed_at",
+                    "confirmation_note",
+                    "flagged_reason",
+                    "updated_at",
+                ]
+            )
+            _write_payment_audit(locked, request.user, PaymentRecordAuditLog.ACTION_ATTACH, old_status, locked.status, note)
+
+        locked.refresh_from_db()
+        return Response(PaymentRecordSerializer(locked, context={"request": request}).data)
+
+
 class STKInitiateView(APIView):
     permission_classes = [IsAuthenticated]
     throttle_classes = [STKInitiateRateThrottle]
@@ -1606,6 +2057,25 @@ class STKInitiateView(APIView):
     def post(self, request):
         if _get_role(request.user) != Profile.ROLE_TENANT:
             return Response({"detail": "Unauthorized request."}, status=403)
+
+        serializer = STKInitiateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        lease = serializer.validated_data["lease"]
+        try:
+            _assert_active_lease(lease, request.user)
+        except PermissionDenied:
+            return Response({"detail": "Unauthorized request."}, status=403)
+        except DRFValidationError:
+            return Response({"detail": "No active lease found."}, status=400)
+
+        if _lease_uses_direct_paybill(lease):
+            return Response(
+                {
+                    "detail": "This lease uses direct landlord Paybill collection. Use the Paybill instructions instead of STK.",
+                    "direct_pay_instructions": _direct_pay_instructions(lease),
+                },
+                status=400,
+            )
 
         missing_env_vars = _missing_intasend_env_vars()
         if missing_env_vars:
@@ -1620,16 +2090,6 @@ class STKInitiateView(APIView):
                 },
                 status=503,
             )
-
-        serializer = STKInitiateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        lease = serializer.validated_data["lease"]
-        try:
-            _assert_active_lease(lease, request.user)
-        except PermissionDenied:
-            return Response({"detail": "Unauthorized request."}, status=403)
-        except DRFValidationError:
-            return Response({"detail": "No active lease found."}, status=400)
 
         period = _current_period()
         billing_period = current_billing_period()
@@ -1746,6 +2206,18 @@ class STKCallbackView(APIView):
         except Exception:
             logger.warning("payment.intasend.bad_payload")
             return Response({"detail": "Invalid payload."}, status=400)
+
+        # Phase 2B: if this callback corresponds to a KRIB subscription
+        # invoice (matched by IntaSend invoice_id), settle it here and stop —
+        # the rent-payment path must not see it. Falls through to the
+        # standard rent flow when the lookup misses.
+        try:
+            if _try_settle_subscription_invoice_from_callback(payload):
+                return Response({"detail": "Subscription callback processed."}, status=200)
+        except Exception:
+            logger.exception("subscription.intasend.callback_failed")
+            # Fall through to the rent path; if this was a subscription
+            # callback the next match attempt will just no-op.
 
         # Normalize into the shared event format and hand off. All security
         # checks (amount, lease, idempotency) live in apply_payment_event so
@@ -2573,14 +3045,21 @@ def tenant_dashboard(request):
     rent = compute_lease_rent_status(lease, period=period)
     recent_payments = PaymentTransaction.objects.filter(
         tenant=request.user).order_by("-created_at")[:5]
+    recent_direct_payments = PaymentRecord.objects.filter(
+        Q(tenant=request.user) | Q(submitted_by=request.user)
+    ).order_by("-created_at")[:5]
     open_maintenance = MaintenanceRequest.objects.filter(tenant=request.user).exclude(
         status=MaintenanceRequest.STATUS_RESOLVED).order_by("-updated_at")
+    direct_instructions = _direct_pay_instructions(lease, period=period) if _lease_uses_direct_paybill(lease) else None
     return Response(
         {
             "rent_status": rent["status"],
             "amount_due": rent["balance"],
             "current_period": period,
+            "collection_mode": _lease_collection_mode(lease),
+            "direct_pay_instructions": direct_instructions,
             "recent_payments": PaymentTransactionSerializer(recent_payments, many=True).data,
+            "recent_direct_payments": PaymentRecordSerializer(recent_direct_payments, many=True, context={"request": request}).data,
             "open_maintenance_requests": MaintenanceRequestSerializer(open_maintenance, many=True).data,
             "unread_notification_count": Notification.objects.filter(user=request.user, is_read=False).count(),
         }
@@ -2603,6 +3082,11 @@ def landlord_dashboard(request):
         lease__unit__property__landlord=request.user,
         status=PaymentTransaction.STATUS_SUCCESS,
         billing_period=period_string_to_date(period),
+    )
+    direct_payments = PaymentRecord.objects.filter(
+        landlord=request.user,
+        status=PaymentRecord.STATUS_CONFIRMED,
+        period=period,
     )
 
     tenants_in_arrears = []
@@ -2627,17 +3111,29 @@ def landlord_dashboard(request):
     recent_payments = PaymentTransaction.objects.filter(
         lease__unit__property__landlord=request.user,
     ).order_by("-created_at")[:5]
+    recent_direct_payments = PaymentRecord.objects.filter(
+        landlord=request.user,
+    ).order_by("-created_at")[:5]
+    legacy_collected = payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    direct_reported = direct_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    verified_direct_collected = direct_payments.filter(
+        collection_account__verification_status=LandlordCollectionAccount.STATUS_VERIFIED
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
 
     return Response(
         {
             "total_properties": properties.count(),
             "occupied_units": units.filter(status=Unit.STATUS_OCCUPIED).count(),
             "vacant_units": units.filter(status=Unit.STATUS_VACANT).count(),
-            "total_collected_this_month": payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00"),
+            "total_collected_this_month": legacy_collected + verified_direct_collected,
+            "legacy_krib_collected_this_month": legacy_collected,
+            "direct_landlord_collected_this_month": verified_direct_collected,
+            "tenant_reported_unverified_this_month": direct_reported - verified_direct_collected,
             "total_arrears": total_arrears,
             "tenants_in_arrears": tenants_in_arrears,
             "pending_maintenance": pending_maintenance.count(),
             "recent_payments": PaymentTransactionSerializer(recent_payments, many=True).data,
+            "recent_direct_payments": PaymentRecordSerializer(recent_direct_payments, many=True, context={"request": request}).data,
             "unread_notification_count": Notification.objects.filter(user=request.user, is_read=False).count(),
         }
     )
@@ -2669,16 +3165,25 @@ def dashboard_summary(request):
         )
         payments = PaymentTransaction.objects.filter(
             tenant=request.user).order_by("-created_at")[:10]
+        direct_payments = PaymentRecord.objects.filter(
+            Q(tenant=request.user) | Q(submitted_by=request.user)
+        ).order_by("-created_at")[:10]
         maintenance = MaintenanceRequest.objects.filter(
             tenant=request.user).order_by("-updated_at")[:10]
         active_lease = LeaseSerializer(lease, context={"period": period}).data
         active_lease["rent_status"] = rent
+        active_lease["collection_mode"] = _lease_collection_mode(lease)
+        direct_instructions = _direct_pay_instructions(lease, period=period) if _lease_uses_direct_paybill(lease) else None
+        if direct_instructions:
+            active_lease["direct_pay_instructions"] = direct_instructions
         return Response(
             {
                 "period": period,
                 "active_lease": active_lease,
                 "rent": rent,
                 "payments": PaymentTransactionSerializer(payments, many=True).data,
+                "direct_payments": PaymentRecordSerializer(direct_payments, many=True, context={"request": request}).data,
+                "direct_pay_instructions": direct_instructions,
                 "maintenance": MaintenanceRequestSerializer(maintenance, many=True).data,
                 "show_overdue_banner": rent.get("status") == "OVERDUE",
             }
@@ -3277,6 +3782,252 @@ class LandlordPayoutReverseView(APIView):
         return Response({"detail": "Payout reversed."})
 
 
+# ---------------------------------------------------------------------------
+# Phase 2A: admin custody settlement & cutover endpoints (staff-only)
+# ---------------------------------------------------------------------------
+
+# In-flight payout states for settlement display. Mirrors
+# services.NON_FINAL_PAYOUT_STATUSES (kept local for query clarity).
+_IN_FLIGHT_PAYOUT_STATUSES = (
+    LandlordPayout.STATUS_REQUESTED,
+    LandlordPayout.STATUS_PROCESSING,
+    LandlordPayout.STATUS_PENDING,
+)
+
+
+def apply_landlord_payout_outcome(payout, result):
+    """Apply an execute_intasend_payout() result to a payout row.
+
+    Thin reuse wrapper over the hardened LandlordPayoutRequestView outcome
+    handler so admin settlement runs through the EXACT same state machine as a
+    landlord-initiated payout (no reinvented payout logic). The handler is
+    stateless w.r.t. the view instance, so a throwaway instance is safe.
+    """
+    return LandlordPayoutRequestView()._apply_payout_outcome(payout, result)
+
+
+def _custody_landlord_or_404(pk):
+    return User.objects.filter(pk=pk, profile__role=Profile.ROLE_LANDLORD).first()
+
+
+class CustodyLandlordListView(APIView):
+    """Staff overview of landlords carrying outstanding custody obligations."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not request.user.is_staff:
+            return Response({"detail": "Admin only endpoint"}, status=403)
+
+        balances = list(
+            LandlordBalance.objects.select_related("landlord")
+            .filter(Q(available_balance__gt=0) | Q(locked_balance__gt=0))
+        )
+        pending_landlord_ids = set(
+            LandlordPayout.objects.filter(status__in=_IN_FLIGHT_PAYOUT_STATUSES)
+            .values_list("landlord_id", flat=True)
+        )
+        landlord_ids = {b.landlord_id for b in balances} | pending_landlord_ids
+        landlords = {u.id: u for u in User.objects.filter(pk__in=landlord_ids)}
+
+        items = []
+        for landlord_id in landlord_ids:
+            landlord = landlords.get(landlord_id)
+            if not landlord:
+                continue
+            state = landlord_outstanding_custody(landlord)
+            items.append(
+                {
+                    "landlord_id": landlord.id,
+                    "name": landlord.get_full_name() or landlord.username,
+                    "available_balance": state["available"],
+                    "locked_balance": state["locked"],
+                    "pending_payout_count": state["pending_count"],
+                    "pending_payout_total": state["pending_total"],
+                    "collection_mode": _landlord_collection_mode(landlord),
+                }
+            )
+        items.sort(key=lambda i: (i["available_balance"] + i["locked_balance"]), reverse=True)
+
+        totals = LandlordBalance.objects.aggregate(
+            total_available=Coalesce(Sum("available_balance"), Decimal("0.00")),
+            total_locked=Coalesce(Sum("locked_balance"), Decimal("0.00")),
+        )
+        return Response(
+            {
+                "total_available_balance": totals["total_available"],
+                "total_locked_balance": totals["total_locked"],
+                "landlords_with_outstanding": len(items),
+                "landlords": items,
+            }
+        )
+
+
+class CustodyLandlordDetailView(APIView):
+    """Staff view of one landlord's settlement state: balance, outstanding
+    summary, in-flight payouts, and recent ledger/payout history."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        if not request.user.is_staff:
+            return Response({"detail": "Admin only endpoint"}, status=403)
+        landlord = _custody_landlord_or_404(pk)
+        if not landlord:
+            return Response({"detail": "Landlord not found."}, status=404)
+
+        state = landlord_outstanding_custody(landlord)
+        in_flight = LandlordPayout.objects.filter(
+            landlord=landlord, status__in=_IN_FLIGHT_PAYOUT_STATUSES
+        ).order_by("-created_at")
+        recent_payouts = LandlordPayout.objects.filter(landlord=landlord).order_by("-created_at")[:10]
+        recent_ledger = LedgerTransaction.objects.filter(user=landlord).order_by("-created_at")[:20]
+
+        return Response(
+            {
+                "landlord": {
+                    "id": landlord.id,
+                    "name": landlord.get_full_name() or landlord.username,
+                    "email": landlord.email,
+                },
+                "collection_mode": _landlord_collection_mode(landlord),
+                "outstanding": state,
+                "can_cutover": not state["has_outstanding"],
+                "in_flight_payouts": LandlordPayoutSerializer(in_flight, many=True).data,
+                "recent_payouts": LandlordPayoutSerializer(recent_payouts, many=True).data,
+                "recent_ledger": LedgerTransactionSerializer(recent_ledger, many=True).data,
+            }
+        )
+
+
+class CustodySettleView(APIView):
+    """Staff-triggered settlement payout that drains a landlord's custody
+    available balance using the EXISTING LandlordPayout / IntaSend rail.
+
+    Pays the landlord's saved payout target (method/destination/bank_code).
+    Amount defaults to the full available balance (after unlocking any due
+    locked funds) but may be overridden. Writes a CustodyAuditLog row.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        if not request.user.is_staff:
+            return Response({"detail": "Admin only endpoint"}, status=403)
+        landlord = _custody_landlord_or_404(pk)
+        if not landlord:
+            return Response({"detail": "Landlord not found."}, status=404)
+
+        saved = LandlordSettings.objects.filter(user=landlord).first()
+        method = (request.data.get("method") or getattr(saved, "payout_method", "") or "").strip().upper()
+        destination = (request.data.get("destination") or getattr(saved, "payout_destination", "") or "").strip()
+        bank_code = (request.data.get("bank_code") or getattr(saved, "payout_bank_code", "") or "").strip() or None
+
+        if method not in (LandlordPayout.METHOD_MPESA, LandlordPayout.METHOD_BANK):
+            return Response(
+                {"detail": "Landlord has no saved payout method; configure one before settling."},
+                status=400,
+            )
+        if not destination:
+            return Response({"detail": "Landlord has no saved payout destination."}, status=400)
+        if method == LandlordPayout.METHOD_BANK and not bank_code:
+            return Response({"detail": "Bank code is required for bank settlements."}, status=400)
+
+        raw_amount = request.data.get("amount")
+        try:
+            with transaction.atomic():
+                balance, _ = LandlordBalance.objects.get_or_create(landlord=landlord)
+                balance = LandlordBalance.objects.select_for_update().get(pk=balance.pk)
+                unlock_due_landlord_balance(landlord)
+                balance.refresh_from_db()
+                available_before = balance.available_balance
+                if raw_amount in (None, ""):
+                    amount = available_before
+                else:
+                    amount = Decimal(str(raw_amount))
+                if amount <= 0:
+                    return Response({"detail": "Nothing to settle; amount must be greater than zero."}, status=400)
+                if amount > available_before:
+                    return Response({"detail": "Insufficient available balance for settlement."}, status=400)
+                balance.available_balance = available_before - amount
+                balance.save(update_fields=["available_balance", "updated_at"])
+                payout = LandlordPayout.objects.create(
+                    landlord=landlord,
+                    amount=amount,
+                    method=method,
+                    destination=_normalized_destination(method, destination),
+                    bank_code=bank_code,
+                    status=LandlordPayout.STATUS_REQUESTED,
+                    requested_by=request.user,
+                )
+                _record_payout_ledger(
+                    payout=payout,
+                    kind=LedgerTransaction.KIND_LANDLORD_PAYOUT_REQUEST,
+                    status=LedgerTransaction.STATUS_PENDING,
+                    reference_text=f"payout:{payout.id};settlement;by:{request.user.id}",
+                )
+                CustodyAuditLog.objects.create(
+                    actor=request.user,
+                    landlord=landlord,
+                    action=CustodyAuditLog.ACTION_SETTLEMENT_PAYOUT,
+                    available_balance=available_before,
+                    locked_balance=balance.locked_balance,
+                    amount=amount,
+                    payout=payout,
+                    note=(request.data.get("note") or "")[:2000],
+                )
+        except (ArithmeticError, TypeError, ValueError):
+            return Response({"detail": "Invalid settlement amount."}, status=400)
+        except Exception:
+            logger.exception("custody.settle.reserve_failed landlord_id=%s", landlord.id)
+            return Response({"detail": "Could not reserve funds for settlement."}, status=500)
+
+        logger.info(
+            "custody.settle.requested payout_id=%s landlord_id=%s amount=%s by=%s",
+            payout.id, landlord.id, str(amount), request.user.id,
+        )
+        result = execute_intasend_payout(payout)
+        return apply_landlord_payout_outcome(payout, result)
+
+
+class CustodyCutoverView(APIView):
+    """Staff-driven cutover that flips a landlord to direct_paybill behind the
+    custody safety rail (the human-in-the-loop cutover path for Phase 2A)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        if not request.user.is_staff:
+            return Response({"detail": "Admin only endpoint"}, status=403)
+        landlord = _custody_landlord_or_404(pk)
+        if not landlord:
+            return Response({"detail": "Landlord not found."}, status=404)
+
+        note = (request.data.get("note") or "admin cutover")[:2000]
+        try:
+            switch_landlord_to_direct_paybill(landlord, actor=request.user, note=note)
+        except CustodyCutoverError as exc:
+            return Response(
+                {
+                    "detail": exc.detail,
+                    "code": "custody_balance_outstanding",
+                    "outstanding": {
+                        "available": str(exc.available),
+                        "locked": str(exc.locked),
+                        "pending_payout_count": exc.pending_count,
+                        "pending_payout_total": str(exc.pending_total),
+                    },
+                },
+                status=409,
+            )
+        return Response(
+            {
+                "detail": f"{landlord.get_full_name() or landlord.username} switched to direct Paybill.",
+                "collection_mode": LandlordSettings.COLLECTION_DIRECT_PAYBILL,
+            }
+        )
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def landlord_revenue(request):
@@ -3288,25 +4039,52 @@ def landlord_revenue(request):
         lease__unit__property__landlord=request.user,
         status=PaymentTransaction.STATUS_SUCCESS,
     )
+    direct_payments = PaymentRecord.objects.filter(
+        landlord=request.user,
+        status=PaymentRecord.STATUS_CONFIRMED,
+    )
     if period:
         payments = payments.filter(period=period)
+        direct_payments = direct_payments.filter(period=period)
 
-    gross = payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    legacy_gross = payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    direct_gross = direct_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    verified_direct = direct_payments.filter(
+        collection_account__verification_status=LandlordCollectionAccount.STATUS_VERIFIED
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    unverified_direct = direct_gross - verified_direct
+    gross = legacy_gross + verified_direct
     payload = {
         "period": period,
         "gross_collected": gross,
         "net_amount": gross,
+        "legacy_krib_collected": legacy_gross,
+        "direct_landlord_collected": verified_direct,
+        "verified_direct_collected": verified_direct,
+        "unverified_direct_reported": unverified_direct,
     }
 
     all_payments = PaymentTransaction.objects.filter(
         lease__unit__property__landlord=request.user,
         status=PaymentTransaction.STATUS_SUCCESS,
     )
+    all_direct_payments = PaymentRecord.objects.filter(
+        landlord=request.user,
+        status=PaymentRecord.STATUS_CONFIRMED,
+    )
     lifetime_gross = all_payments.aggregate(total=Sum("amount"))[
         "total"] or Decimal("0.00")
+    lifetime_direct = all_direct_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
+    lifetime_verified_direct = all_direct_payments.filter(
+        collection_account__verification_status=LandlordCollectionAccount.STATUS_VERIFIED
+    ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
     payload["lifetime"] = {
-        "gross_collected": lifetime_gross,
-        "net_amount": lifetime_gross,
+        "gross_collected": lifetime_gross + lifetime_verified_direct,
+        "net_amount": lifetime_gross + lifetime_verified_direct,
+        "legacy_krib_collected": lifetime_gross,
+        "direct_landlord_collected": lifetime_verified_direct,
+        "verified_direct_collected": lifetime_verified_direct,
+        "unverified_direct_reported": lifetime_direct - lifetime_verified_direct,
     }
 
     return Response(LandlordRevenueSerializer(payload).data)
@@ -3366,6 +4144,275 @@ def landlord_followups(request):
         )
 
     return Response(LandlordFollowupSerializer(rows, many=True).data)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2B: landlord subscription billing endpoints
+# ---------------------------------------------------------------------------
+
+
+def _require_landlord(request):
+    """Raise 403 unless the caller is a landlord (staff still allowed for
+    inspection but not for paying their own non-existent invoice). Returns the
+    Response to send back when forbidden, or None on success."""
+    if _get_role(request.user) != Profile.ROLE_LANDLORD and not request.user.is_staff:
+        return Response({"detail": "Landlord only endpoint."}, status=403)
+    return None
+
+
+class LandlordSubscriptionCurrentView(APIView):
+    """GET /api/landlord/subscription/current/ — the current period's
+    invoice, or JSON null if generation has not run yet."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        forbidden = _require_landlord(request)
+        if forbidden:
+            return forbidden
+        period = request.query_params.get("period") or current_subscription_period()
+        invoice = (
+            SubscriptionInvoice.objects.filter(landlord=request.user, period=period)
+            .prefetch_related("line_items")
+            .first()
+        )
+        if not invoice:
+            return JsonResponse(None, safe=False)
+        return Response(SubscriptionInvoiceSerializer(invoice).data)
+
+
+class LandlordSubscriptionListView(APIView):
+    """GET /api/landlord/subscription/invoices/ — paginated history."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        forbidden = _require_landlord(request)
+        if forbidden:
+            return forbidden
+        invoices = (
+            SubscriptionInvoice.objects.filter(landlord=request.user)
+            .prefetch_related("line_items")
+            .order_by("-period", "-id")
+        )
+        return Response(SubscriptionInvoiceSerializer(invoices, many=True).data)
+
+
+class LandlordSubscriptionPayView(APIView):
+    """POST /api/landlord/subscription/invoices/<pk>/pay/ — kick off STK push
+    to KRIB's own IntaSend account, reusing the existing intasend_stk_push
+    helper. The webhook (STKCallbackView) finalizes when IntaSend confirms.
+
+    Idempotent at the invoice level: an already-paid invoice returns 400 with
+    a clear code; an in-flight invoice (already has an intasend_invoice_id and
+    is still pending) returns 409 so the client knows to wait rather than
+    spawning a second STK push.
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [STKInitiateRateThrottle]
+
+    def post(self, request, pk):
+        forbidden = _require_landlord(request)
+        if forbidden:
+            return forbidden
+
+        invoice = SubscriptionInvoice.objects.filter(
+            pk=pk, landlord=request.user
+        ).first()
+        if not invoice:
+            # Important: even staff posting on behalf of a landlord must scope
+            # by request.user here — paying someone else's invoice is not a
+            # supported operation in this phase.
+            return Response({"detail": "Subscription invoice not found."}, status=404)
+
+        if invoice.status == SubscriptionInvoice.STATUS_PAID:
+            return Response(
+                {"detail": "Invoice already paid.", "code": "already_paid"},
+                status=400,
+            )
+        if invoice.status == SubscriptionInvoice.STATUS_FREE_TIER:
+            return Response(
+                {"detail": "Free-tier invoices have no balance to pay.", "code": "free_tier"},
+                status=400,
+            )
+        if invoice.status == SubscriptionInvoice.STATUS_WAIVED:
+            return Response(
+                {"detail": "Invoice was waived.", "code": "waived"},
+                status=400,
+            )
+        if invoice.amount <= 0:
+            return Response(
+                {"detail": "Invoice has no positive balance.", "code": "no_balance"},
+                status=400,
+            )
+        if invoice.status in (
+            SubscriptionInvoice.STATUS_PENDING,
+            SubscriptionInvoice.STATUS_OVERDUE,
+        ) and (invoice.payment_reference or invoice.intasend_invoice_id):
+            return Response(
+                {
+                    "detail": "Payment is already in progress for this invoice.",
+                    "code": "payment_in_progress",
+                },
+                status=409,
+            )
+
+        serializer = SubscriptionPayInitiateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        phone_number = serializer.validated_data["phone_number"]
+
+        missing_env_vars = _missing_intasend_env_vars()
+        if missing_env_vars:
+            logger.warning(
+                "subscription.initiate.blocked missing_env=%s",
+                missing_env_vars,
+            )
+            return Response(
+                {
+                    "detail": "Payment gateway is not configured.",
+                    "missing_env_vars": missing_env_vars,
+                },
+                status=503,
+            )
+
+        # The local reference is persisted BEFORE the provider call under a
+        # row lock. A second request for the same invoice will see that marker
+        # and return 409 instead of launching another STK push.
+        reference = f"SUB-{invoice.id}-{uuid.uuid4().hex[:8]}"
+        with transaction.atomic():
+            locked = SubscriptionInvoice.objects.select_for_update().get(pk=invoice.pk)
+            if locked.status == SubscriptionInvoice.STATUS_PAID:
+                return Response(
+                    {"detail": "Invoice already paid.", "code": "already_paid"},
+                    status=400,
+                )
+            if locked.status in (
+                SubscriptionInvoice.STATUS_PENDING,
+                SubscriptionInvoice.STATUS_OVERDUE,
+            ) and (locked.payment_reference or locked.intasend_invoice_id):
+                return Response(
+                    {
+                        "detail": "Payment is already in progress for this invoice.",
+                        "code": "payment_in_progress",
+                    },
+                    status=409,
+                )
+            locked.payment_reference = reference
+            locked.payment_initiated_at = timezone.now()
+            locked.save(update_fields=["payment_reference", "payment_initiated_at", "updated_at"])
+
+        result = intasend_stk_push(phone_number, invoice.amount, reference)
+        if not result.get("success"):
+            self._clear_payment_attempt(invoice.pk, reference)
+            return Response(
+                {"detail": result.get("error") or "Payment failed. Please try again."},
+                status=502,
+            )
+
+        intasend_invoice_id = str(result.get("invoice_id") or "").strip()
+        if not intasend_invoice_id:
+            self._clear_payment_attempt(invoice.pk, reference)
+            return Response(
+                {"detail": "IntaSend did not return an invoice id."},
+                status=502,
+            )
+
+        with transaction.atomic():
+            locked = SubscriptionInvoice.objects.select_for_update().get(pk=invoice.pk)
+            if locked.status == SubscriptionInvoice.STATUS_PAID:
+                # A concurrent webhook beat us inside the lock window.
+                return Response(
+                    {"detail": "Invoice already paid.", "code": "already_paid"},
+                    status=400,
+                )
+            locked.intasend_invoice_id = intasend_invoice_id
+            locked.payment_reference = reference
+            if not locked.payment_initiated_at:
+                locked.payment_initiated_at = timezone.now()
+            locked.save(update_fields=[
+                "intasend_invoice_id",
+                "payment_reference",
+                "payment_initiated_at",
+                "updated_at",
+            ])
+            SubscriptionInvoiceAuditLog.objects.create(
+                invoice=locked,
+                actor=request.user,
+                action=SubscriptionInvoiceAuditLog.ACTION_PAYMENT_INITIATED,
+                old_status=locked.status,
+                new_status=locked.status,
+                note=f"intasend_invoice_id={intasend_invoice_id} reference={reference}",
+            )
+
+        return Response(
+            {
+                "detail": "STK push initiated.",
+                "intasend_invoice_id": intasend_invoice_id,
+                "reference": reference,
+                "invoice": SubscriptionInvoiceSerializer(locked).data,
+            },
+            status=201,
+        )
+
+    def _clear_payment_attempt(self, invoice_pk, reference):
+        with transaction.atomic():
+            locked = SubscriptionInvoice.objects.select_for_update().get(pk=invoice_pk)
+            if locked.payment_reference == reference and not locked.intasend_invoice_id:
+                locked.payment_reference = None
+                locked.payment_initiated_at = None
+                locked.save(update_fields=["payment_reference", "payment_initiated_at", "updated_at"])
+
+
+def _try_settle_subscription_invoice_from_callback(payload):
+    """If `payload` is an IntaSend callback for one of OUR subscription
+    invoices, settle it and return True. Returns False otherwise so the
+    caller can fall through to the rent-payment path.
+
+    Keeping this routine separate (rather than weaving it into the shared
+    payment core) means the rent rail's invariants stay untouched — the
+    subscription rail has its own state machine and audit table.
+    """
+    if not isinstance(payload, dict):
+        return False
+    invoice = payload.get("invoice") if isinstance(payload.get("invoice"), dict) else {}
+    invoice_id = str(payload.get("invoice_id") or invoice.get("invoice_id") or "").strip()
+    if not invoice_id:
+        return False
+
+    sub_invoice = SubscriptionInvoice.objects.filter(intasend_invoice_id=invoice_id).first()
+    if not sub_invoice:
+        return False
+
+    state = str(payload.get("state") or invoice.get("state") or "").upper()
+    if state != "COMPLETE":
+        return True  # we still consumed the event so it doesn't fall through
+
+    # Amount check before marking paid: if IntaSend reports a value, it MUST
+    # equal the invoice amount. Mismatched amounts are logged and dropped to
+    # avoid silently accepting an underpayment.
+    raw_value = invoice.get("value") if isinstance(invoice, dict) else None
+    if raw_value not in (None, ""):
+        try:
+            paid_amount = Decimal(str(raw_value))
+        except Exception:
+            paid_amount = None
+        if paid_amount is not None and paid_amount.quantize(Decimal("0.01")) != Decimal(sub_invoice.amount).quantize(Decimal("0.01")):
+            logger.warning(
+                "subscription.callback.amount_mismatch invoice_id=%s expected=%s got=%s",
+                sub_invoice.id,
+                sub_invoice.amount,
+                paid_amount,
+            )
+            return True
+
+    mark_subscription_invoice_paid(
+        sub_invoice,
+        paid_via=str(invoice.get("mpesa_receipt") or invoice_id),
+        actor=None,
+        note=f"intasend_invoice_id={invoice_id}",
+    )
+    return True
 
 
 class ThrottledTokenObtainPairView(TokenObtainPairView):

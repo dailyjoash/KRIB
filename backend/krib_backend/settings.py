@@ -316,6 +316,22 @@ BUSINESS_NAME = os.getenv("BUSINESS_NAME", "KRIB")
 # staging/test runs via the env var.
 LANDLORD_PAYOUT_COOLDOWN_HOURS = int(os.getenv("LANDLORD_PAYOUT_COOLDOWN_HOURS", "24"))
 
+# Phase 2B: KRIB subscription billing rail (separate from rent collection).
+# Charged to landlords for using the platform; payments flow to KRIB's own
+# IntaSend account, not to landlords. Enforcement (suspending accounts) is
+# explicitly DEFERRED — only the invoicing + reminder surface ships now.
+SUBSCRIPTION_PER_UNIT_KES = int(os.getenv("SUBSCRIPTION_PER_UNIT_KES", "50"))
+SUBSCRIPTION_FREE_TIER_THRESHOLD = int(os.getenv("SUBSCRIPTION_FREE_TIER_THRESHOLD", "5"))
+SUBSCRIPTION_BILLING_DAY = int(os.getenv("SUBSCRIPTION_BILLING_DAY", "1"))
+SUBSCRIPTION_GRACE_PERIOD_DAYS = int(os.getenv("SUBSCRIPTION_GRACE_PERIOD_DAYS", "7"))
+SUBSCRIPTION_OVERDUE_DAYS = int(os.getenv("SUBSCRIPTION_OVERDUE_DAYS", "14"))
+# Placeholder for a future phase. NEVER read by code in this phase — leaving the
+# flag wired up means a later enforcement landing only has to flip the env var
+# rather than re-introduce the setting.
+SUBSCRIPTION_ENFORCEMENT_ENABLED = os.getenv(
+    "SUBSCRIPTION_ENFORCEMENT_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # The currency the payment core compares incoming provider events against.
 # IntaSend is fixed to KES, Stripe accepts whatever the PaymentIntent was
 # created in (we currency-pin via STRIPE_CURRENCY), PayPal mirrors

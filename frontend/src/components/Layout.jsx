@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useMemo, useState } from "react";
+import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   Bell,
@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { AuthContext } from "../context/AuthContext";
 import api from "../services/api";
+import { formatDateTime } from "../utils/format";
 import brandImage from "../assets/Gemini_Generated_Image_2trnue2trnue2trn (1).png";
 
 const getHomePath = (role) => (role === "landlord" ? "/dashboard" : role === "manager" ? "/manager" : "/tenant");
@@ -30,6 +31,11 @@ export default function Layout({ title, children }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [isCompactView, setIsCompactView] = useState(() => window.matchMedia("(max-width: 900px)").matches);
   const [tenantHasActiveLease, setTenantHasActiveLease] = useState(null);
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const [notifications, setNotifications] = useState([]);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notificationsError, setNotificationsError] = useState("");
+  const notificationMenuRef = useRef(null);
   const isTenant = user?.role === "tenant";
   const isExecutive = ["landlord", "manager"].includes(user?.role);
 
@@ -167,11 +173,66 @@ export default function Layout({ title, children }) {
 
   useEffect(() => {
     setMobileOpen(false);
+    setNotificationOpen(false);
   }, [location.pathname]);
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+
+    let cancelled = false;
+
+    setNotificationsLoading(true);
+    setNotificationsError("");
+
+    api.get("/api/notifications/")
+      .then((res) => {
+        if (cancelled) return;
+        const data = Array.isArray(res.data) ? res.data : res.data?.results || [];
+        setNotifications(data);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setNotificationsError(isTenant ? "Unable to load notices." : "Unable to load notifications.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setNotificationsLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isTenant, notificationOpen]);
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+
+    const handlePointerDown = (event) => {
+      if (!notificationMenuRef.current?.contains(event.target)) {
+        setNotificationOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event) => {
+      if (event.key === "Escape") {
+        setNotificationOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [notificationOpen]);
 
   const doLogout = () => {
     logout();
-    navigate("/login");
+    navigate("/login", { replace: true });
   };
 
   const onNavClick = () => {
@@ -235,6 +296,9 @@ export default function Layout({ title, children }) {
 
   const topbarLabel = isTenant && isCompactView ? null : topbarTitle;
   const minimalTopbar = !isCompactView && !isTenant && !topbarLabel;
+  const notificationLabel = isTenant ? "notices" : "notifications";
+  const unreadCount = useMemo(() => notifications.filter((item) => !item.is_read).length, [notifications]);
+  const notificationPreview = useMemo(() => notifications.slice(0, 8), [notifications]);
 
   return (
     <div className={`layout-root ${isCompactView ? "mobile-view" : "desktop-view"} ${isTenant ? "tenant-shell" : ""} ${isExecutive ? "executive-shell" : ""}`}>
@@ -283,9 +347,59 @@ export default function Layout({ title, children }) {
               {topbarLabel ? <span className="topbar-label">{topbarLabel}</span> : null}
             </div>
             <div className="topbar-right">
-              <Link className={`icon-btn ${isTenant ? "tenant-bell-btn" : ""}`.trim()} to="/notifications" aria-label={isTenant ? "Open notices" : "Open notifications"}>
-                <Bell size={18} />
-              </Link>
+              <div className="notification-menu" ref={notificationMenuRef}>
+                <button
+                  className={`icon-btn ${isTenant ? "tenant-bell-btn" : ""}`.trim()}
+                  type="button"
+                  aria-label={notificationOpen ? `Close ${notificationLabel}` : `Open ${notificationLabel}`}
+                  aria-haspopup="dialog"
+                  aria-expanded={notificationOpen}
+                  onClick={() => setNotificationOpen((open) => !open)}
+                >
+                  <Bell size={18} />
+                  {unreadCount > 0 ? <span className="notification-badge">{unreadCount > 9 ? "9+" : unreadCount}</span> : null}
+                </button>
+
+                {notificationOpen ? (
+                  <div className="notification-dropdown" role="dialog" aria-label={isTenant ? "Notices" : "Notifications"}>
+                    <div className="notification-dropdown-head">
+                      <div>
+                        <strong>{isTenant ? "Notices" : "Notifications"}</strong>
+                        <span>{unreadCount} unread</span>
+                      </div>
+                      <Link className="resident-link-btn notification-view-all" to="/notifications" onClick={() => setNotificationOpen(false)}>
+                        View all
+                      </Link>
+                    </div>
+
+                    <div className="notification-dropdown-list">
+                      {notificationsLoading ? <p className="notification-dropdown-state">Loading...</p> : null}
+                      {!notificationsLoading && notificationsError ? <p className="notification-dropdown-state">{notificationsError}</p> : null}
+                      {!notificationsLoading && !notificationsError && notificationPreview.length === 0 ? (
+                        <p className="notification-dropdown-state">{isTenant ? "No notices yet." : "No notifications yet."}</p>
+                      ) : null}
+
+                      {!notificationsLoading && !notificationsError
+                        ? notificationPreview.map((item) => (
+                            <Link
+                              className={`notification-dropdown-item ${item.is_read ? "" : "unread"}`.trim()}
+                              key={item.id}
+                              to="/notifications"
+                              onClick={() => setNotificationOpen(false)}
+                            >
+                              <span className="notification-dot" aria-hidden="true" />
+                              <span className="notification-dropdown-copy">
+                                <strong>{item.title || (isTenant ? "Notice" : "Notification")}</strong>
+                                <span>{item.message || "Open notification center for details."}</span>
+                                <small>{formatDateTime(item.created_at)}</small>
+                              </span>
+                            </Link>
+                          ))
+                        : null}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
         </header>

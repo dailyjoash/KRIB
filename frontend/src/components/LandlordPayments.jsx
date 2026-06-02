@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { CalendarDays, Download, Mail, MessageSquare, Wallet } from "lucide-react";
+import { CalendarDays, CheckCircle, Download, Link as LinkIcon, Mail, MessageSquare, Wallet, XCircle } from "lucide-react";
 import api from "../services/api";
 import { getErrorMessage } from "../utils/errors";
 import { downloadBlob, downloadCsv } from "../utils/files";
@@ -12,6 +12,8 @@ import { PageLayout, SectionCard, StatCard } from "./ui";
 const tabs = [
   { id: "payments", label: "Paid Rent" },
   { id: "arrears", label: "Arrears" },
+  { id: "pending", label: "Confirmations" },
+  { id: "unmatched", label: "Unmatched" },
 ];
 
 const buildReminderMessage = (row) => {
@@ -23,12 +25,15 @@ export default function LandlordPayments() {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState("payments");
   const [payments, setPayments] = useState([]);
+  const [directPayments, setDirectPayments] = useState([]);
   const [summary, setSummary] = useState(null);
   const [period, setPeriod] = useState("");
   const [search, setSearch] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [sendingKey, setSendingKey] = useState("");
+  const [actionNotes, setActionNotes] = useState({});
+  const [attachLeaseIds, setAttachLeaseIds] = useState({});
   const [amountsHidden, setAmountsHidden] = useState(() => {
     try {
       const stored = localStorage.getItem("krib-exec-amounts-hidden");
@@ -42,11 +47,13 @@ export default function LandlordPayments() {
     setError("");
     try {
       const params = selectedPeriod ? { period: selectedPeriod } : {};
-      const [paymentsRes, summaryRes] = await Promise.all([
+      const [paymentsRes, directPaymentsRes, summaryRes] = await Promise.all([
         api.get("/api/payments/", { params }),
+        api.get("/api/payments/direct/", { params }),
         api.get("/api/dashboard/summary/", { params }),
       ]);
       setPayments(paymentsRes.data || []);
+      setDirectPayments(directPaymentsRes.data || []);
       setSummary(summaryRes.data);
     } catch (err) {
       setError(getErrorMessage(err, "Failed to load payments."));
@@ -95,16 +102,36 @@ export default function LandlordPayments() {
   }, [summary]);
 
   const paidRows = useMemo(
-    () => payments.filter((row) => row.status === "success"),
-    [payments]
+    () => [
+      ...payments.filter((row) => row.status === "success").map((row) => ({ ...row, source_label: "KRIB-collected", is_direct: false })),
+      ...directPayments
+        .filter((row) => row.status === "confirmed")
+        .map((row) => ({
+          ...row,
+          source_label: row.verification_label === "verified_landlord_collected" ? "Verified landlord-collected" : "Tenant-reported / unverified",
+          is_direct: true,
+          payment_method: "direct_paybill",
+        })),
+    ],
+    [directPayments, payments]
+  );
+
+  const pendingRows = useMemo(
+    () => directPayments.filter((row) => row.status === "pending_confirmation"),
+    [directPayments]
+  );
+
+  const unmatchedRows = useMemo(
+    () => directPayments.filter((row) => row.status === "unmatched"),
+    [directPayments]
   );
 
   const filteredRows = useMemo(() => {
-    const source = activeTab === "payments" ? paidRows : arrearsRows;
+    const source = activeTab === "payments" ? paidRows : activeTab === "arrears" ? arrearsRows : activeTab === "pending" ? pendingRows : unmatchedRows;
     if (!search) return source;
     const query = search.toLowerCase();
     return source.filter((row) => JSON.stringify(row).toLowerCase().includes(query));
-  }, [activeTab, arrearsRows, paidRows, search]);
+  }, [activeTab, arrearsRows, paidRows, pendingRows, search, unmatchedRows]);
 
   const exportCurrentView = () => {
     if (activeTab === "arrears") {
@@ -125,15 +152,52 @@ export default function LandlordPayments() {
 
     downloadCsv(
       "krib-payments.csv",
-      ["Tenant", "Unit", "Amount Paid", "Balance", "Transaction Time"],
+      ["Tenant", "Unit", "Amount Paid", "Balance", "Source", "Transaction Time"],
       filteredRows.map((row) => [
         row.tenant?.username || row.tenant?.email || "-",
         row.lease?.unit?.unit_number || "-",
         row.amount,
         row.remaining_balance,
+        row.source_label || "KRIB-collected",
         formatDateTime(row.transaction_date || row.created_at),
       ])
     );
+  };
+
+  const handleDirectAction = async (row, action) => {
+    const note = actionNotes[row.id] || "";
+    setError("");
+    setSuccess("");
+    try {
+      await api.post(`/api/payments/direct/${row.id}/${action}/`, { note });
+      setSuccess(action === "confirm" ? "Payment confirmed." : "Payment rejected.");
+      setActionNotes((prev) => ({ ...prev, [row.id]: "" }));
+      load(period);
+    } catch (err) {
+      setError(getErrorMessage(err, `Failed to ${action} payment.`));
+    }
+  };
+
+  const handleAttach = async (row) => {
+    const leaseId = attachLeaseIds[row.id] || "";
+    if (!leaseId) {
+      setError("Enter a lease ID before attaching the payment.");
+      return;
+    }
+    setError("");
+    setSuccess("");
+    try {
+      await api.post(`/api/payments/direct/${row.id}/attach/`, {
+        lease_id: leaseId,
+        note: actionNotes[row.id] || "Attached from reconciliation queue",
+      });
+      setSuccess("Payment attached and allocated.");
+      setAttachLeaseIds((prev) => ({ ...prev, [row.id]: "" }));
+      setActionNotes((prev) => ({ ...prev, [row.id]: "" }));
+      load(period);
+    } catch (err) {
+      setError(getErrorMessage(err, "Failed to attach payment."));
+    }
   };
 
   const deliverFollowUp = async (row, channel) => {
@@ -242,7 +306,7 @@ export default function LandlordPayments() {
             <p className="subtitle">No records found for this view.</p>
           ) : activeTab === "payments" ? (
             filteredRows.map((row, index) => (
-              <article className="resident-row-card" key={row.id}>
+              <article className="resident-row-card" key={`${row.is_direct ? "direct" : "legacy"}-${row.id}`}>
                 <div className="resident-row-id">{index + 1}</div>
                 <div className="resident-profile-columns landlord-payment-columns">
                   <div className="resident-profile-item">
@@ -258,8 +322,12 @@ export default function LandlordPayments() {
                     <strong>{formatKES(row.amount || 0)}</strong>
                   </div>
                   <div className="resident-profile-item">
-                    <span>Balance</span>
-                    <strong>{formatKES(row.remaining_balance || 0)}</strong>
+                    <span>{row.is_direct ? "Source" : "Balance"}</span>
+                    <strong>{row.is_direct ? row.source_label : formatKES(row.remaining_balance || 0)}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Status</span>
+                    <StatusBadge status={row.status} />
                   </div>
                   <div className="resident-profile-item">
                     <span>Time of transaction</span>
@@ -267,15 +335,109 @@ export default function LandlordPayments() {
                   </div>
                   <div className="resident-profile-item">
                     <span>Receipt</span>
-                    <button
-                      className="btn btn-glass"
-                      type="button"
-                      onClick={() => downloadBlob(`/api/payments/receipt/${row.id}/`, `krib-receipt-${row.id}.pdf`)}
-                    >
-                      <Download size={16} />
-                      <span>Download</span>
-                    </button>
+                    {row.is_direct ? (
+                      <strong>Manual record</strong>
+                    ) : (
+                      <button
+                        className="btn btn-glass"
+                        type="button"
+                        onClick={() => downloadBlob(`/api/payments/receipt/${row.id}/`, `krib-receipt-${row.id}.pdf`)}
+                      >
+                        <Download size={16} />
+                        <span>Download</span>
+                      </button>
+                    )}
                   </div>
+                </div>
+              </article>
+            ))
+          ) : activeTab === "pending" ? (
+            filteredRows.map((row) => (
+              <article className="resident-row-card" key={row.id}>
+                <div className="resident-row-id">{row.id}</div>
+                <div className="resident-profile-columns manager-action-columns">
+                  <div className="resident-profile-item">
+                    <span>Tenant</span>
+                    <strong>{row.tenant?.username || row.tenant?.email || "Tenant"}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Unit</span>
+                    <strong>{row.lease?.unit?.property?.name || "-"} / {row.lease?.unit?.unit_number || "-"}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Code</span>
+                    <strong>{row.transaction_code}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Current balance</span>
+                    <strong>{formatKES(row.remaining_balance || 0)}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Reported paid</span>
+                    <strong>{formatKES(row.amount || 0)}</strong>
+                  </div>
+                </div>
+                <div className="resident-row-meta manager-action-meta">
+                  <input
+                    className="btn-glass"
+                    value={actionNotes[row.id] || ""}
+                    onChange={(event) => setActionNotes({ ...actionNotes, [row.id]: event.target.value })}
+                    placeholder="Confirmation note"
+                  />
+                  <button className="btn btn-glass" type="button" onClick={() => handleDirectAction(row, "confirm")}>
+                    <CheckCircle size={16} />
+                    <span>Confirm</span>
+                  </button>
+                  <button className="btn btn-glass" type="button" onClick={() => handleDirectAction(row, "reject")}>
+                    <XCircle size={16} />
+                    <span>Reject</span>
+                  </button>
+                </div>
+              </article>
+            ))
+          ) : activeTab === "unmatched" ? (
+            filteredRows.map((row) => (
+              <article className="resident-row-card" key={row.id}>
+                <div className="resident-row-id">{row.id}</div>
+                <div className="resident-profile-columns manager-action-columns">
+                  <div className="resident-profile-item">
+                    <span>Code</span>
+                    <strong>{row.transaction_code}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Amount</span>
+                    <strong>{formatKES(row.amount || 0)}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Phone used</span>
+                    <strong>{row.phone_number || "-"}</strong>
+                  </div>
+                  <div className="resident-profile-item">
+                    <span>Flag</span>
+                    <strong>{row.flagged_reason || "Needs matching"}</strong>
+                  </div>
+                </div>
+                <div className="resident-row-meta manager-action-meta">
+                  <input
+                    className="btn-glass"
+                    value={attachLeaseIds[row.id] || ""}
+                    onChange={(event) => setAttachLeaseIds({ ...attachLeaseIds, [row.id]: event.target.value })}
+                    placeholder="Lease ID"
+                  />
+                  <input
+                    className="btn-glass"
+                    value={actionNotes[row.id] || ""}
+                    onChange={(event) => setActionNotes({ ...actionNotes, [row.id]: event.target.value })}
+                    placeholder="Attach note"
+                  />
+                  <button className="btn btn-glass" type="button" onClick={() => handleAttach(row)}>
+                    <LinkIcon size={16} />
+                    <span>Attach</span>
+                  </button>
+                  <button className="btn btn-glass" type="button" onClick={() => handleDirectAction(row, "reject")}>
+                    <XCircle size={16} />
+                    <span>Reject</span>
+                  </button>
                 </div>
               </article>
             ))
