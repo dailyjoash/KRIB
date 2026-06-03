@@ -118,6 +118,13 @@ const Login = () => {
               {loading ? "Logging in..." : "Sign in"}
             </button>
           </form>
+
+          <div className="auth-signup-prompt">
+            <p>Own rental property?</p>
+            <Link to="/signup-landlord" className="auth-signup-button">
+              Create a landlord account
+            </Link>
+          </div>
         </div>
       </section>
     </div>
