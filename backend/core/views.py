@@ -246,8 +246,8 @@ def _landlord_collection_mode(landlord):
     except LandlordSettings.DoesNotExist:
         settings_obj = None
     if not settings_obj:
-        return LandlordSettings.COLLECTION_CUSTODY_LEGACY
-    return settings_obj.collection_mode or LandlordSettings.COLLECTION_CUSTODY_LEGACY
+        return LandlordSettings.COLLECTION_DIRECT_PAYBILL
+    return settings_obj.collection_mode or LandlordSettings.COLLECTION_DIRECT_PAYBILL
 
 
 def _lease_collection_mode(lease):

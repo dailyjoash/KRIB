@@ -404,6 +404,7 @@ class InviteDeliveryTests(BaseAPITestCase):
             user=self.landlord,
             defaults={
                 "business_name": "Test Properties",
+                "collection_mode": LandlordSettings.COLLECTION_CUSTODY_LEGACY,
                 "payout_method": "MPESA",
                 "payout_destination": "+254700000001",
             },
@@ -543,6 +544,13 @@ class PaymentCallbackTests(BaseAPITestCase):
     def setUp(self):
         self.landlord = self.create_user("landlord_pay", Profile.ROLE_LANDLORD)
         self.tenant = self.create_user("tenant_pay", Profile.ROLE_TENANT)
+        LandlordSettings.objects.update_or_create(
+            user=self.landlord,
+            defaults={
+                "business_name": "Payment LL",
+                "collection_mode": LandlordSettings.COLLECTION_CUSTODY_LEGACY,
+            },
+        )
         self.webhook_secret = "test-secret"
         prop = Property.objects.create(landlord=self.landlord, name="P", location="NBO")
         unit = Unit.objects.create(
@@ -797,6 +805,7 @@ class PaymentCallbackTests(BaseAPITestCase):
         self.assertEqual(payment.status, PaymentTransaction.STATUS_PENDING)
 
 
+@override_settings(CUSTODY_MODE_ENABLED=True)
 class LandlordPayoutRequestTests(BaseAPITestCase):
     def setUp(self):
         self.landlord = self.create_user("landlord_payout", Profile.ROLE_LANDLORD)
@@ -997,6 +1006,13 @@ class DashboardSummaryTests(BaseAPITestCase):
     def setUp(self):
         self.landlord = self.create_user("landlord_summary", Profile.ROLE_LANDLORD)
         self.tenant = self.create_user("tenant_summary", Profile.ROLE_TENANT)
+        LandlordSettings.objects.update_or_create(
+            user=self.landlord,
+            defaults={
+                "business_name": "Summary LL",
+                "collection_mode": LandlordSettings.COLLECTION_CUSTODY_LEGACY,
+            },
+        )
         prop = Property.objects.create(landlord=self.landlord, name="P", location="NBO")
         unit = Unit.objects.create(
             property=prop,

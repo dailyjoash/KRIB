@@ -8,7 +8,7 @@ isolation), and that the FREE_TIER_THRESHOLD setting is honoured at runtime.
 
 from decimal import Decimal
 from io import StringIO
-from datetime import timedelta
+from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
@@ -559,3 +559,50 @@ class GenerateCommandTests(APITestCase):
         )
         invoice = SubscriptionInvoice.objects.get(landlord=landlord)
         self.assertEqual(invoice.period, "2027-01")
+
+
+class SchedulerSubscriptionWiringTests(APITestCase):
+    def test_apply_reminders_command_runs(self):
+        out = StringIO()
+
+        call_command("apply_subscription_reminders", stdout=out)
+
+        self.assertIn("Subscription reminders applied", out.getvalue())
+
+    def test_apply_reminders_command_dry_run(self):
+        out = StringIO()
+
+        with patch(
+            "core.management.commands.apply_subscription_reminders.apply_subscription_reminders"
+        ) as mock_apply:
+            call_command("apply_subscription_reminders", "--dry-run", stdout=out)
+
+        self.assertIn("Dry run", out.getvalue())
+        mock_apply.assert_not_called()
+
+    @override_settings(SUBSCRIPTION_BILLING_DAY=15)
+    def test_generate_skipped_on_wrong_day(self):
+        from core.management.commands import run_periodic_tasks
+
+        with patch(
+            "core.management.commands.run_periodic_tasks.timezone.localdate",
+            return_value=date(2026, 6, 2),
+        ), patch("django.core.management.call_command") as mock_call:
+            results = run_periodic_tasks.run_scheduled_tasks()
+
+        called_names = [c.args[0] for c in mock_call.call_args_list]
+        self.assertNotIn("generate_subscription_invoices", called_names)
+        self.assertIsNone(results["generate_subscription_invoices"])
+
+    @override_settings(SUBSCRIPTION_BILLING_DAY=15)
+    def test_generate_runs_on_billing_day(self):
+        from core.management.commands import run_periodic_tasks
+
+        with patch(
+            "core.management.commands.run_periodic_tasks.timezone.localdate",
+            return_value=date(2026, 6, 15),
+        ), patch("django.core.management.call_command") as mock_call:
+            run_periodic_tasks.run_scheduled_tasks()
+
+        called_names = [c.args[0] for c in mock_call.call_args_list]
+        self.assertIn("generate_subscription_invoices", called_names)

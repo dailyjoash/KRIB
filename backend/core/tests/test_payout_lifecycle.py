@@ -18,6 +18,7 @@ import uuid
 
 from django.contrib.auth.models import User
 from django.core.management import call_command
+from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -34,6 +35,7 @@ from core.models import (
 STRONG_PASSWORD = "StrongPass1234!"
 
 
+@override_settings(CUSTODY_MODE_ENABLED=True)
 class _PayoutBase(APITestCase):
     def setUp(self):
         self.landlord = self._make_user("ll_lifecycle", Profile.ROLE_LANDLORD)

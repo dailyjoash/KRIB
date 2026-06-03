@@ -1,18 +1,20 @@
 """Second-pass payout-lifecycle tests.
 
 Covers:
-  1. run_periodic_tasks runs all three reconcilers and survives failures.
+  1. run_periodic_tasks runs recurring jobs and survives failures.
   2. Admin mark-paid rejects legacy PENDING, REQUESTED, PROCESSING-without-ref.
   3. Initial IntaSend SUCCESS now means ACCEPTED, not SETTLED; status-lookup
      SUCCESS still settles (because the lookup endpoint is authoritative).
 """
 
+from datetime import date
 from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core.management import call_command
+from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -49,7 +51,8 @@ def _auth(client, user):
 
 
 class PeriodicTasksRunnerTests(APITestCase):
-    def test_runner_invokes_all_three_tasks(self):
+    @override_settings(SUBSCRIPTION_BILLING_DAY=1, CUSTODY_MODE_ENABLED=True)
+    def test_runner_invokes_regular_tasks(self):
         """The production scheduler must call check_arrears,
         reconcile_payment_allocations, and reconcile_payouts each cycle.
 
@@ -60,18 +63,24 @@ class PeriodicTasksRunnerTests(APITestCase):
         from core.management.commands import run_periodic_tasks
 
         with patch(
-            "core.management.commands.run_periodic_tasks.call_command"
-        ) as mock_call:
+            "core.management.commands.run_periodic_tasks.timezone.localdate",
+            return_value=date(2026, 6, 2),
+        ), patch("django.core.management.call_command") as mock_call:
             results = run_periodic_tasks.run_scheduled_tasks()
 
         called_names = [c.args[0] for c in mock_call.call_args_list]
         self.assertIn("check_arrears", called_names)
         self.assertIn("reconcile_payment_allocations", called_names)
         self.assertIn("reconcile_payouts", called_names)
+        self.assertIn("apply_subscription_reminders", called_names)
+        self.assertNotIn("generate_subscription_invoices", called_names)
         self.assertEqual(results["check_arrears"], True)
         self.assertEqual(results["reconcile_payment_allocations"], True)
         self.assertEqual(results["reconcile_payouts"], True)
+        self.assertEqual(results["apply_subscription_reminders"], True)
+        self.assertIsNone(results["generate_subscription_invoices"])
 
+    @override_settings(SUBSCRIPTION_BILLING_DAY=1, CUSTODY_MODE_ENABLED=True)
     def test_single_task_failure_does_not_block_others(self):
         """check_arrears raising must not prevent reconcile_payouts from
         running. The whole point of the per-task try/except wrapper."""
@@ -83,7 +92,10 @@ class PeriodicTasksRunnerTests(APITestCase):
             return 0
 
         with patch(
-            "core.management.commands.run_periodic_tasks.call_command",
+            "core.management.commands.run_periodic_tasks.timezone.localdate",
+            return_value=date(2026, 6, 2),
+        ), patch(
+            "django.core.management.call_command",
             side_effect=fake_call_command,
         ) as mock_call:
             results = run_periodic_tasks.run_scheduled_tasks()
@@ -93,19 +105,22 @@ class PeriodicTasksRunnerTests(APITestCase):
         # …but the others still ran and succeeded.
         self.assertEqual(results["reconcile_payment_allocations"], True)
         self.assertEqual(results["reconcile_payouts"], True)
+        self.assertEqual(results["apply_subscription_reminders"], True)
         called_names = [c.args[0] for c in mock_call.call_args_list]
         self.assertIn("reconcile_payouts", called_names)
 
+    @override_settings(SUBSCRIPTION_BILLING_DAY=1, CUSTODY_MODE_ENABLED=True)
     def test_command_once_flag_runs_one_cycle_then_exits(self):
         """`--once` lets the test suite and ad-hoc operators exercise the
         loop without hanging on time.sleep."""
         stdout = StringIO()
         with patch(
-            "core.management.commands.run_periodic_tasks.call_command"
-        ) as mock_call:
+            "core.management.commands.run_periodic_tasks.timezone.localdate",
+            return_value=date(2026, 6, 2),
+        ), patch("django.core.management.call_command") as mock_call:
             call_command("run_periodic_tasks", "--once", stdout=stdout)
-        # Each of the three tasks was attempted exactly once.
-        self.assertEqual(mock_call.call_count, 3)
+        # Four always-on tasks are attempted; billing generation is skipped.
+        self.assertEqual(mock_call.call_count, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +128,7 @@ class PeriodicTasksRunnerTests(APITestCase):
 # ---------------------------------------------------------------------------
 
 
+@override_settings(CUSTODY_MODE_ENABLED=True)
 class AdminMarkPaidRestrictionsTests(APITestCase):
     def setUp(self):
         self.landlord = _make_user("ll_mp_v2", Profile.ROLE_LANDLORD)

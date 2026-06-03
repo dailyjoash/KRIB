@@ -18,40 +18,57 @@ import logging
 import os
 import time
 
-from django.core.management import BaseCommand, call_command
+import django.core.management as django_management
+from django.conf import settings
+from django.core.management import BaseCommand
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
 
+def _is_subscription_billing_day():
+    billing_day = int(getattr(settings, "SUBSCRIPTION_BILLING_DAY", 1))
+    return timezone.localdate().day == billing_day
+
+
 # Order matters for clarity but not correctness — each task is independent.
-# Tuple of (command_name, kwargs) so future tasks can pass options.
+# Tuple of (command_name, kwargs[, condition_fn]) so future tasks can pass
+# options and optional run conditions.
 PERIODIC_TASKS = (
     # Tenant-side billing alerts.
     ("check_arrears", {}),
     # Retry ledger allocation for payments that landed in SUCCESS but never
     # got their landlord-credit/wallet-credit ledger rows written (e.g. a
     # crash in `_allocate_success_payment` after the status save committed).
-    ("reconcile_payment_allocations", {}),
+    ("reconcile_payment_allocations", {}, lambda: settings.CUSTODY_MODE_ENABLED),
     # Promote PROCESSING payouts to PAID/REVERSED by asking IntaSend (or any
     # future provider) for an authoritative settlement state.
-    ("reconcile_payouts", {}),
+    ("reconcile_payouts", {}, lambda: settings.CUSTODY_MODE_ENABLED),
+    # Send subscription payment nudges and transition stale pending invoices.
+    ("apply_subscription_reminders", {}),
+    # Generate landlord subscription invoices only on the configured billing day.
+    ("generate_subscription_invoices", {}, _is_subscription_billing_day),
 )
 
 
-def _run_one(command_name, command_kwargs, *, stdout_writer=None):
+def _run_one(command_name, command_kwargs, condition_fn=None, *, stdout_writer=None):
     """Run a single management command and swallow its exception.
 
-    Returns True on success, False on failure. Side effects: structured
-    log entry + optional stdout write so the operator sees per-task status
-    in the scheduler container's logs.
+    Returns True on success, False on failure, and None when skipped. Side
+    effects: structured log entry + optional stdout write so the operator sees
+    per-task status in the scheduler container's logs.
     """
     started = timezone.now()
     try:
+        if condition_fn is not None and not condition_fn():
+            logger.info("scheduler.task.skipped name=%s", command_name)
+            if stdout_writer:
+                stdout_writer(f"[{started.isoformat()}] skipped task={command_name}")
+            return None
         if stdout_writer:
             stdout_writer(f"[{started.isoformat()}] start task={command_name}")
         logger.info("scheduler.task.start name=%s", command_name)
-        call_command(command_name, **command_kwargs)
+        django_management.call_command(command_name, **command_kwargs)
         logger.info("scheduler.task.success name=%s", command_name)
         if stdout_writer:
             stdout_writer(f"[{timezone.now().isoformat()}] ok task={command_name}")
@@ -67,6 +84,15 @@ def _run_one(command_name, command_kwargs, *, stdout_writer=None):
         return False
 
 
+def _unpack_periodic_task(task):
+    if len(task) == 2:
+        command_name, command_kwargs = task
+        return command_name, command_kwargs, None
+    if len(task) == 3:
+        return task
+    raise ValueError(f"Periodic task tuples must have 2 or 3 items, got {len(task)}")
+
+
 def run_scheduled_tasks(stdout_writer=None):
     """Execute every task in PERIODIC_TASKS exactly once.
 
@@ -74,9 +100,13 @@ def run_scheduled_tasks(stdout_writer=None):
     time.sleep or wrapping the whole `while True` loop.
     """
     results = {}
-    for command_name, command_kwargs in PERIODIC_TASKS:
+    for task in PERIODIC_TASKS:
+        command_name, command_kwargs, condition_fn = _unpack_periodic_task(task)
         results[command_name] = _run_one(
-            command_name, command_kwargs, stdout_writer=stdout_writer
+            command_name,
+            command_kwargs,
+            condition_fn,
+            stdout_writer=stdout_writer,
         )
     return results
 

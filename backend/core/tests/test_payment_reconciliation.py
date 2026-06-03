@@ -17,6 +17,7 @@ from rest_framework.test import APITestCase
 
 from core.models import (
     LandlordBalance,
+    LandlordSettings,
     LedgerTransaction,
     Lease,
     PaymentTransaction,
@@ -42,6 +43,13 @@ class _PaymentFixtureBase(APITestCase):
     def setUp(self):
         self.landlord = self._make_user("ll_pay_recon", Profile.ROLE_LANDLORD)
         self.tenant = self._make_user("tenant_pay_recon", Profile.ROLE_TENANT)
+        LandlordSettings.objects.update_or_create(
+            user=self.landlord,
+            defaults={
+                "business_name": "Payment Recon LL",
+                "collection_mode": LandlordSettings.COLLECTION_CUSTODY_LEGACY,
+            },
+        )
         prop = Property.objects.create(landlord=self.landlord, name="P", location="NBO")
         unit = Unit.objects.create(
             property=prop, unit_number="U1",

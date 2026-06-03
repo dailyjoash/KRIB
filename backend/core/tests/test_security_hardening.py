@@ -170,6 +170,7 @@ class StripeWebhookFailClosedTests(_Base):
         self.assertIn(response.status_code, (400, 503))
 
 
+@override_settings(CUSTODY_MODE_ENABLED=True)
 class LandlordPayoutDestinationGuardTests(_Base):
     def setUp(self):
         self.landlord = self.make_user("ll_payout_guard", Profile.ROLE_LANDLORD)
@@ -278,6 +279,7 @@ class LandlordPayoutDestinationGuardTests(_Base):
         self.assertEqual(response.status_code, 403)
 
 
+@override_settings(CUSTODY_MODE_ENABLED=True)
 class PayoutMarkPaidAuditTests(_Base):
     def setUp(self):
         self.landlord = self.make_user("ll_audit", Profile.ROLE_LANDLORD)
@@ -535,6 +537,7 @@ class CrossLandlordManagerScopeTests(_Base):
         self.assertIsNone(self.prop_b.manager_id)
 
 
+@override_settings(CUSTODY_MODE_ENABLED=True)
 class PayoutDestinationCooldownTests(_Base):
     """A landlord who just changed their payout destination must wait the
     cool-down window before a payout will release."""

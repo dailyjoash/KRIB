@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
@@ -59,16 +60,23 @@ urlpatterns = [
     path("landlord/settings/", views.LandlordSettingsView.as_view(), name="landlord-settings"),
     path("landlord/collection-account/", views.LandlordCollectionAccountView.as_view(), name="landlord-collection-account"),
     path("staff/collection-accounts/<int:pk>/verify/", views.LandlordCollectionAccountVerifyView.as_view(), name="staff-collection-account-verify"),
-    path("landlord/payouts/", views.LandlordPayoutsView.as_view(), name="landlord-payouts"),
-    path("landlord/payouts/request/", views.LandlordPayoutRequestView.as_view(), name="landlord-payout-request"),
-    path("landlord/payouts/<int:pk>/mark-paid/", views.LandlordPayoutMarkPaidView.as_view(), name="landlord-payout-mark-paid"),
-    path("landlord/payouts/<int:pk>/reverse/", views.LandlordPayoutReverseView.as_view(), name="landlord-payout-reverse"),
-    path("staff/custody/landlords/", views.CustodyLandlordListView.as_view(), name="staff-custody-landlords"),
-    path("staff/custody/landlords/<int:pk>/", views.CustodyLandlordDetailView.as_view(), name="staff-custody-landlord-detail"),
-    path("staff/custody/landlords/<int:pk>/settle/", views.CustodySettleView.as_view(), name="staff-custody-settle"),
-    path("staff/custody/landlords/<int:pk>/cutover/", views.CustodyCutoverView.as_view(), name="staff-custody-cutover"),
     path("landlord/subscription/current/", views.LandlordSubscriptionCurrentView.as_view(), name="landlord-subscription-current"),
     path("landlord/subscription/invoices/", views.LandlordSubscriptionListView.as_view(), name="landlord-subscription-invoices"),
     path("landlord/subscription/invoices/<int:pk>/pay/", views.LandlordSubscriptionPayView.as_view(), name="landlord-subscription-pay"),
+]
+
+if settings.CUSTODY_MODE_ENABLED:
+    urlpatterns += [
+        path("landlord/payouts/", views.LandlordPayoutsView.as_view(), name="landlord-payouts"),
+        path("landlord/payouts/request/", views.LandlordPayoutRequestView.as_view(), name="landlord-payout-request"),
+        path("landlord/payouts/<int:pk>/mark-paid/", views.LandlordPayoutMarkPaidView.as_view(), name="landlord-payout-mark-paid"),
+        path("landlord/payouts/<int:pk>/reverse/", views.LandlordPayoutReverseView.as_view(), name="landlord-payout-reverse"),
+        path("staff/custody/landlords/", views.CustodyLandlordListView.as_view(), name="staff-custody-landlords"),
+        path("staff/custody/landlords/<int:pk>/", views.CustodyLandlordDetailView.as_view(), name="staff-custody-landlord-detail"),
+        path("staff/custody/landlords/<int:pk>/settle/", views.CustodySettleView.as_view(), name="staff-custody-settle"),
+        path("staff/custody/landlords/<int:pk>/cutover/", views.CustodyCutoverView.as_view(), name="staff-custody-cutover"),
+    ]
+
+urlpatterns += [
     path("", include(router.urls)),
 ]

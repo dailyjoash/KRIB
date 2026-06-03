@@ -34,6 +34,9 @@ REST_FRAMEWORK = {
 # Disable cron during tests
 CRONJOBS = []
 
+# The test suite still exercises the preserved custody/payout rail directly.
+CUSTODY_MODE_ENABLED = True
+
 # Silence migration output during tests
 class DisableMigrations:
     def __contains__(self, item):

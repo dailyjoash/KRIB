@@ -7,6 +7,7 @@ from unittest.mock import patch
 from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.db.models import F
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework.test import APITestCase
 
@@ -21,6 +22,7 @@ from core.models import (
 PASSWORD = "StrongPass1234!"
 
 
+@override_settings(CUSTODY_MODE_ENABLED=True)
 class CustodyPhase2ABase(APITestCase):
     def make_user(self, username, role, *, is_staff=False):
         user = User.objects.create_user(username=username, password=PASSWORD)

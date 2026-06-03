@@ -67,7 +67,7 @@ class LandlordSettings(models.Model):
     collection_mode = models.CharField(
         max_length=30,
         choices=COLLECTION_MODE_CHOICES,
-        default=COLLECTION_CUSTODY_LEGACY,
+        default=COLLECTION_DIRECT_PAYBILL,
     )
     payout_method = models.CharField(max_length=20, blank=True, null=True)
     payout_destination = models.CharField(max_length=255, blank=True, null=True)

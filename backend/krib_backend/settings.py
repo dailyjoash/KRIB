@@ -332,6 +332,13 @@ SUBSCRIPTION_ENFORCEMENT_ENABLED = os.getenv(
     "SUBSCRIPTION_ENFORCEMENT_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# Custody mode: KRIB holds landlord funds and initiates payouts.
+# KRIB is a transaction monitor - custody mode is disabled by default.
+# Set to "1" only if you explicitly want to enable the custody rail.
+CUSTODY_MODE_ENABLED = os.getenv(
+    "CUSTODY_MODE_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # The currency the payment core compares incoming provider events against.
 # IntaSend is fixed to KES, Stripe accepts whatever the PaymentIntent was
 # created in (we currency-pin via STRIPE_CURRENCY), PayPal mirrors
